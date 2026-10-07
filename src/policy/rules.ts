@@ -8,15 +8,14 @@ import type { ParsedCertificate, ParsedOutput, ParsedTransaction, ResolvedInput 
 
 /**
  * The machine name of a policy rule, listed in the order the rules are
- * checked; the first one that fails is the one reported. Three rules take
+ * checked; the first one that fails is the one reported. Two rules take
  * a different name in each mode, since what they ask differs: the sponsor
- * inputs, the collateral and the sponsor outflow rules.
+ * inputs and the sponsor outflow rules.
  */
 export type RuleName =
   | 'well_formed'
   | 'uses_leased_fee_input'
   | 'no_sponsor_inputs'
-  | 'uses_leased_collateral'
   | 'uses_shared_collateral'
   | 'bounded_validity'
   | 'account_transaction'
@@ -288,11 +287,12 @@ const sponsorInputs: Rule = ({ inputs, sponsorInputs }, { mode }) => {
  * The collateral is exactly the shared collateral UTxO, returned to the
  * sponsor, with total collateral set within what it holds, and the
  * transaction is not flagged as failing phase two, which would hand the
- * collateral to the ledger outright. The rule is named after the mode:
- * the lease named the UTxO in fee mode, the collateral route in the other.
+ * collateral to the ledger outright. The same UTxO is named by the lease
+ * in fee mode and by the collateral route in the other, so the rule
+ * answers under one name in both.
  */
-const sponsorCollateral: Rule = ({ transaction }, { mode, collateral, sponsor }) => {
-  const rule = mode.kind === 'fee' ? 'uses_leased_collateral' : 'uses_shared_collateral';
+const sponsorCollateral: Rule = ({ transaction }, { collateral, sponsor }) => {
+  const rule = 'uses_shared_collateral';
   if (!transaction.isValid) {
     return violation(rule, 'The transaction is flagged as failing phase two, which would forfeit the collateral');
   }
@@ -376,7 +376,9 @@ const carries = (output: ParsedOutput): 'datum' | 'reference script' | undefined
 /**
  * What the sponsor's input is drawn down by is exactly the fee, plus the
  * deposit and the control output at creation, within the limits, and
- * what comes back to the sponsor is plain lovelace the pool can spend.
+ * what comes back to the sponsor is one plain change output the pool can
+ * spend: change split over several outputs would litter the sponsor
+ * address with small UTxOs the pool classifies as reserve.
  */
 const sponsorOutflowBounded: Rule = ({ transaction, creation, sponsorOutputs, sponsoredLovelace }, { limits }) => {
   if (transaction.fee > BigInt(limits.maxFeeLovelace)) {
@@ -387,6 +389,9 @@ const sponsorOutflowBounded: Rule = ({ transaction, creation, sponsorOutputs, sp
     if (carried !== undefined) {
       return violation('sponsor_outflow_bounded', `An output to the sponsor carries a ${carried}, which the pool could not spend plainly`);
     }
+  }
+  if (sponsorOutputs.length !== 1) {
+    return violation('sponsor_outflow_bounded', `The transaction pays the sponsor ${sponsorOutputs.length} outputs where exactly one change output is expected`);
   }
   const expected = transaction.fee + (creation === undefined ? 0n : creation.deposit + creation.controlOutput.lovelace);
   if (sponsoredLovelace !== expected) {

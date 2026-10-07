@@ -355,6 +355,85 @@ describe('pool sync', () => {
     expect(poolRows()).toContainEqual({ ref: `${txHash(1)}#0`, kind: 'fee', status: 'consumed' });
   });
 
+  it('retires a leased fee UTxO the chain lists at a size outside every pool, closing its lease on the audit trail, and never leases or restores it', async () => {
+    service.fund(txHash(1), 0, 100_000_000n);
+    service.fund(txHash(3), 0, 5_000_000n);
+    service.fund(txHash(2), 0, 30_000_000n);
+    await service.sync.run();
+    const key = service.issueKey().record;
+    const lease = await service.leases.create(key);
+    expect(lease.fee.txHash).toBe(txHash(1));
+    const resized = createPoolSync({
+      db: service.db,
+      provider: service.provider,
+      sponsorAddress: service.serviceWallet.address,
+      sizes: { feeUtxoLovelace: 50_000_000, collateralUtxoLovelace: 5_000_000 },
+      slots: service.config.slots,
+      now: () => service.clock.now,
+    });
+
+    const report = await resized.run();
+
+    expect(report).toMatchObject({ retired: 1, gone: 0, consumed: 0, restored: 0 });
+    expect(report.reserve.lovelace).toBe(130_000_000n);
+    expect(poolRows()).toEqual([
+      { ref: `${txHash(1)}#0`, kind: 'fee', status: 'retired' },
+      { ref: `${txHash(3)}#0`, kind: 'collateral', status: 'free' },
+    ]);
+    expect(leaseStatus(lease.id)).toBe('expired');
+    expect(auditRows().slice(-2)).toEqual([
+      { apiKeyId: key.id, action: 'lease', outcome: 'expired', detail: { leaseId: lease.id, reason: 'utxo_retired', utxo: `${txHash(1)}#0` } },
+      { apiKeyId: null, action: 'pool', outcome: 'retired', detail: { utxo: `${txHash(1)}#0`, kind: 'fee', was: 'leased', lovelace: '100000000' } },
+    ]);
+
+    expect((await resized.run()).retired).toBe(0);
+    expect((await service.sync.run()).restored).toBe(0);
+    expect(poolRows()).toContainEqual({ ref: `${txHash(1)}#0`, kind: 'fee', status: 'retired' });
+    await expect(service.leases.create(key)).rejects.toThrow(/The pool has no fee UTxO/);
+    expect(auditRows().filter((row) => row.outcome === 'retired')).toHaveLength(1);
+  });
+
+  it('retires a consumed fee UTxO and the shared collateral alike when they fall outside the pool sizes, designating the next collateral of the new size', async () => {
+    service.fund(txHash(1), 0, 100_000_000n);
+    service.fund(txHash(3), 0, 5_000_000n);
+    service.fund(txHash(4), 0, 5_000_000n);
+    await service.sync.run();
+    const key = service.issueKey().record;
+    const lease = await service.leases.create(key);
+    issueWitness(lease.id);
+    service.db.prepare("UPDATE leases SET status = 'consumed' WHERE id = ?").run(lease.id);
+    service.db.prepare("UPDATE pool_utxos SET status = 'consumed' WHERE tx_hash = ?").run(txHash(1));
+    expect(sharedCollateral()).toBe(`${txHash(3)}#0`);
+    const resized = createPoolSync({
+      db: service.db,
+      provider: service.provider,
+      sponsorAddress: service.serviceWallet.address,
+      sizes: { feeUtxoLovelace: 50_000_000, collateralUtxoLovelace: 8_000_000 },
+      slots: service.config.slots,
+      now: () => service.clock.now,
+    });
+
+    const report = await resized.run();
+
+    expect(report.retired).toBe(3);
+    expect(poolRows()).toEqual([
+      { ref: `${txHash(1)}#0`, kind: 'fee', status: 'retired' },
+      { ref: `${txHash(3)}#0`, kind: 'collateral', status: 'retired' },
+      { ref: `${txHash(4)}#0`, kind: 'collateral', status: 'retired' },
+    ]);
+    expect(leaseStatus(lease.id)).toBe('consumed');
+    expect(sharedCollateral()).toBeUndefined();
+    expect(service.db.prepare('SELECT COUNT(*) AS count FROM shared_collateral').get()).toEqual({ count: 0 });
+    expect(auditRows().filter((row) => row.outcome === 'retired').map((row) => row.detail.was)).toEqual(['consumed', 'free', 'free']);
+
+    service.clock.now = new Date('2024-01-01T01:00:00.000Z');
+    service.fund(txHash(5), 0, 8_000_000n);
+    const after = await resized.run();
+    expect(after).toMatchObject({ discovered: 1, restored: 0, retired: 0 });
+    expect(sharedCollateral()).toBe(`${txHash(5)}#0`);
+    expect(poolRows()).toContainEqual({ ref: `${txHash(1)}#0`, kind: 'fee', status: 'retired' });
+  });
+
   it('shares one run between callers waiting at the same time', async () => {
     service.fund(txHash(1), 0, 100_000_000n);
 

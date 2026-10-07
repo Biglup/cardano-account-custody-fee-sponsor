@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { OutOfFundsError } from '../../src/http/errors.js';
-import { buildSplitTransaction, planSplit } from '../../src/pool/replenish.js';
+import { buildSplitTransaction, createReplenish, planSplit } from '../../src/pool/replenish.js';
 import { REPLENISH_FEE_MARGIN } from '../../src/pool/sizes.js';
-import type { PoolSync } from '../../src/pool/sync.js';
+import { type PoolSync, createPoolSync } from '../../src/pool/sync.js';
 import { type TestService, createTestService, txHash } from '../support/service.js';
 import { transactionParts } from '../support/transaction.js';
 
@@ -99,6 +99,23 @@ describe('buildSplitTransaction', () => {
 
     expect(transactionParts(tx).inputs).toEqual([reserve.input]);
   });
+
+  it('leaves every UTxO the pool holds free, leased or consumed out of the inputs, even when the reserve it is handed lists them', async () => {
+    const free = service.fund(txHash(1), 0, 100_000_000n);
+    const leased = service.fund(txHash(3), 0, 100_000_000n);
+    const consumed = service.fund(txHash(4), 0, 100_000_000n);
+    service.fund(txHash(5), 0, 5_000_000n);
+    const reserve = service.fund(txHash(2), 0, 1_000_000_000n);
+    await service.sync.run();
+    service.db.prepare("UPDATE pool_utxos SET status = 'leased' WHERE tx_hash = ?").run(txHash(3));
+    service.db.prepare("UPDATE pool_utxos SET status = 'consumed' WHERE tx_hash = ?").run(txHash(4));
+    const plan = planSplit(service.db, SETTINGS, 1_000_000_000n, { feeUtxoCount: 2, collateralCount: 0 });
+    const widened: PoolSync = { ...service.sync, reserve: () => ({ ...service.sync.reserve(), utxos: [free, leased, consumed, reserve] }) };
+
+    const tx = await buildSplitTransaction(service.db, service.serviceWallet, widened, plan);
+
+    expect(transactionParts(tx).inputs).toEqual([reserve.input]);
+  });
 });
 
 describe('replenish', () => {
@@ -140,6 +157,30 @@ describe('replenish', () => {
     expect(parts.inputs).toEqual([{ txId: txHash(2), index: 0 }]);
     expect(await service.provider.resolveUnspentOutputs([collateral.input])).toEqual([collateral]);
     expect(service.collateral.current()?.txHash).toBe(txHash(1));
+  });
+
+  it('retires a leased fee UTxO that a smaller fee size lists as reserve, closing its lease, before a split may spend it', async () => {
+    service.fund(txHash(1), 0, 100_000_000n);
+    service.fund(txHash(3), 0, 5_000_000n);
+    service.fund(txHash(2), 0, 30_000_000n);
+    await service.sync.run();
+    const key = service.issueKey().record;
+    const lease = await service.leases.create(key);
+    expect(lease.fee.txHash).toBe(txHash(1));
+    const resized = { ...SETTINGS, feeUtxoLovelace: 50_000_000 };
+    const sync = createPoolSync({ db: service.db, provider: service.provider, sponsorAddress: service.serviceWallet.address, sizes: resized, slots: service.config.slots, now: () => service.clock.now });
+    const replenish = createReplenish({ db: service.db, provider: service.provider, serviceWallet: service.serviceWallet, sync, settings: resized });
+
+    const result = await replenish({ feeUtxoCount: 1, collateralCount: 0 });
+
+    expect(result.feeOutputs).toBe(1);
+    expect(service.leases.find(key, lease.id).status).toBe('expired');
+    const spent = transactionParts(service.provider.submitted[0] as string).inputs.map((input) => `${input.txId}#${input.index}`);
+    const held = (service.db.prepare("SELECT tx_hash || '#' || tx_index AS ref FROM pool_utxos WHERE status IN ('free', 'leased', 'consumed')").all() as { ref: string }[]).map(
+      (row) => row.ref,
+    );
+    expect(spent.filter((input) => held.includes(input))).toEqual([]);
+    expect(service.db.prepare('SELECT status FROM pool_utxos WHERE tx_hash = ?').get(txHash(1))).toEqual({ status: 'retired' });
   });
 
   it('carries a signature from the sponsor wallet', async () => {

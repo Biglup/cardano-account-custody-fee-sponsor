@@ -36,6 +36,8 @@ export interface AppDependencies {
   witness: WitnessService;
   sync: PoolSync;
   replenish: ReplenishFn;
+  /** The clock the admin routes issue and disable keys by. */
+  now: () => Date;
 }
 
 /**
@@ -65,6 +67,7 @@ export const createApp = ({
   witness,
   sync,
   replenish,
+  now,
 }: AppDependencies): Express => {
   const app = express();
   app.disable('x-powered-by');
@@ -80,7 +83,7 @@ export const createApp = ({
   const keyRateLimit = keyRateLimiter(rateLimit.keyRateLimitPerMinute);
   app.use('/v1/leases', createLeaseRouter(db, leases, collateral, witness, lease, keyRateLimit));
   app.use('/v1/collateral', createCollateralRouter(db, collateral, witness, collateralSettings, keyRateLimit));
-  app.use('/admin', createAdminRouter({ db, adminApiKey, sync, leases, replenish }));
+  app.use('/admin', createAdminRouter({ db, adminApiKey, sync, leases, replenish, now }));
 
   app.use(notFoundHandler);
   app.use(errorHandler);

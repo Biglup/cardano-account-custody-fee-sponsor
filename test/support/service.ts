@@ -9,6 +9,9 @@ import { fakeTransactionId, transactionParts } from './transaction.js';
 /** A mnemonic for tests only; it holds nothing on any network. */
 export const TEST_MNEMONIC = 'test test test test test test test test test test test junk';
 
+/** A second mnemonic for tests only, deriving another sponsor address; it holds nothing on any network either. */
+export const OTHER_MNEMONIC = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+
 /** The admin key the test service is configured with. */
 export const TEST_ADMIN_KEY = 'test-admin-key';
 
@@ -57,11 +60,17 @@ export interface TestService extends Omit<Service, 'provider' | 'start' | 'stop'
   close(): void;
 }
 
-/** Builds the test service from the test environment, with `overrides` applied to it. */
-export const createTestService = async (overrides: Record<string, string> = {}): Promise<TestService> => {
+/** What a test service may share with one built before it: the fake chain and the clock, as a restart over the same database keeps both. */
+export interface SharedWithService {
+  provider?: FakeChain;
+  clock?: { now: Date };
+}
+
+/** Builds the test service from the test environment, with `overrides` applied to it, over a fresh fake chain and clock unless `shared` says otherwise. */
+export const createTestService = async (overrides: Record<string, string> = {}, shared: SharedWithService = {}): Promise<TestService> => {
   const config = loadConfig(testEnv(overrides));
-  const provider = new FakeChain();
-  const clock = { now: new Date('2024-01-01T00:00:00.000Z') };
+  const provider = shared.provider ?? new FakeChain();
+  const clock = shared.clock ?? { now: new Date('2024-01-01T00:00:00.000Z') };
   const service = await createService({ config, provider, logger: silentLogger, now: () => clock.now });
   return {
     config: service.config,
@@ -77,7 +86,7 @@ export const createTestService = async (overrides: Record<string, string> = {}):
     app: service.app,
     clock,
     issueKey: (label = 'test', quotas = {}) => {
-      const issued = createApiKey(service.db, label, quotas);
+      const issued = createApiKey(service.db, label, quotas, clock.now);
       return { apiKey: issued.apiKey, record: issued.record };
     },
     fund: (txId, index, lovelace) => {

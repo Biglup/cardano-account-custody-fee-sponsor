@@ -17,8 +17,8 @@ surroundings.
   lease: it is keyed by the transaction it signs, and the same transaction
   presented again, by any key, receives the same signature, which
   authorises nothing the first one did not.
-- The admin key can issue client keys, inspect and replenish the pool and
-  read the audit trail. It cannot sign anything.
+- The admin key can issue, list and disable client keys, inspect and
+  replenish the pool and read the audit trail. It cannot sign anything.
 - No route exposes the mnemonic, a private key, a client key once issued,
   or a transaction body.
 
@@ -42,10 +42,9 @@ sponsor's value from going anywhere but the fee and the account:
   In collateral mode `no_sponsor_inputs` refuses every sponsor input,
   the shared collateral included, so the only sponsor UTxO a transaction
   on that route touches is the collateral it declares.
-- `uses_leased_collateral`, and `uses_shared_collateral` in collateral
-  mode, keep the collateral exactly the shared UTxO, returned to the
-  sponsor, and refuse a transaction that declares itself failing, which
-  would forfeit the collateral outright.
+- `uses_shared_collateral` keeps the collateral exactly the shared UTxO
+  in both modes, returned to the sponsor, and refuses a transaction that
+  declares itself failing, which would forfeit the collateral outright.
 - `account_transaction` and `no_foreign_scripts` make sure the only
   scripts that run are the account contract and the account's own stake
   script; a lookalike policy, a foreign script input or a foreign
@@ -53,8 +52,9 @@ sponsor's value from going anywhere but the fee and the account:
 - `sponsor_outflow_bounded` ties what the fee UTxO is drawn down by to the
   fee, plus the registration deposit and the control output at creation,
   capped by `MAX_FEE_LOVELACE` and `MAX_SPONSORED_LOVELACE`; nothing is
-  paid out to a third party and nothing comes back to the sponsor in a
-  shape the pool cannot spend. In collateral mode `sponsor_outflow_zero`
+  paid out to a third party and what comes back to the sponsor is one
+  change output in a shape the pool can spend, never change fragmented
+  into UTxOs the pool would classify as reserve. In collateral mode `sponsor_outflow_zero`
   refuses any output to the sponsor payment key and any sponsor value
   entering the transaction, so the sponsor neither pays nor receives.
 - `no_sponsor_value_elsewhere` checks that every output away from the
@@ -118,6 +118,20 @@ own clock and trusts it to be within those 120 slots of the chain's.
 
 A client that takes leases and never uses them holds each one for
 `LEASE_TTL_SECONDS` at most, and at most `openLeases` of them at a time.
+A client that obtains witnesses and never submits holds more: each
+witnessed fee UTxO is held for the lease TTL plus the margin plus the
+restore slots, fourteen minutes with the defaults, and a key may take a
+fresh witness on it as soon as it returns. With the defaults, one key at
+60 witnesses per hour can hold the ten default fee UTxOs out of the pool
+by never submitting, for about two hours when it presents creations,
+which sponsor up to `MAX_SPONSORED_LOVELACE` each until the daily
+sponsored lovelace quota ends it, and for as long as the hourly quota
+lasts when it operates an account of its own, which sponsors the fee
+alone. Size `witnessesPerHour` against `FEE_UTXO_COUNT` for each key:
+holding one fee UTxO continuously takes about four witnesses per hour at
+the default TTL and margin, so a key allowed fewer than four times
+`FEE_UTXO_COUNT` witnesses per hour cannot freeze the pool by itself,
+and the audit trail shows a key whose witnesses never land.
 A client of the collateral route holds nothing: the shared collateral is
 not reserved for it, and a collateral witness it never submits ties up no
 UTxO, since the transaction spends none of the sponsor's. The bound such
@@ -213,7 +227,8 @@ valid for as long as its bound allows.
   of shell histories and logs.
 - Rotate `ADMIN_API_KEY` by changing the environment and restarting; it
   is not stored. Issue each client its own key with the quotas it needs,
-  and disable a key by setting `disabled_at` on its row.
+  and disable a key through `DELETE /admin/keys/:id`, which refuses
+  every later request with it and is written to the audit trail.
 - Keep the pool small: a few fee UTxOs and a couple of collateral UTxOs,
   one shared and one spare, sized for the traffic expected, with the
   reserve holding what a replenish needs. The pool, not the reserve, is

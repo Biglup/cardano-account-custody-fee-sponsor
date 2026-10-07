@@ -3,8 +3,13 @@ import type Database from 'better-sqlite3';
 /** What a pool UTxO is for: paying a client's fee, or backing collateral. */
 export type UtxoKind = 'fee' | 'collateral';
 
-/** Where a pool UTxO is in its life: leasable, held by a lease, spent by a witnessed transaction or taken as collateral, or vanished without either. */
-export type UtxoStatus = 'free' | 'leased' | 'consumed' | 'gone';
+/**
+ * Where a pool UTxO is in its life: leasable, held by a lease, spent by a
+ * witnessed transaction or taken as collateral, vanished without either,
+ * or retired because a pool size change left it outside every pool, after
+ * which it is never leased or restored and a replenish may spend it.
+ */
+export type UtxoStatus = 'free' | 'leased' | 'consumed' | 'gone' | 'retired';
 
 /** One sponsor UTxO as the pool table tracks it. */
 export interface PoolUtxo {

@@ -39,14 +39,14 @@ export const toAuditEntry = (row: AuditRow): RecordedAuditEntry => ({
 });
 
 /**
- * Appends a decision to the audit table. The detail is stored as JSON and
- * is meant to hold identifiers and amounts only: lease ids, UTxO
- * references, transaction hashes and lovelace, never a transaction body
- * or a key.
+ * Appends a decision made at `at` to the audit table. The detail is
+ * stored as JSON and is meant to hold identifiers and amounts only: lease
+ * ids, UTxO references, transaction hashes and lovelace, never a
+ * transaction body or a key.
  */
-export const recordAudit = (db: Database.Database, entry: AuditEntry): void => {
+export const recordAudit = (db: Database.Database, entry: AuditEntry, at: Date): void => {
   db.prepare('INSERT INTO audit (ts, api_key_id, action, outcome, detail) VALUES (?, ?, ?, ?, ?)').run(
-    new Date().toISOString(),
+    at.toISOString(),
     entry.apiKeyId ?? null,
     entry.action,
     entry.outcome,

@@ -8,10 +8,11 @@ import { type Config, loadConfig } from '../config.js';
 import { openDatabase } from '../db/connection.js';
 import { applyMigrations } from '../db/migrations.js';
 import { OutOfFundsError } from '../http/errors.js';
+import { bindSponsorAddress } from '../sponsor.js';
 import { type ServiceWallet, loadServiceWallet } from '../wallet.js';
-import { designatedCollateral } from './collateral.js';
 import { REPLENISH_FEE_MARGIN, minimumSplitLovelace } from './sizes.js';
 import { type PoolSync, createPoolSync } from './sync.js';
+import { utxoRef } from './utxo.js';
 
 /** How long a split waits for the chain to confirm it, in milliseconds. */
 const CONFIRMATION_TIMEOUT_MS = 180_000;
@@ -87,18 +88,28 @@ export const planSplit = (db: Database.Database, settings: ReplenishSettings, re
   return { feeUtxoLovelace, feeWanted, feeOutputs, collateralLovelace, collateralWanted, collateralOutputs };
 };
 
+/** The pool UTxOs a split must never spend: every one free, leased or consumed, the shared collateral among them, as `txHash#index` references. */
+const heldByPool = (db: Database.Database): Set<string> =>
+  new Set(
+    (db.prepare("SELECT tx_hash, tx_index FROM pool_utxos WHERE status IN ('free', 'leased', 'consumed')").all() as { tx_hash: string; tx_index: number }[]).map(
+      (row) => utxoRef(row.tx_hash, row.tx_index),
+    ),
+  );
+
 /**
  * Builds the self transaction of a split: every input comes from the
- * reserve, so pool UTxOs, leased or free, are never touched, and the
- * shared collateral UTxO is left out of the inputs the builder may draw
- * on whatever the reserve says, since a transaction witnessed against it
- * may land at any moment. Each planned output pays the sponsor address
- * its exact size, with the change returning to the same address. The
- * transaction is returned unsigned.
+ * reserve, and every UTxO the pool holds free, leased or consumed is
+ * left out of the inputs the builder may draw on whatever the reserve
+ * says, since a client may be building on a leased one, a transaction
+ * witnessed against a consumed one or against the shared collateral may
+ * land at any moment, and a pool size change can list any of them as
+ * reserve. Each planned output pays the sponsor address its exact size,
+ * with the change returning to the same address. The transaction is
+ * returned unsigned.
  */
 export const buildSplitTransaction = async (db: Database.Database, serviceWallet: ServiceWallet, sync: PoolSync, plan: SplitPlan): Promise<string> => {
-  const shared = designatedCollateral(db)?.utxo;
-  const spendable = sync.reserve().utxos.filter((utxo) => !(utxo.input.txId === shared?.txHash && utxo.input.index === shared.index));
+  const held = heldByPool(db);
+  const spendable = sync.reserve().utxos.filter((utxo) => !held.has(utxoRef(utxo.input.txId, utxo.input.index)));
   const builder = await serviceWallet.wallet.createTransactionBuilder();
   builder.setUtxos(spendable).setChangeAddress(serviceWallet.address);
   for (let i = 0; i < plan.feeOutputs; i += 1) {
@@ -162,7 +173,8 @@ const main = async (): Promise<void> => {
   const provider = new Cometa.BlockfrostProvider({ network: Cometa.NetworkMagic.Preprod, projectId: config.blockfrostProjectId });
   const serviceWallet = await loadServiceWallet(config, provider);
   const db = openDatabase(config.databasePath);
-  applyMigrations(db);
+  applyMigrations(db, new Date());
+  bindSponsorAddress(db, serviceWallet.address, new Date());
   const sync = createPoolSync({ db, provider, sponsorAddress: serviceWallet.address, sizes: config, slots: config.slots });
   const replenish = createReplenish({ db, provider, serviceWallet, sync, settings: config });
 

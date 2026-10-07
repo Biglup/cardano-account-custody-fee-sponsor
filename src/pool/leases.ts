@@ -151,7 +151,7 @@ export const createLeaseService = ({ db, sync, witnesses, settings, now = () => 
     const rows = selectExpired.all(now().toISOString()) as LeaseRow[];
     for (const row of rows) {
       closeLease(row, 'expired');
-      recordAudit(db, { apiKeyId: row.api_key_id, action: 'lease', outcome: 'expired', detail: { leaseId: row.id } });
+      recordAudit(db, { apiKeyId: row.api_key_id, action: 'lease', outcome: 'expired', detail: { leaseId: row.id } }, now());
     }
     return rows.length;
   };
@@ -221,7 +221,7 @@ export const createLeaseService = ({ db, sync, witnesses, settings, now = () => 
   /** Records a refusal under the open lease quota and rethrows it; any other failure passes through untouched. */
   const auditQuota = (apiKey: ApiKey, err: unknown): never => {
     if (err instanceof QuotaExceededError) {
-      recordAudit(db, { apiKeyId: apiKey.id, action: 'lease', outcome: err.code, detail: { quota: err.quota, reason: err.detail } });
+      recordAudit(db, { apiKeyId: apiKey.id, action: 'lease', outcome: err.code, detail: { quota: err.quota, reason: err.detail } }, now());
     }
     throw err;
   };
@@ -240,15 +240,19 @@ export const createLeaseService = ({ db, sync, witnesses, settings, now = () => 
     }
     if (typeof outcome === 'string') {
       const error = shortageError(outcome);
-      recordAudit(db, { apiKeyId: apiKey.id, action: 'lease', outcome: error.code, detail: { reason: outcome } });
+      recordAudit(db, { apiKeyId: apiKey.id, action: 'lease', outcome: error.code, detail: { reason: outcome } }, now());
       throw error;
     }
-    recordAudit(db, {
-      apiKeyId: apiKey.id,
-      action: 'lease',
-      outcome: 'created',
-      detail: { leaseId: outcome.id, feeUtxo: outcome.fee_utxo, expiresAt: outcome.expires_at },
-    });
+    recordAudit(
+      db,
+      {
+        apiKeyId: apiKey.id,
+        action: 'lease',
+        outcome: 'created',
+        detail: { leaseId: outcome.id, feeUtxo: outcome.fee_utxo, expiresAt: outcome.expires_at },
+      },
+      now(),
+    );
     return toLease(outcome);
   };
 
@@ -294,7 +298,7 @@ export const createLeaseService = ({ db, sync, witnesses, settings, now = () => 
     }
     if (row.status === 'open') {
       closeLease(row, 'released');
-      recordAudit(db, { apiKeyId: apiKey.id, action: 'lease', outcome: 'released', detail: { leaseId } });
+      recordAudit(db, { apiKeyId: apiKey.id, action: 'lease', outcome: 'released', detail: { leaseId } }, now());
     }
     return toLease({ ...row, status: 'released' });
   };

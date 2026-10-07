@@ -46,6 +46,79 @@ describe('POST /admin/keys', () => {
   });
 });
 
+describe('GET /admin/keys', () => {
+  it('lists every key with its quotas and times, oldest first, and never the hash', async () => {
+    const first = await request(service.app).post('/admin/keys').set(admin).send({ label: 'wallet-a', quotas: { openLeases: 7 } });
+    service.clock.now = new Date('2024-01-01T00:05:00.000Z');
+    const second = await request(service.app).post('/admin/keys').set(admin).send({ label: 'wallet-b' });
+    await request(service.app).delete(`/admin/keys/${second.body.id}`).set(admin);
+
+    const response = await request(service.app).get('/admin/keys').set(admin);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      keys: [
+        {
+          id: 1,
+          label: 'wallet-a',
+          quotas: { openLeases: 7, witnessesPerHour: 60, sponsoredLovelacePerDay: 600_000_000 },
+          createdAt: '2024-01-01T00:00:00.000Z',
+          disabledAt: null,
+        },
+        {
+          id: 2,
+          label: 'wallet-b',
+          quotas: { openLeases: 5, witnessesPerHour: 60, sponsoredLovelacePerDay: 600_000_000 },
+          createdAt: '2024-01-01T00:05:00.000Z',
+          disabledAt: '2024-01-01T00:05:00.000Z',
+        },
+      ],
+    });
+    expect(response.text).not.toContain(hashApiKey(first.body.apiKey));
+    expect(response.text).not.toContain(hashApiKey(second.body.apiKey));
+  });
+});
+
+describe('DELETE /admin/keys/:id', () => {
+  it('disables the key, records it, refuses the key afterwards and answers the same for a key already disabled', async () => {
+    service.fund(txHash(1), 0, 100_000_000n);
+    service.fund(txHash(2), 0, 5_000_000n);
+    const issued = await request(service.app).post('/admin/keys').set(admin).send({ label: 'wallet-a' });
+    const bearer = { Authorization: `Bearer ${issued.body.apiKey}` };
+    expect((await request(service.app).post('/v1/leases').set(bearer)).status).toBe(201);
+    service.clock.now = new Date('2024-01-01T00:05:00.000Z');
+
+    const disabled = await request(service.app).delete(`/admin/keys/${issued.body.id}`).set(admin);
+
+    expect(disabled.status).toBe(200);
+    expect(disabled.body).toEqual({ id: issued.body.id, label: 'wallet-a' });
+    expect((await request(service.app).post('/v1/leases').set(bearer)).status).toBe(401);
+    expect((await request(service.app).get('/v1/collateral').set(bearer)).status).toBe(401);
+    const audit = await request(service.app).get('/admin/audit').set(admin);
+    expect(audit.body.entries.filter((entry: { action: string }) => entry.action === 'key')).toEqual([
+      { id: expect.any(Number), ts: '2024-01-01T00:05:00.000Z', action: 'key', outcome: 'disabled', detail: { keyId: issued.body.id, label: 'wallet-a' } },
+    ]);
+
+    service.clock.now = new Date('2024-01-01T00:10:00.000Z');
+    const again = await request(service.app).delete(`/admin/keys/${issued.body.id}`).set(admin);
+    expect(again.status).toBe(200);
+    expect(again.body).toEqual({ id: issued.body.id, label: 'wallet-a' });
+    expect(service.db.prepare('SELECT disabled_at FROM api_keys WHERE id = ?').get(issued.body.id)).toEqual({ disabled_at: '2024-01-01T00:05:00.000Z' });
+    const unchanged = await request(service.app).get('/admin/audit').set(admin);
+    expect(unchanged.body.entries.filter((entry: { action: string }) => entry.action === 'key')).toHaveLength(1);
+  });
+
+  it('answers 404 not_found for an id no key has, and 400 invalid_request for an id that is not a number', async () => {
+    const unknown = await request(service.app).delete('/admin/keys/999').set(admin);
+    expect(unknown.status).toBe(404);
+    expect(unknown.body).toEqual({ error: 'not_found', detail: 'No key 999 exists' });
+
+    const malformed = await request(service.app).delete('/admin/keys/first').set(admin);
+    expect(malformed.status).toBe(400);
+    expect(malformed.body.error).toBe('invalid_request');
+  });
+});
+
 describe('GET /admin/pool', () => {
   it('reports the counts, the reserve, the open leases, the shared collateral and every live UTxO', async () => {
     service.fund(txHash(1), 0, 100_000_000n);
@@ -77,9 +150,8 @@ describe('GET /admin/audit', () => {
     await service.sync.run();
     const { apiKey, record } = service.issueKey();
     const lease = await request(service.app).post('/v1/leases').set('Authorization', `Bearer ${apiKey}`);
+    service.clock.now = new Date('2024-01-01T00:05:00.000Z');
     await request(service.app).delete(`/v1/leases/${lease.body.leaseId}`).set('Authorization', `Bearer ${apiKey}`);
-    service.db.prepare("UPDATE audit SET ts = '2024-01-01T00:00:00.000Z' WHERE outcome = 'created'").run();
-    service.db.prepare("UPDATE audit SET ts = '2024-01-01T00:05:00.000Z' WHERE outcome = 'released'").run();
 
     const everything = await request(service.app).get('/admin/audit').set(admin);
     const later = await request(service.app).get('/admin/audit').query({ since: '2024-01-01T00:05:00.000Z' }).set(admin);
@@ -107,9 +179,8 @@ describe('GET /admin/audit', () => {
     await service.sync.run();
     const { apiKey } = service.issueKey();
     const lease = await request(service.app).post('/v1/leases').set('Authorization', `Bearer ${apiKey}`);
+    service.clock.now = new Date('2024-01-01T00:05:00.000Z');
     await request(service.app).delete(`/v1/leases/${lease.body.leaseId}`).set('Authorization', `Bearer ${apiKey}`);
-    service.db.prepare("UPDATE audit SET ts = '2024-01-01T00:00:00.000Z' WHERE outcome = 'created'").run();
-    service.db.prepare("UPDATE audit SET ts = '2024-01-01T00:05:00.000Z' WHERE outcome = 'released'").run();
     const outcomes = async (since: string): Promise<string[]> => {
       const response = await request(service.app).get('/admin/audit').query({ since }).set(admin);
       expect(response.status).toBe(200);

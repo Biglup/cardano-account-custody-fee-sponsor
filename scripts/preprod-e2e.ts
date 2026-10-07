@@ -24,6 +24,7 @@ import {
 } from 'cardano-account-custody-offchain';
 import { config as loadEnvFile } from 'dotenv';
 import { type CollateralBody, type LeaseBody, SponsorError, SponsorWallet, type SponsorWalletOptions } from '../src/index.js';
+import { presetCollateralBound } from '../src/client/sponsor-wallet.js';
 import { Cometa } from '../src/cometa.js';
 import { type Config, loadConfig } from '../src/config.js';
 import type { RecordedAuditEntry } from '../src/audit.js';
@@ -31,6 +32,7 @@ import type { PoolCounts } from '../src/http/health.js';
 import { createLogger } from '../src/logger.js';
 import { type ParsedTransaction, parseTransaction } from '../src/policy/parse.js';
 import { createService } from '../src/service.js';
+import { type SlotSettings, slotAt } from '../src/slots.js';
 
 /** The repository root, where the environment file and the evidence document live. */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -358,8 +360,13 @@ interface CreationAmounts {
   invalidHereafter: bigint;
 }
 
-/** Reads the creation amounts off the transaction and checks that the sponsor paid exactly the fee, the deposit and the control output. */
-const creationAmounts = (tx: ParsedTransaction, lease: LeaseBody, owner: FreshWallet): CreationAmounts => {
+/**
+ * Reads the creation amounts off the transaction and checks that the
+ * sponsor paid exactly the fee, the deposit and the control output, and
+ * that the validity upper bound is the slot of the lease expiry, which
+ * is what the adapter presets in fee mode.
+ */
+const creationAmounts = (tx: ParsedTransaction, lease: LeaseBody, owner: FreshWallet, slots: SlotSettings): CreationAmounts => {
   const registration = tx.certificates.find((certificate) => certificate.kind === 'registration');
   const control = tx.outputs.find((output) => output.address === owner.account.address && output.assets[owner.account.stateNftAssetId] === 1n);
   if (registration?.deposit === undefined || control === undefined || tx.invalidHereafter === undefined) {
@@ -370,6 +377,10 @@ const creationAmounts = (tx: ParsedTransaction, lease: LeaseBody, owner: FreshWa
   const expected = tx.fee + registration.deposit + control.lovelace;
   if (sponsored !== expected) {
     throw new Error(`The sponsor paid ${sponsored} lovelace where the fee, the deposit and the control output account for ${expected}`);
+  }
+  const expiry = slotAt(slots, new Date(lease.expiresAt));
+  if (tx.invalidHereafter !== expiry) {
+    throw new Error(`The creation stops being valid at slot ${tx.invalidHereafter} where the lease expiry is slot ${expiry}`);
   }
   return { fee: tx.fee, deposit: registration.deposit, controlLovelace: control.lovelace, change, sponsored, invalidHereafter: tx.invalidHereafter };
 };
@@ -397,9 +408,15 @@ interface OperationAmounts {
  * what the policy in collateral mode requires of it: every input is one
  * of the account's UTxOs, no output pays the sponsor, the collateral is
  * exactly the shared UTxO with its return to the sponsor address, and the
- * body carries a validity upper bound.
+ * body carries the validity upper bound `expectedBound` says it should.
  */
-const operationAmounts = (tx: ParsedTransaction, account: DiscoveredAccount, accountUtxos: Set<string>, collateral: CollateralBody): OperationAmounts => {
+const operationAmounts = (
+  tx: ParsedTransaction,
+  account: DiscoveredAccount,
+  accountUtxos: Set<string>,
+  collateral: CollateralBody,
+  expectedBound: bigint,
+): OperationAmounts => {
   const foreign = tx.inputs.map(inputRef).filter((input) => !accountUtxos.has(input));
   if (foreign.length > 0) {
     throw new Error(`The operation spends ${foreign.join(', ')}, which the account does not hold`);
@@ -412,6 +429,9 @@ const operationAmounts = (tx: ParsedTransaction, account: DiscoveredAccount, acc
   }
   if (tx.collateralReturn?.address !== collateral.sponsorAddress || tx.totalCollateral === undefined || tx.invalidHereafter === undefined) {
     throw new Error('The operation lacks a collateral return to the sponsor, a total collateral or a validity upper bound');
+  }
+  if (tx.invalidHereafter !== expectedBound) {
+    throw new Error(`The operation stops being valid at slot ${tx.invalidHereafter} where slot ${expectedBound} was expected`);
   }
   const control = tx.outputs.find((output) => output.address === account.address && output.assets[account.stateNftAssetId] === 1n);
   if (control === undefined) {
@@ -689,7 +709,7 @@ const main = async (): Promise<void> => {
       throw new Error('The sponsor wallet holds no lease after building');
     }
     console.log(`  built on lease ${lease.leaseId}, fee UTxO ${lease.fee.txHash}#${lease.fee.index}`);
-    const creation = creationAmounts(parsed(creationTx), lease, owner);
+    const creation = creationAmounts(parsed(creationTx), lease, owner, config.slots);
     attempted.push({ hash: parsed(creationTx).hash, role: 'sponsored account creation' });
     const creationTxId = await submit(provider, [sponsor, owner.wallet], creationTx);
     console.log(`  submitted ${creationTxId}`);
@@ -729,16 +749,19 @@ const main = async (): Promise<void> => {
     console.log(`  submitted ${depositTxId}`);
     await settle(provider, depositTxId, depositParsed);
 
-    const collateral = new SponsorWallet({ baseUrl: running.baseUrl, apiKey, provider, mode: 'collateral' });
+    const clock = { now: new Date() };
+    const collateral = new SponsorWallet({ baseUrl: running.baseUrl, apiKey, provider, mode: 'collateral', now: () => clock.now });
+    const presetBound = (shared: CollateralBody): bigint => slotAt(config.slots, presetCollateralBound(shared, clock.now));
     const accountRefs = async (): Promise<Set<string>> => new Set((await provider.getUnspentOutputs(owner.account.address)).map(ref));
-    const operate = async (role: string, signer: Wallet, build: () => Promise<string>): Promise<Operation> => {
+    const operate = async (role: string, signer: Wallet, build: () => Promise<string>, expectedBound: (shared: CollateralBody) => bigint = presetBound): Promise<Operation> => {
       const held = await accountRefs();
+      clock.now = new Date();
       const tx = await build();
       const shared = collateral.collateral;
       if (shared === undefined) {
         throw new Error('The collateral wallet holds no shared collateral after building');
       }
-      const amounts = operationAmounts(parsed(tx), owner.account, held, shared);
+      const amounts = operationAmounts(parsed(tx), owner.account, held, shared, expectedBound(shared));
       attempted.push({ hash: parsed(tx).hash, role });
       const txId = await submit(provider, [collateral, signer], tx);
       console.log(`  submitted ${txId}, fee ${amounts.fee} paid by the account, collateral ${ref(shared)}`);
@@ -770,8 +793,10 @@ const main = async (): Promise<void> => {
       issueGrant({ owner: owner.keyHash, wallet: owner.wallet, collateral, provider, grant }),
     );
 
-    const grantSpend = (lovelace: bigint, unchecked: boolean): Promise<string> =>
-      spendWithGrant({
+    let agentValidUntilSlot = 0n;
+    const grantSpend = (lovelace: bigint, unchecked: boolean): Promise<string> => {
+      agentValidUntilSlot = currentSlot() + AGENT_VALIDITY_SLOTS;
+      return spendWithGrant({
         record,
         wallet: agent.wallet,
         collateral,
@@ -779,12 +804,18 @@ const main = async (): Promise<void> => {
         slot: GRANT_SLOT,
         grantee: agent.keyHash,
         outputs: [{ address: recipient.address, value: { coins: lovelace } }],
-        validUntilSlot: currentSlot() + AGENT_VALIDITY_SLOTS,
+        validUntilSlot: agentValidUntilSlot,
         unchecked,
       });
+    };
 
     console.log(`Step 5: agent spend of ${AGENT_SPEND_LOVELACE} lovelace within the cap, paid from the account`);
-    const agentSpend = await operate('agent spend within the cap, paid from the account', agent.wallet, () => grantSpend(AGENT_SPEND_LOVELACE, false));
+    const agentSpend = await operate(
+      'agent spend within the cap, paid from the account',
+      agent.wallet,
+      () => grantSpend(AGENT_SPEND_LOVELACE, false),
+      () => agentValidUntilSlot,
+    );
 
     console.log(`Step 6: agent spend of ${OVER_CAP_SPEND_LOVELACE} lovelace over the cap, built unchecked`);
     const overCapTx = await grantSpend(OVER_CAP_SPEND_LOVELACE, true);

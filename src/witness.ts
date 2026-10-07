@@ -154,23 +154,31 @@ export const createWitnessService = ({
 
   /** Refuses the transaction under a policy rule and records the refusal; nothing the client holds changes. */
   const refuse = (apiKey: ApiKey, subject: Subject, txHash: string | undefined, violation: Violation): never => {
-    recordAudit(db, {
-      apiKeyId: apiKey.id,
-      action: 'witness',
-      outcome: violation.rule,
-      detail: { ...subject, txHash: txHash ?? null, rule: violation.rule, reason: violation.detail },
-    });
+    recordAudit(
+      db,
+      {
+        apiKeyId: apiKey.id,
+        action: 'witness',
+        outcome: violation.rule,
+        detail: { ...subject, txHash: txHash ?? null, rule: violation.rule, reason: violation.detail },
+      },
+      now(),
+    );
     throw new InvalidTransactionError(violation.rule, violation.detail);
   };
 
   /** Records a refusal under a quota and rethrows it; nothing the client holds changes. */
   const refuseQuota = (apiKey: ApiKey, subject: Subject, txHash: string, error: QuotaExceededError): never => {
-    recordAudit(db, {
-      apiKeyId: apiKey.id,
-      action: 'witness',
-      outcome: error.code,
-      detail: { ...subject, txHash, quota: error.quota, reason: error.detail },
-    });
+    recordAudit(
+      db,
+      {
+        apiKeyId: apiKey.id,
+        action: 'witness',
+        outcome: error.code,
+        detail: { ...subject, txHash, quota: error.quota, reason: error.detail },
+      },
+      now(),
+    );
     throw error;
   };
 
@@ -198,12 +206,16 @@ export const createWitnessService = ({
 
   /** Records a refusal by the lease's state, or by a shortage of the service's own, and rethrows it; nothing changes. */
   const refuseWith = (apiKey: ApiKey, subject: Subject, txHash: string | undefined, error: ServiceError): never => {
-    recordAudit(db, {
-      apiKeyId: apiKey.id,
-      action: 'witness',
-      outcome: leaseOutcome(error),
-      detail: { ...subject, txHash: txHash ?? null, reason: error.detail ?? error.code },
-    });
+    recordAudit(
+      db,
+      {
+        apiKeyId: apiKey.id,
+        action: 'witness',
+        outcome: leaseOutcome(error),
+        detail: { ...subject, txHash: txHash ?? null, reason: error.detail ?? error.code },
+      },
+      now(),
+    );
     throw error;
   };
 
@@ -247,7 +259,7 @@ export const createWitnessService = ({
     if (issued === undefined || issued.txHash !== txHash) {
       return refuseWith(apiKey, { leaseId }, txHash, new LeaseConsumedError(leaseId));
     }
-    recordAudit(db, { apiKeyId: apiKey.id, action: 'witness', outcome: 'reissued', detail: { leaseId, txHash } });
+    recordAudit(db, { apiKeyId: apiKey.id, action: 'witness', outcome: 'reissued', detail: { leaseId, txHash } }, now());
     return { leaseId, witnessSet: issued.witnessSet };
   };
 
@@ -257,7 +269,7 @@ export const createWitnessService = ({
     if (issued === undefined || issued.leaseId !== undefined) {
       return undefined;
     }
-    recordAudit(db, { apiKeyId: apiKey.id, action: 'witness', outcome: 'reissued', detail: { mode: 'collateral', txHash } });
+    recordAudit(db, { apiKeyId: apiKey.id, action: 'witness', outcome: 'reissued', detail: { mode: 'collateral', txHash } }, now());
     return { txHash, witnessSet: issued.witnessSet };
   };
 
@@ -318,12 +330,16 @@ export const createWitnessService = ({
       }
       throw err;
     }
-    recordAudit(db, {
-      apiKeyId: apiKey.id,
-      action: 'witness',
-      outcome: 'issued',
-      detail: { leaseId, txHash: tx.hash, kind: signed.verdict.kind ?? null, sponsoredLovelace, fee: tx.fee.toString() },
-    });
+    recordAudit(
+      db,
+      {
+        apiKeyId: apiKey.id,
+        action: 'witness',
+        outcome: 'issued',
+        detail: { leaseId, txHash: tx.hash, kind: signed.verdict.kind ?? null, sponsoredLovelace, fee: tx.fee.toString() },
+      },
+      now(),
+    );
     logger?.info({ leaseId, txHash: tx.hash, kind: signed.verdict.kind, sponsoredLovelace }, 'Witness issued');
     return { leaseId, witnessSet: signed.witnessSet };
   };
@@ -365,12 +381,16 @@ export const createWitnessService = ({
       }
       throw err;
     }
-    recordAudit(db, {
-      apiKeyId: apiKey.id,
-      action: 'witness',
-      outcome: 'issued',
-      detail: { mode: 'collateral', txHash: tx.hash, kind: signed.verdict.kind ?? null, sponsoredLovelace, fee: tx.fee.toString() },
-    });
+    recordAudit(
+      db,
+      {
+        apiKeyId: apiKey.id,
+        action: 'witness',
+        outcome: 'issued',
+        detail: { mode: 'collateral', txHash: tx.hash, kind: signed.verdict.kind ?? null, sponsoredLovelace, fee: tx.fee.toString() },
+      },
+      now(),
+    );
     logger?.info({ mode: 'collateral', txHash: tx.hash, kind: signed.verdict.kind }, 'Witness issued');
     return { txHash: tx.hash, witnessSet: signed.witnessSet };
   };

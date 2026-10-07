@@ -40,6 +40,7 @@ export interface SyncReport {
   consumed: number;
   gone: number;
   restored: number;
+  retired: number;
   reserve: ReserveSnapshot;
 }
 
@@ -117,10 +118,15 @@ const poolOf = (utxo: UTxO, sizes: PoolSizes): UtxoKind | 'reserve' =>
  * lists stays consumed while any witness issued on it can still land, and
  * becomes free once the current slot, read off the clock, is more than
  * `RESTORE_MARGIN_SLOTS` past the validity upper bound of every one of
- * them, since no block can include those transactions any more. Every run
- * ends by keeping the shared collateral designated: the same UTxO while
- * the chain lists it, the next free collateral UTxO once it is consumed,
- * which is written to the audit trail with what replaced it.
+ * them, since no block can include those transactions any more. A UTxO
+ * the pool tracks that the chain still lists but that classifies as
+ * reserve now, because a pool size changed, is retired: any lease open
+ * on it is closed as for a vanished UTxO, the retirement is written to
+ * the audit trail, and the row is never leased or restored again, so the
+ * UTxO is the reserve's to split. Every run ends by keeping the shared
+ * collateral designated: the same UTxO while the chain lists it, the
+ * next free collateral UTxO once it is consumed, which is written to the
+ * audit trail with what replaced it, or retired.
  */
 export const createPoolSync = ({ db, provider, sponsorAddress, sizes, slots, now = () => new Date(), logger }: PoolSyncDependencies): PoolSync => {
   let reserve: ReserveSnapshot = { utxos: [], lovelace: 0n, syncedAt: undefined };
@@ -132,6 +138,7 @@ export const createPoolSync = ({ db, provider, sponsorAddress, sizes, slots, now
     "INSERT INTO pool_utxos (tx_hash, tx_index, lovelace, kind, status, discovered_at) VALUES (?, ?, ?, ?, 'free', ?)",
   );
   const restoreUtxo = db.prepare("UPDATE pool_utxos SET status = 'free' WHERE tx_hash = ? AND tx_index = ? AND status = 'gone'");
+  const retireUtxo = db.prepare("UPDATE pool_utxos SET status = 'retired' WHERE tx_hash = ? AND tx_index = ?");
   const hasWitness = db.prepare('SELECT 1 FROM witnesses w JOIN leases l ON l.id = w.lease_id WHERE l.fee_utxo = ? LIMIT 1');
   const settleUtxo = db.prepare('UPDATE pool_utxos SET status = ? WHERE tx_hash = ? AND tx_index = ?');
   const selectLatestBound = db.prepare(
@@ -152,18 +159,30 @@ export const createPoolSync = ({ db, provider, sponsorAddress, sizes, slots, now
     return bound !== null && BigInt(bound) + RESTORE_MARGIN_SLOTS < slot;
   };
 
-  /** Closes every open lease on a vanished fee UTxO by its own witness, freeing nothing, since the UTxO itself is settled. */
-  const closeLeasesOn = (ref: string): void => {
+  /** Closes every open lease on a fee UTxO that vanished or was retired by its own witness, freeing nothing, since the UTxO itself is settled. */
+  const closeLeasesOn = (ref: string, reason: 'utxo_vanished' | 'utxo_retired', at: Date): void => {
     for (const lease of selectOpenLeases.all(ref) as OpenLeaseRow[]) {
       const outcome = lease.witnessed ? 'consumed' : 'expired';
       settleLease.run(outcome, lease.id);
       refreshUtxoStatus(db, ref);
-      recordAudit(db, { apiKeyId: lease.api_key_id, action: 'lease', outcome, detail: { leaseId: lease.id, reason: 'utxo_vanished', utxo: ref } });
+      recordAudit(db, { apiKeyId: lease.api_key_id, action: 'lease', outcome, detail: { leaseId: lease.id, reason, utxo: ref } }, at);
     }
   };
 
-  const reconcile = db.transaction((listed: UTxO[], now: string, slot: bigint): Omit<SyncReport, 'reserve'> => {
-    const report = { discovered: 0, consumed: 0, gone: 0, restored: 0 };
+  /** Retires a tracked UTxO the chain lists at a size outside every pool, closing what was built on it. */
+  const retire = (utxo: UTxO, known: TrackedRow, at: Date): void => {
+    const ref = utxoRef(known.tx_hash, known.tx_index);
+    retireUtxo.run(known.tx_hash, known.tx_index);
+    if (known.kind === 'fee') {
+      closeLeasesOn(ref, 'utxo_retired', at);
+    }
+    recordAudit(db, { action: 'pool', outcome: 'retired', detail: { utxo: ref, kind: known.kind, was: known.status, lovelace: utxo.output.value.coins.toString() } }, at);
+    logger?.warn({ utxo: ref, kind: known.kind, was: known.status }, 'Pool UTxO retired, since it lies outside every pool size');
+  };
+
+  const reconcile = db.transaction((listed: UTxO[], current: Date, slot: bigint): Omit<SyncReport, 'reserve'> => {
+    const now = current.toISOString();
+    const report = { discovered: 0, consumed: 0, gone: 0, restored: 0, retired: 0 };
     const tracked = new Map<string, TrackedRow>();
     for (const row of selectTracked.all() as TrackedRow[]) {
       tracked.set(utxoRef(row.tx_hash, row.tx_index), row);
@@ -176,10 +195,14 @@ export const createPoolSync = ({ db, provider, sponsorAddress, sizes, slots, now
       const ref = utxoRef(utxo.input.txId, utxo.input.index);
       seen.add(ref);
       const kind = poolOf(utxo, sizes);
+      const known = tracked.get(ref);
       if (kind === 'reserve') {
+        if (known !== undefined && known.status !== 'retired') {
+          retire(utxo, known, current);
+          report.retired += 1;
+        }
         continue;
       }
-      const known = tracked.get(ref);
       if (known === undefined) {
         insertUtxo.run(utxo.input.txId, utxo.input.index, Number(utxo.output.value.coins), kind, now);
         report.discovered += 1;
@@ -188,14 +211,14 @@ export const createPoolSync = ({ db, provider, sponsorAddress, sizes, slots, now
         report.restored += 1;
       } else if (known.status === 'consumed' && known.kind === 'fee' && everyWitnessLapsed(ref, slot)) {
         freeConsumed.run(utxo.input.txId, utxo.input.index);
-        recordAudit(db, { action: 'pool', outcome: 'restored', detail: { utxo: ref, slot: slot.toString() } });
+        recordAudit(db, { action: 'pool', outcome: 'restored', detail: { utxo: ref, slot: slot.toString() } }, current);
         report.restored += 1;
       }
     }
 
     let consumedShared: string | undefined;
     for (const [ref, row] of tracked) {
-      if (seen.has(ref) || row.status === 'gone' || row.status === 'consumed') {
+      if (seen.has(ref) || row.status === 'gone' || row.status === 'consumed' || row.status === 'retired') {
         continue;
       }
       const shared = ref === sharedRef;
@@ -203,7 +226,7 @@ export const createPoolSync = ({ db, provider, sponsorAddress, sizes, slots, now
       const status = shared || witnessed ? 'consumed' : 'gone';
       settleUtxo.run(status, row.tx_hash, row.tx_index);
       if (row.kind === 'fee') {
-        closeLeasesOn(ref);
+        closeLeasesOn(ref, 'utxo_vanished', current);
       }
       if (shared) {
         consumedShared = ref;
@@ -214,7 +237,7 @@ export const createPoolSync = ({ db, provider, sponsorAddress, sizes, slots, now
     const chosen = refreshSharedCollateral(db, now, logger);
     if (consumedShared !== undefined) {
       const next = chosen === undefined ? null : utxoRef(chosen.txHash, chosen.index);
-      recordAudit(db, { action: 'pool', outcome: 'collateral_consumed', detail: { utxo: consumedShared, next } });
+      recordAudit(db, { action: 'pool', outcome: 'collateral_consumed', detail: { utxo: consumedShared, next } }, current);
       logger?.warn({ utxo: consumedShared, next }, 'Shared collateral consumed');
     }
     return report;
@@ -224,7 +247,7 @@ export const createPoolSync = ({ db, provider, sponsorAddress, sizes, slots, now
     const listed = await provider.getUnspentOutputs(sponsorAddress);
     const current = now();
     const syncedAt = current.toISOString();
-    const changes = reconcile(listed, syncedAt, slotAt(slots, current));
+    const changes = reconcile(listed, current, slotAt(slots, current));
     const reserveUtxos = listed.filter((utxo) => poolOf(utxo, sizes) === 'reserve');
     reserve = {
       utxos: reserveUtxos,
@@ -233,7 +256,14 @@ export const createPoolSync = ({ db, provider, sponsorAddress, sizes, slots, now
     };
     const report = { ...changes, reserve };
     logger?.info(
-      { discovered: report.discovered, consumed: report.consumed, gone: report.gone, restored: report.restored, reserveLovelace: reserve.lovelace.toString() },
+      {
+        discovered: report.discovered,
+        consumed: report.consumed,
+        gone: report.gone,
+        restored: report.restored,
+        retired: report.retired,
+        reserveLovelace: reserve.lovelace.toString(),
+      },
       'Pool synced',
     );
     return report;

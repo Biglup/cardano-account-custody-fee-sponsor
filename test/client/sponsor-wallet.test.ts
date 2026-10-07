@@ -266,7 +266,7 @@ describe('SponsorWallet', () => {
     service.provider.removeUtxo({ txId: txHash(200), index: 0 });
     await service.sync.run();
 
-    await expect(sponsor.signTransaction(stale, true)).rejects.toMatchObject({ status: 422, code: 'invalid_transaction', rule: 'uses_leased_collateral' });
+    await expect(sponsor.signTransaction(stale, true)).rejects.toMatchObject({ status: 422, code: 'invalid_transaction', rule: 'uses_shared_collateral' });
 
     expect(sponsor.lease).toBeUndefined();
     expect(service.db.prepare('SELECT status FROM leases WHERE id = ?').get(first)).toEqual({ status: 'released' });

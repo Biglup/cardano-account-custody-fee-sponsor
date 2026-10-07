@@ -11,6 +11,7 @@ import { type LeaseService, createLeaseService } from './pool/leases.js';
 import { type ReplenishFn, createReplenish } from './pool/replenish.js';
 import { type PoolSync, createPoolSync } from './pool/sync.js';
 import { type WitnessStore, createWitnessStore } from './pool/witnesses.js';
+import { bindSponsorAddress } from './sponsor.js';
 import { type ServiceWallet, loadServiceWallet } from './wallet.js';
 import { type WitnessService, createWitnessService } from './witness.js';
 
@@ -45,7 +46,8 @@ export interface Service {
  * Assembles the service from its configuration and a provider: the
  * sponsor wallet derived from the mnemonic, which is wiped from the
  * configuration in the process, the database at the configured path with
- * its migrations applied, the pool sync, the shared collateral, the
+ * its migrations applied and bound to the sponsor address, which refuses
+ * a database of another sponsor, the pool sync, the shared collateral, the
  * witness store, the lease, replenish and witness services, and the
  * express application over them. Nothing is started;
  * the caller starts the jobs and listens where it sees fit, which is what
@@ -61,7 +63,13 @@ export const createService = async ({ config, provider, logger, now = () => new 
   }
 
   const db = openDatabase(config.databasePath);
-  applyMigrations(db);
+  applyMigrations(db, now());
+  try {
+    bindSponsorAddress(db, serviceWallet.address, now());
+  } catch (err) {
+    db.close();
+    throw err;
+  }
 
   const sync = createPoolSync({ db, provider, sponsorAddress: serviceWallet.address, sizes: config, slots: config.slots, now, logger });
   const collateral = createSharedCollateral({ db, sync, settings: config });
@@ -83,6 +91,7 @@ export const createService = async ({ config, provider, logger, now = () => new 
     witness,
     sync,
     replenish,
+    now,
   });
 
   return {

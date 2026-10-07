@@ -321,7 +321,6 @@ const toParsedOutput = (output: TxOut): ParsedOutput => ({
   hasReferenceScript: output.scriptReference !== undefined,
 });
 
-/** The transaction id: the hash of the body exactly as it is serialised. */
 /** A refusal under the first rule. */
 const wellFormedViolation = (detail: string): ParseResult => ({ violation: { rule: 'well_formed', detail } });
 

@@ -42,11 +42,14 @@ export interface SponsorWalletOptions {
 /** The error codes after which the lease the wallet holds can no longer be built on, so the next use takes a new one. */
 const LEASE_GONE = new Set(['unknown_lease', 'lease_expired', 'lease_consumed']);
 
-/** The collateral rule of collateral mode; a refusal under it drops the shared collateral held, since the service no longer accepts it as declared, so the next use reads the current one. */
+/**
+ * The collateral rule of both modes; a refusal under it drops what the
+ * wallet holds, since it names a collateral the service no longer accepts
+ * as declared: the lease is given back in fee mode, so the next use takes
+ * one naming the current collateral, and the shared collateral is
+ * forgotten in collateral mode, so the next use reads the current one.
+ */
 const SHARED_COLLATERAL_RULE = 'uses_shared_collateral';
-
-/** The collateral rule of fee mode; a refusal under it gives the lease back, since it names a collateral the service no longer accepts, so the next use takes a lease naming the current one. */
-const LEASE_COLLATERAL_RULE = 'uses_leased_collateral';
 
 /**
  * How much of the collateral validity window a builder leaves unused when
@@ -55,6 +58,17 @@ const LEASE_COLLATERAL_RULE = 'uses_leased_collateral';
  * within the window the service measures from its own now.
  */
 const COLLATERAL_BOUND_MARGIN_SECONDS = 60;
+
+/**
+ * The validity upper bound a builder in collateral mode presets, as a
+ * time, for the shared collateral read at `now`: the end of the
+ * collateral validity window less the margin, or less half the window
+ * when that is smaller.
+ */
+export const presetCollateralBound = (collateral: Pick<CollateralBody, 'validitySeconds'>, now: Date): Date => {
+  const margin = Math.min(COLLATERAL_BOUND_MARGIN_SECONDS, Math.floor(collateral.validitySeconds / 2));
+  return new Date(now.getTime() + (collateral.validitySeconds - margin) * 1000);
+};
 
 /**
  * A coin selector that spends nothing beyond the inputs the builder was
@@ -327,12 +341,11 @@ export class SponsorWallet implements Wallet {
         .setCollateralUtxos([sponsorUtxo(grant.lease.collateral)])
         .expiresAfter(new Date(grant.lease.expiresAt));
     }
-    const margin = Math.min(COLLATERAL_BOUND_MARGIN_SECONDS, Math.floor(grant.collateral.validitySeconds / 2));
     return builder
       .setUtxos([])
       .setCoinSelector(explicitInputsOnly)
       .setCollateralUtxos([sponsorUtxo(grant.collateral)])
-      .expiresAfter(new Date(this.now().getTime() + (grant.collateral.validitySeconds - margin) * 1000));
+      .expiresAfter(presetCollateralBound(grant.collateral, this.now()));
   }
 
   /** The grant the wallet holds, or undefined when it holds none or holds a lease that has expired on the wallet's clock. */
@@ -404,7 +417,7 @@ export class SponsorWallet implements Wallet {
         } else {
           this.consumed = undefined;
         }
-      } else if (error.rule === LEASE_COLLATERAL_RULE && repeat === undefined) {
+      } else if (error.rule === SHARED_COLLATERAL_RULE && repeat === undefined) {
         this.held = undefined;
         await this.giveBack(leaseId);
       }

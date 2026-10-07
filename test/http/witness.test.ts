@@ -407,7 +407,7 @@ describe('transaction policy', () => {
     expectViolation(await witness(taken.leaseId, transaction), 'uses_leased_fee_input', /is not among the inputs/);
   });
 
-  it('uses_leased_collateral: refuses collateral other than the shared UTxO, a spare collateral UTxO included', async () => {
+  it('uses_shared_collateral: refuses collateral other than the shared UTxO, a spare collateral UTxO included', async () => {
     await fundPool(1, 2);
     const control = placeControl();
     const taken = await lease();
@@ -417,12 +417,12 @@ describe('transaction policy', () => {
 
     expectViolation(
       await witness(taken.leaseId, transaction),
-      'uses_leased_collateral',
+      'uses_shared_collateral',
       new RegExp(`collateral inputs must be exactly the shared collateral UTxO ${txHash(200)}#0`),
     );
   });
 
-  it('uses_leased_collateral: refuses a transaction without a collateral return to the sponsor', async () => {
+  it('uses_shared_collateral: refuses a transaction without a collateral return to the sponsor', async () => {
     await fundPool();
     const control = placeControl();
     const taken = await lease();
@@ -430,38 +430,38 @@ describe('transaction policy', () => {
       customise: (builder) => builder.setCollateralChangeAddress(strangerAddress),
     });
 
-    expectViolation(await witness(taken.leaseId, transaction), 'uses_leased_collateral', /collateral return must pay the sponsor address/);
+    expectViolation(await witness(taken.leaseId, transaction), 'uses_shared_collateral', /collateral return must pay the sponsor address/);
   });
 
-  it('uses_leased_collateral: refuses total collateral above what the shared collateral UTxO holds', async () => {
+  it('uses_shared_collateral: refuses total collateral above what the shared collateral UTxO holds', async () => {
     await fundPool();
     const control = placeControl();
     const taken = await lease();
     const transaction = withTotalCollateral(await buildOwnerOperation(service, taken, control), 6_000_000n);
 
-    expectViolation(await witness(taken.leaseId, transaction), 'uses_leased_collateral', /Total collateral 6000000 exceeds the 5000000 lovelace/);
+    expectViolation(await witness(taken.leaseId, transaction), 'uses_shared_collateral', /Total collateral 6000000 exceeds the 5000000 lovelace/);
   });
 
-  it('uses_leased_collateral: refuses a collateral return carrying a datum or a reference script', async () => {
+  it('uses_shared_collateral: refuses a collateral return carrying a datum or a reference script', async () => {
     await fundPool();
     const control = placeControl();
     const taken = await lease();
     const plain = await buildOwnerOperation(service, taken, control);
 
     const withDatum = withCollateralReturn(plain, outputWithDatumHash(taken.sponsorAddress, 4_000_000n, '00'.repeat(32)));
-    expectViolation(await witness(taken.leaseId, withDatum), 'uses_leased_collateral', /collateral return carries a datum/);
+    expectViolation(await witness(taken.leaseId, withDatum), 'uses_shared_collateral', /collateral return carries a datum/);
 
     const withScript = withCollateralReturn(plain, outputWithReferenceScript(taken.sponsorAddress, 4_000_000n, foreignScript));
-    expectViolation(await witness(taken.leaseId, withScript), 'uses_leased_collateral', /collateral return carries a reference script/);
+    expectViolation(await witness(taken.leaseId, withScript), 'uses_shared_collateral', /collateral return carries a reference script/);
   });
 
-  it('uses_leased_collateral: refuses a transaction flagged as failing phase two', async () => {
+  it('uses_shared_collateral: refuses a transaction flagged as failing phase two', async () => {
     await fundPool();
     const taken = await lease();
     const transaction = markInvalid(await buildCreation(service, taken));
     expect(Cometa.inspectTx(transaction).is_valid).toBe(false);
 
-    expectViolation(await witness(taken.leaseId, transaction), 'uses_leased_collateral', /flagged as failing phase two/);
+    expectViolation(await witness(taken.leaseId, transaction), 'uses_shared_collateral', /flagged as failing phase two/);
   });
 
   it('bounded_validity: refuses a transaction without a validity upper bound, or one past the lease expiry plus the margin', async () => {
@@ -626,6 +626,19 @@ describe('transaction policy', () => {
       'sponsor_outflow_bounded',
       /drawn down by \d+ lovelace but the fee, the registration deposit and the control output account for \d+/,
     );
+  });
+
+  it('sponsor_outflow_bounded: refuses change fragmented over two outputs to the sponsor, even when the sponsor is drawn down by the fee alone', async () => {
+    await fundPool();
+    const control = placeControl();
+    const taken = await lease();
+    const transaction = await buildOwnerOperation(service, taken, control, {
+      customise: (builder) => builder.sendLovelace({ address: taken.sponsorAddress, amount: 2_000_000n }),
+    });
+    const parsed = parseTransaction(transaction).transaction;
+    expect(parsed?.outputs.filter((output) => output.address === taken.sponsorAddress)).toHaveLength(2);
+
+    expectViolation(await witness(taken.leaseId, transaction), 'sponsor_outflow_bounded', /pays the sponsor 2 outputs where exactly one change output is expected/);
   });
 
   it('sponsor_outflow_bounded: refuses an output to the sponsor carrying a datum or a reference script', async () => {

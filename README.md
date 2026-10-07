@@ -235,8 +235,29 @@ optional with any of `openLeases`, `witnessesPerHour` and
 }
 ```
 
-The key is stored as its SHA-256 hash. A key is disabled by setting
-`disabled_at` on its row.
+The key is stored as its SHA-256 hash.
+
+### `GET /admin/keys`
+
+Answers 200 with every key ever issued, oldest first, never the hash:
+
+```json
+{
+  "keys": [
+    { "id": 1, "label": "my dapp", "quotas": { "openLeases": 5, "witnessesPerHour": 60, "sponsoredLovelacePerDay": 600000000 }, "createdAt": "2026-10-07T12:00:00.000Z", "disabledAt": null }
+  ]
+}
+```
+
+### `DELETE /admin/keys/:id`
+
+Disables the key, after which every request presenting it answers 401
+`unauthorized`; its open leases run out by themselves. Answers 200
+`{ "id": 1, "label": "my dapp" }`, also for a key already disabled, which
+keeps the time it was first disabled at.
+
+- 404 `not_found` for an id no key has; 400 `invalid_request` for an id
+  that is not a number.
 
 ### `GET /admin/pool`
 
@@ -291,7 +312,7 @@ margin, fee outputs first.
 ## Transaction policy
 
 The witness routes sign only a transaction that passes every rule, in
-this order; the first failure is the one reported under `rule`. Three
+this order; the first failure is the one reported under `rule`. Two
 rules ask something different in each mode and answer under another
 name.
 
@@ -306,13 +327,14 @@ name.
    cannot be read, such as one at a Byron address, is refused.
    `no_sponsor_inputs` in collateral mode: no input is a sponsor UTxO at
    all, the shared collateral spent as a regular input included.
-3. `uses_leased_collateral` in fee mode, `uses_shared_collateral` in
-   collateral mode: the transaction is not flagged `is_valid = false`,
-   the collateral inputs are exactly the shared collateral UTxO, the
-   collateral return pays the sponsor address and carries neither a
-   datum nor a reference script, and total collateral is set and within
-   what the UTxO holds. A transaction built on a collateral UTxO the
-   pool has since replaced fails here.
+3. `uses_shared_collateral`: the transaction is not flagged
+   `is_valid = false`, the collateral inputs are exactly the shared
+   collateral UTxO, which the lease named in fee mode and
+   `GET /v1/collateral` in collateral mode, the collateral return pays
+   the sponsor address and carries neither a datum nor a reference
+   script, and total collateral is set and within what the UTxO holds.
+   A transaction built on a collateral UTxO the pool has since replaced
+   fails here.
 4. `bounded_validity`: the body sets a validity upper bound later than
    the slot of the service's current time and no later than the slot of
    the lease expiry plus `VALIDITY_MARGIN_SECONDS` in fee mode, or of
@@ -327,11 +349,11 @@ name.
    credential and locks it in exactly one output at an account address
    staked to that credential.
 6. `sponsor_outflow_bounded` in fee mode: the fee is at most
-   `MAX_FEE_LOVELACE`, every output back to the sponsor address is plain
-   lovelace with neither a datum nor a reference script, and the fee
-   UTxO is drawn down, after that change, by exactly the fee plus, at
-   creation only, the registration deposit and the control output's
-   lovelace, at most `MAX_SPONSORED_LOVELACE`. `sponsor_outflow_zero`
+   `MAX_FEE_LOVELACE`, exactly one output pays the sponsor address, the
+   change, as plain lovelace with neither a datum nor a reference
+   script, and the fee UTxO is drawn down, after that change, by exactly
+   the fee plus, at creation only, the registration deposit and the
+   control output's lovelace, at most `MAX_SPONSORED_LOVELACE`. `sponsor_outflow_zero`
    in collateral mode: no output pays the sponsor payment key at any
    base, enterprise or pointer address, and no withdrawal draws from
    the sponsor's reward account; the fee is the account's and not
@@ -359,7 +381,7 @@ name.
 | Rule | Fee mode | Collateral mode |
 | ---- | -------- | --------------- |
 | Sponsor inputs | `uses_leased_fee_input`: the leased fee UTxO and no other | `no_sponsor_inputs`: none |
-| Collateral | `uses_leased_collateral`: the shared UTxO the lease named | `uses_shared_collateral`: the shared UTxO `GET /v1/collateral` names |
+| Collateral | `uses_shared_collateral`: the shared UTxO the lease named | `uses_shared_collateral`: the shared UTxO `GET /v1/collateral` names |
 | Sponsor outflow | `sponsor_outflow_bounded`: exactly the fee, plus deposit and control UTxO at creation | `sponsor_outflow_zero`: nothing in, nothing out |
 | Validity bound | at most the lease expiry plus `VALIDITY_MARGIN_SECONDS` | at most now plus `COLLATERAL_VALIDITY_SECONDS` |
 
@@ -400,6 +422,16 @@ replacement, and designates the oldest free collateral UTxO in its
 place; a transaction built on the old one fails the collateral rule and
 is built again on the new one. A spare collateral UTxO that vanishes is
 marked `gone` and restored when it reappears.
+
+A pool UTxO the chain still lists but that lies outside every pool size
+is retired, which happens when `FEE_UTXO_LOVELACE` or
+`COLLATERAL_UTXO_LOVELACE` changes under a populated pool: a lease open
+on it is closed as for a vanished UTxO, the retirement is recorded as a
+`pool` audit entry, and the row is marked `retired`, a terminal status
+that is never leased, never designated as collateral and never restored.
+The UTxO is then the reserve's, and a replenish may split it. A replenish
+never spends a UTxO the pool holds free, leased or consumed, whatever the
+reserve lists.
 
 ## Quotas and rate limits
 
@@ -470,20 +502,29 @@ Requires Node 22.
    that checkout present. Only `npm run typecheck:scripts` and the
    preprod proof use it, and both need it built there with `npm run
    build` in that directory; the service, its tests, `npm run lint` and
-   `npm run typecheck` do not.
+   `npm run typecheck` do not. The `file:` dependency and the continuous
+   integration workflow are pinned to contract commit `ced2fe4`, the one
+   that adds the collateral wallet option the preprod proof builds on;
+   `package-lock.json` must be regenerated whenever the contract's
+   off-chain package changes its dependencies.
 3. Start the service with `npm run dev`, or `npm run start` without the
    file watcher.
 
-The database schema is created on first start at `DATABASE_PATH`.
+The database schema is created on first start at `DATABASE_PATH`, and
+the database is bound to the sponsor address derived from
+`SPONSOR_MNEMONIC`: a later start whose mnemonic derives another address
+is refused, since the pool, the leases and the witnesses describe one
+wallet's UTxOs.
 
 ### Replenishing
 
 `npm run replenish` splits the sponsor wallet's reserve into fee and
 collateral UTxOs up to the configured targets and prints the transaction
-id and the counts; `POST /admin/pool/replenish` does the same on a
-running service with optional counts. Fund the sponsor address, run a
-replenish, and `GET /health` reports the free fee UTxOs and the shared
-collateral. A replenish spends the reserve only.
+id and the counts; it is for a stopped service, since it writes the pool
+tables the service owns while it runs. `POST /admin/pool/replenish` is
+the way to replenish while the service runs, with optional counts. Fund
+the sponsor address, run a replenish, and `GET /health` reports the free
+fee UTxOs and the shared collateral. A replenish spends the reserve only.
 
 ### Audit trail
 
@@ -494,10 +535,10 @@ Actions and outcomes: `lease` with `created`, `released`, `expired`,
 `witness` with `issued`, `reissued`, the name of the rule that refused
 the transaction, `unknown_lease`, `lease_expired`, `lease_released`,
 `lease_consumed`, `quota_exceeded`, `no_utxo_available` and
-`out_of_funds`; `pool` with `restored` and `collateral_consumed`. A
-witness entry carries the lease id or `mode: collateral`, the
-transaction hash, whether it was a `creation` or an `operation`, the
-sponsored lovelace and the fee.
+`out_of_funds`; `pool` with `restored`, `retired` and
+`collateral_consumed`; `key` with `disabled`. A witness entry carries
+the lease id or `mode: collateral`, the transaction hash, whether it was
+a `creation` or an `operation`, the sponsored lovelace and the fee.
 
 ### Operator notes
 
@@ -511,6 +552,17 @@ sponsored lovelace and the fee.
 - The schema is defined in the initial migration only. A database
   created by an earlier development build is not migrated and must be
   deleted before starting.
+- Changing `FEE_UTXO_LOVELACE` or `COLLATERAL_UTXO_LOVELACE` under a
+  populated pool retires every pool UTxO of the old size on the next
+  sync: open leases on them are closed, so a client building on one has
+  its witness request refused and takes a new lease, and the UTxOs
+  become reserve for the next replenish. A fee UTxO whose witnessed
+  spend has not landed yet is retired all the same, and a replenish may
+  then spend it ahead of that transaction; change the sizes while no
+  witness is outstanding, or accept that such a transaction may be
+  invalidated. Replenish after the change so the pool holds UTxOs of the
+  new sizes. Retired rows stay retired if the sizes are reverted; a
+  replenish, not a restore, puts UTxOs of the old size back in the pool.
 - The service reads the chain's current slot off its own clock, so keep
   the clock disciplined with NTP. A clock ahead of the chain shortens
   the time a witnessed fee UTxO is held back; the 120 slot restore
@@ -567,7 +619,7 @@ const txId = await sponsor.submitTransaction(Cometa.applyVkeyWitnessSet(tx, witn
   `detail`; an answer with no service error body, such as a proxy's, is
   thrown with code `unexpected_response`. A policy refusal leaves the
   lease open for a corrected transaction, except one under
-  `uses_leased_collateral`, after which the lease is given back and the
+  `uses_shared_collateral`, after which the lease is given back and the
   next use takes a lease naming the current collateral. A lease the
   service reports as `unknown_lease`, `lease_expired` or
   `lease_consumed` is dropped so the next use takes a new one.
@@ -613,9 +665,11 @@ collateral alone.
 
 ### One copy of cometa
 
-Any cometa object passed into the adapter's builder, such as a script or
-a reward address, must come from the same copy of cometa the adapter
-runs on. cometa keeps its WebAssembly state per loaded copy, and an
+The consumer must await `Cometa.ready()` on the copy of cometa the
+adapter runs on before the adapter is first used; the adapter does not
+load the WebAssembly module itself. Any cometa object passed into the
+adapter's builder, such as a script or a reward address, must come from
+that same copy. cometa keeps its WebAssembly state per loaded copy, and an
 object of one copy holds a pointer that another copy reads as garbage. A
 registry install of this package and of cometa dedupes them into one
 copy; a `file:` link does not, and a consumer linked that way must point
@@ -668,7 +722,8 @@ surroundings.
   rest on its transactions, so one process serves one database and
   there is no horizontal scaling without a shared database.
 - Preprod only: the network and the Blockfrost endpoint are fixed to
-  preprod.
+  preprod, and mainnet is refused in code, since the service carries the
+  slot settings of preprod alone.
 - The service has not been audited.
 
 ## License

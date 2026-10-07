@@ -1,8 +1,8 @@
 import type Database from 'better-sqlite3';
 import { Router } from 'express';
 import { z } from 'zod';
-import { type AuditRow, toAuditEntry } from '../audit.js';
-import { createApiKey, quotasSchema } from '../keys.js';
+import { type AuditRow, recordAudit, toAuditEntry } from '../audit.js';
+import { createApiKey, disableApiKey, listApiKeys, quotasSchema } from '../keys.js';
 import { designatedCollateral } from '../pool/collateral.js';
 import type { LeaseService } from '../pool/leases.js';
 import type { ReplenishFn } from '../pool/replenish.js';
@@ -11,10 +11,14 @@ import { type PoolUtxoRow, toPoolUtxo } from '../pool/utxo.js';
 import { asyncHandler } from './async.js';
 import { requireAdminKey } from './auth.js';
 import { parseBody } from './body.js';
+import { NotFoundError } from './errors.js';
 import { poolCounts } from './health.js';
 
 /** The body of a key issuance request: a label to recognise the key by, and optional quota overrides. */
 const createKeySchema = z.object({ label: z.string().trim().min(1).max(100), quotas: quotasSchema.optional() }).strict();
+
+/** The parameters of a request naming one key: its id, as the issuance answered it. */
+const keyParamsSchema = z.object({ id: z.coerce.number().int().positive() }).strict();
 
 /** The body of a replenish request; every field is optional and defaults to the configuration. */
 const replenishSchema = z
@@ -46,30 +50,51 @@ const auditQuerySchema = z
   })
   .strict();
 
-/** What the admin routes need injected. */
+/** What the admin routes need injected; `now` is the clock keys are issued and disabled by. */
 export interface AdminDependencies {
   db: Database.Database;
   adminApiKey: string;
   sync: PoolSync;
   leases: LeaseService;
   replenish: ReplenishFn;
+  now: () => Date;
 }
 
 /**
  * The admin routes under `/admin`: every one requires the admin key.
- * Keys are issued here and shown once; the pool can be inspected, with
- * the collateral UTxO currently shared and when it was chosen, and
- * replenished from the sponsor wallet; the audit trail can be read back
- * from a point in time, so an operator can follow what every key did.
+ * Keys are issued here and shown once, listed without their hashes and
+ * disabled, which is written to the audit trail and refuses every later
+ * request with the key; the pool can be inspected, with the collateral
+ * UTxO currently shared and when it was chosen, and replenished from the
+ * sponsor wallet; the audit trail can be read back from a point in time,
+ * so an operator can follow what every key did.
  */
-export const createAdminRouter = ({ db, adminApiKey, sync, leases, replenish }: AdminDependencies): Router => {
+export const createAdminRouter = ({ db, adminApiKey, sync, leases, replenish, now }: AdminDependencies): Router => {
   const router = Router();
   router.use(requireAdminKey(adminApiKey));
 
   router.post('/keys', (req, res) => {
     const { label, quotas } = parseBody(createKeySchema, req.body);
-    const issued = createApiKey(db, label, quotas);
+    const issued = createApiKey(db, label, quotas ?? {}, now());
     res.status(201).json({ apiKey: issued.apiKey, id: issued.record.id, label: issued.record.label, quotas: issued.record.quotas });
+  });
+
+  router.get('/keys', (_req, res) => {
+    const keys = listApiKeys(db).map((key) => ({ ...key, disabledAt: key.disabledAt ?? null }));
+    res.json({ keys });
+  });
+
+  router.delete('/keys/:id', (req, res) => {
+    const { id } = parseBody(keyParamsSchema, req.params);
+    const at = now();
+    const disabled = disableApiKey(db, id, at);
+    if (disabled === undefined) {
+      throw new NotFoundError(`No key ${id} exists`);
+    }
+    if (!disabled.alreadyDisabled) {
+      recordAudit(db, { action: 'key', outcome: 'disabled', detail: { keyId: id, label: disabled.record.label } }, at);
+    }
+    res.json({ id: disabled.record.id, label: disabled.record.label });
   });
 
   router.get('/pool', (_req, res) => {

@@ -28,7 +28,13 @@ interface Migration {
  * two concurrent requests from leasing the same fee UTxO. Collateral is
  * never leased: `shared_collateral` names the one collateral UTxO every
  * transaction declares, which the pool sync designates and replaces, so
- * that a restart keeps the same one.
+ * that a restart keeps the same one. A UTxO is retired when a pool size
+ * change leaves it outside every pool; a retired row is never leased or
+ * restored, and stays so the UTxO is still known as the sponsor's.
+ *
+ * `sponsor` records the address the pool belongs to on first start, so
+ * that a later start from a different mnemonic is refused rather than
+ * mixing two wallets' UTxOs in one pool.
  */
 const INITIAL_SCHEMA = `
 CREATE TABLE api_keys (
@@ -45,9 +51,15 @@ CREATE TABLE pool_utxos (
   tx_index INTEGER NOT NULL,
   lovelace INTEGER NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN ('fee', 'collateral')),
-  status TEXT NOT NULL CHECK (status IN ('free', 'leased', 'consumed', 'gone')),
+  status TEXT NOT NULL CHECK (status IN ('free', 'leased', 'consumed', 'gone', 'retired')),
   discovered_at TEXT NOT NULL,
   PRIMARY KEY (tx_hash, tx_index)
+);
+
+CREATE TABLE sponsor (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  address TEXT NOT NULL,
+  recorded_at TEXT NOT NULL
 );
 
 CREATE TABLE shared_collateral (
@@ -101,10 +113,11 @@ const migrations: Migration[] = [
 
 /**
  * Applies every migration that has not yet run against `db`, recording
- * each one in `schema_migrations` so a later call is a no-op. Safe to call
- * on every startup and, for tests, against a fresh in memory database.
+ * each one in `schema_migrations` as applied at `at`, so a later call is
+ * a no-op. Safe to call on every startup and, for tests, against a fresh
+ * in memory database.
  */
-export const applyMigrations = (db: Database.Database): void => {
+export const applyMigrations = (db: Database.Database, at: Date): void => {
   db.exec('CREATE TABLE IF NOT EXISTS schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)');
   const appliedRows = db.prepare('SELECT id FROM schema_migrations').all() as { id: string }[];
   const applied = new Set(appliedRows.map((row) => row.id));
@@ -115,7 +128,7 @@ export const applyMigrations = (db: Database.Database): void => {
     }
     const runMigration = db.transaction(() => {
       migration.up(db);
-      db.prepare('INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)').run(migration.id, new Date().toISOString());
+      db.prepare('INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)').run(migration.id, at.toISOString());
     });
     runMigration();
   }
