@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import { Cometa } from '../src/cometa.js';
-import type { LeaseBody } from '../src/http/leases.js';
+import type { LeaseBody } from '../src/api.js';
 import type { RuleName } from '../src/policy/rules.js';
 import {
   CONTROL_LOVELACE,

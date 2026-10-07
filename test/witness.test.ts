@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Wallet } from '@biglup/cometa';
+import type { LeaseBody } from '../src/api.js';
 import { InvalidTransactionError, LeaseConsumedError, LeaseExpiredError, QuotaExceededError } from '../src/http/errors.js';
-import { type LeaseBody, toLeaseBody } from '../src/http/leases.js';
+import { toLeaseBody } from '../src/http/leases.js';
 import type { ApiKey } from '../src/keys.js';
 import { parseTransaction } from '../src/policy/parse.js';
 import type { Lease, LeaseService } from '../src/pool/leases.js';

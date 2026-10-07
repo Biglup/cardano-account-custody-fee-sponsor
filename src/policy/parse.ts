@@ -2,6 +2,7 @@ import type { AssetAmounts, Credential, PlutusLanguageVersion, Provider, Redeeme
 import { z } from 'zod';
 import { Cometa } from '../cometa.js';
 import { utxoRef } from '../pool/utxo.js';
+import { transactionHash } from '../transaction-hash.js';
 import type { Violation } from './rules.js';
 
 /** The largest transaction the service inspects, which is also the protocol's own limit. */
@@ -321,12 +322,6 @@ const toParsedOutput = (output: TxOut): ParsedOutput => ({
 });
 
 /** The transaction id: the hash of the body exactly as it is serialised. */
-const transactionHash = (cbor: string): string => {
-  const reader = Cometa.CborReader.fromHex(cbor);
-  reader.readStartArray();
-  return Cometa.uint8ArrayToHex(Cometa.Blake2b.computeHash(reader.readEncodedValue(), 32));
-};
-
 /** A refusal under the first rule. */
 const wellFormedViolation = (detail: string): ParseResult => ({ violation: { rule: 'well_formed', detail } });
 

@@ -64,8 +64,11 @@ export const stateNftAssetId = `${accountScriptHash}${stakeScriptHash}`;
 /** A constructor with the given index and fields. */
 const constr = (index: number, fields: PlutusData[] = []): PlutusData => ({ constructor: BigInt(index), fields: { items: fields } });
 
-/** The account state of a freshly created account: one device, no grants, generation zero. */
-export const initialState: PlutusData = constr(0, [{ items: [Cometa.hexToUint8Array(DEVICE_KEY)] }, { items: [] }, 0n]);
+/** The account state of a freshly created account owned by `device`: that one device, no grants, generation zero. */
+export const initialStateOf = (device: string): PlutusData => constr(0, [{ items: [Cometa.hexToUint8Array(device)] }, { items: [] }, 0n]);
+
+/** The account state of a freshly created account: the fixture device, no grants, generation zero. */
+export const initialState: PlutusData = initialStateOf(DEVICE_KEY);
 
 /** The redeemer of the owner path, the mint handler and the stake script, none of which carries data. */
 export const unitRedeemer: PlutusData = constr(0);

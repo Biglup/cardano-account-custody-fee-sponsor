@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import type { Credential } from '@biglup/cometa';
 import { Cometa } from '../../src/cometa.js';
-import type { LeaseBody } from '../../src/http/leases.js';
+import type { LeaseBody } from '../../src/api.js';
 import { MAX_TRANSACTION_BYTES, parseTransaction, paymentCredentialOf, plutusLanguageOf, resolveInputs } from '../../src/policy/parse.js';
 import {
   DEVICE_KEY,

@@ -1,11 +1,11 @@
 import type { TransactionBuilder, TxEvaluator, UTxO } from '@biglup/cometa';
 import { Cometa } from '../../src/cometa.js';
-import type { LeaseBody, LeasedUtxoBody } from '../../src/http/leases.js';
+import type { LeaseBody, LeasedUtxoBody } from '../../src/api.js';
 import {
   accountAddress,
   accountRewardAddress,
   accountScript,
-  initialState,
+  initialStateOf,
   stakeScript,
   stateNftAssetId,
   unitRedeemer,
@@ -26,10 +26,12 @@ export interface ClientOptions {
   customise?: Customise;
 }
 
-/** How a client shapes an account creation beyond the fixtures' defaults: the control output's lovelace and address. */
+/** How a client shapes an account creation beyond the fixtures' defaults: the control output's lovelace and address, and the owner device. */
 export interface CreationOptions extends ClientOptions {
   controlLovelace?: bigint;
   controlAddress?: string;
+  /** The key that owns the account and signs its creation; the fixture device unless said otherwise. */
+  device?: string;
 }
 
 /** The UTxO a leased UTxO of the API response resolves to. */
@@ -68,27 +70,32 @@ export const clientBuilder = (service: TestService, lease: LeaseBody, options: C
 };
 
 /** The inline datum of a control output carrying the initial state. */
-const stateDatum = { type: Cometa.DatumType.InlineData, inlineDatum: initialState } as const;
+const stateDatum = { type: Cometa.DatumType.InlineData, inlineDatum: initialStateOf(DEVICE_KEY) } as const;
 
 /**
- * Builds an account creation on the lease, as the contract's builder
- * does with a sponsor: the stake credential is registered with its
- * deposit, the state NFT is minted into a control output at the account
- * address, the owner device signs, and the sponsor pays for all of it.
+ * Shapes a builder into an account creation, as the contract's builder
+ * does on a sponsor's builder: the stake credential is registered with
+ * its deposit, the state NFT is minted into a control output at the
+ * account address with the initial state inline, the owner device signs,
+ * and whatever the builder spends pays for all of it.
  */
-export const buildCreation = async (service: TestService, lease: LeaseBody, options: CreationOptions = {}): Promise<string> => {
-  const builder = clientBuilder(service, lease, options);
+export const shapeCreation = (builder: TransactionBuilder, options: CreationOptions = {}): TransactionBuilder => {
+  const device = options.device ?? DEVICE_KEY;
   builder.registerStakeAddress({ rewardAddress: accountRewardAddress, redeemer: unitRedeemer });
   builder.mintToken({ assetIdHex: stateNftAssetId, amount: 1n, redeemer: unitRedeemer });
   builder.lockValue({
     scriptAddress: options.controlAddress ?? accountAddress,
     value: { coins: options.controlLovelace ?? CONTROL_LOVELACE, assets: { [stateNftAssetId]: 1n } },
-    datum: stateDatum,
+    datum: { type: Cometa.DatumType.InlineData, inlineDatum: initialStateOf(device) },
   });
-  builder.addSigner(DEVICE_KEY).addScript(accountScript).addScript(stakeScript);
+  builder.addSigner(device).addScript(accountScript).addScript(stakeScript);
   options.customise?.(builder);
-  return builder.build();
+  return builder;
 };
+
+/** Builds an account creation on the lease, with the sponsor paying for all of it. */
+export const buildCreation = (service: TestService, lease: LeaseBody, options: CreationOptions = {}): Promise<string> =>
+  shapeCreation(clientBuilder(service, lease, options), options).build();
 
 /**
  * Builds an owner operation on the lease: the control UTxO is spent with

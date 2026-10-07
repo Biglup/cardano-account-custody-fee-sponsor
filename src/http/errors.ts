@@ -1,11 +1,5 @@
 import type { NextFunction, Request, Response } from 'express';
-
-/** The JSON body every error response carries: a machine readable code, and, for a policy failure, which rule failed and why. */
-export interface ErrorResponseBody {
-  error: string;
-  rule?: string;
-  detail?: string;
-}
+import type { ErrorResponseBody } from '../api.js';
 
 /**
  * The base of every error the service maps to a specific HTTP status and

@@ -13,7 +13,13 @@ Requires Node 22.
    - `ADMIN_API_KEY`
    - `PORT`
    - `DATABASE_PATH`
-2. Install dependencies: `npm install`
+2. Install dependencies: `npm install`. The contract's off-chain library
+   is a development dependency linked from a sibling checkout at
+   `../cardano-account-custody-contract/offchain`, so the install needs
+   that checkout present. Only the preprod proof under `scripts` uses it;
+   the service, its tests, `npm run typecheck` and `npm run lint` stand
+   without it being built, and `npm run typecheck:scripts` needs it built
+   there with `npm run build`.
 3. Start the service: `npm run dev`
 
 `GET /health` answers once the service is up. On start the service lists
@@ -175,10 +181,96 @@ the lease, so that requests in flight at the same time cannot pass them
 together. A witness set answered again for the same transaction counts
 once.
 
+## Client adapter
+
+`SponsorWallet`, exported from the package root, is a cometa wallet over
+the API, to pass as the `sponsor` of the account contract's builders:
+
+```ts
+import { SponsorWallet } from 'cardano-account-custody-fee-sponsor';
+
+const sponsor = new SponsorWallet({ baseUrl: 'https://sponsor.example', apiKey, provider });
+const tx = await createAccount({ owner, wallet: ownerWallet, sponsor, provider, state });
+const witnesses = [...(await sponsor.signTransaction(tx, true)), ...(await ownerWallet.signTransaction(tx, true))];
+const txId = await sponsor.submitTransaction(Cometa.applyVkeyWitnessSet(tx, witnesses));
+```
+
+- A lease is taken on first use and held until a witness consumes it,
+  `release()` gives it up or it expires; the next use takes a new one.
+  `lease` is the one held, with its UTxOs and its expiry.
+- What the wallet reports as its own is what the lease grants: the sponsor
+  address, the leased fee UTxO as its only spendable UTxO and the leased
+  collateral UTxO as its only collateral.
+- `createTransactionBuilder()` returns a cometa builder preset with those,
+  the provider as its evaluator, both change outputs to the sponsor and
+  the validity upper bound at the lease expiry, so the contract's
+  builders, which set no bound of their own, pass `bounded_validity`
+  unchanged. A client that sets its own bound must keep it within the
+  lease expiry plus `VALIDITY_MARGIN_SECONDS`.
+- `signTransaction` posts the transaction to the witness route and
+  returns the sponsor's witness set; the client appends its own
+  signatures and submits, and `submitTransaction` goes straight to the
+  provider, since the service never submits. A refusal is thrown as
+  `SponsorError` with the HTTP `status`, the error `code`, the policy
+  `rule` when the code is `invalid_transaction`, and the `detail`. A
+  policy refusal leaves the lease open for a corrected transaction; a
+  lease the service reports as unknown, expired or consumed is dropped so
+  the next use takes a new one. Signing the transaction the last witness
+  was issued for again, as a client does after losing the answer, goes
+  back to the lease it consumed and receives the same witness set rather
+  than taking a new lease the policy would then refuse.
+- Any cometa object passed into the adapter's builder, such as a script
+  or a reward address, must come from the same copy of cometa the adapter
+  runs on. cometa keeps its WebAssembly state per loaded copy, and an
+  object of one copy holds a pointer that another copy reads as garbage.
+  A registry install of the package and of cometa dedupes them into one
+  copy; a `file:` link does not, and a consumer linked that way must
+  point every resolution of cometa at one copy, as `scripts/shared-cometa.ts`
+  does for the preprod proof.
+
+The contract's `createAccount` with a sponsor builds exactly what the
+policy accepts at creation. Its owner operations with a sponsor let the
+sponsor pay the control output's growth, when the state outgrows the
+lovelace the control UTxO holds, and receive withdrawn rewards as change,
+both of which the policy refuses under `sponsor_outflow_bounded`, which
+requires an operation to draw exactly the fee from the sponsor. So
+`withdrawRewards` with a sponsor is refused whenever it withdraws
+anything, since the withdrawal lands in the sponsor's change, and `addDevice`,
+`issueGrant` and `rewriteState` with a sponsor are refused once the
+larger state raises the control output's minimum lovelace above what it
+holds; the other owner operations with a sponsor pass while the control
+output keeps its lovelace. Owner operations the service will not pay for
+are built without a sponsor, paid from the account's own funds with the
+device wallet providing the collateral.
+
+## Preprod proof
+
+`npm run preprod-e2e` runs the whole loop against preprod and spends
+test ADA from the sponsor wallet: it starts the service in this process
+from `.env` on a free local port, issues a client key, replenishes the
+pool when fewer than three fee UTxOs are free, creates a custody account
+for a fresh owner wallet that holds no ADA (an account index of the
+sponsor mnemonic from 10 upwards whose stake credential is not
+registered) through the contract's `createAccount` with `SponsorWallet`
+as the sponsor, checks the control UTxO, the registration and the
+amounts on chain, has the service refuse a creation that also pays
+sponsor value to a third party and the reuse of the consumed lease, and
+writes [docs/preprod-evidence.md](docs/preprod-evidence.md).
+
+The script builds through the contract's off-chain library, linked from
+the sibling checkout described under Running, which must be built there
+first. It loads `scripts/shared-cometa.ts` before the library so that
+both use this repository's copy of cometa, since the link does not
+dedupe the two copies and the reward address the contract's builder
+registers would otherwise be read by the wrong one.
+
 ## Commands
 
 - `npm test` runs the test suite.
 - `npm run lint` runs eslint.
-- `npm run typecheck` runs the TypeScript compiler with no output.
+- `npm run typecheck` runs the TypeScript compiler with no output over the service and its tests.
+- `npm run typecheck:scripts` does the same over `scripts`, which needs the sibling contract checkout built.
 - `npm run start` runs the service without the file watcher.
+- `npm run build` compiles the package to `dist`, which is what another project imports the client adapter from.
 - `npm run replenish` splits the sponsor wallet into the pool of fee and collateral UTxOs.
+- `npm run preprod-e2e` runs the preprod proof described above.

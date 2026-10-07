@@ -1,17 +1,8 @@
-import type Database from 'better-sqlite3';
-import type { Express } from 'express';
 import type { UTxO } from '@biglup/cometa';
 import pino from 'pino';
-import { type Config, loadConfig } from '../../src/config.js';
-import { openDatabase } from '../../src/db/connection.js';
-import { applyMigrations } from '../../src/db/migrations.js';
-import { createApp } from '../../src/http/app.js';
+import { loadConfig } from '../../src/config.js';
 import { type ApiKey, type QuotaOverrides, createApiKey } from '../../src/keys.js';
-import { type LeaseService, createLeaseService } from '../../src/pool/leases.js';
-import { type ReplenishFn, createReplenish } from '../../src/pool/replenish.js';
-import { type PoolSync, createPoolSync } from '../../src/pool/sync.js';
-import { type ServiceWallet, loadServiceWallet } from '../../src/wallet.js';
-import { type WitnessService, createWitnessService } from '../../src/witness.js';
+import { type Service, createService } from '../../src/service.js';
 import { FakeProvider } from './fake.js';
 import { fakeTransactionId, transactionParts } from './transaction.js';
 
@@ -24,12 +15,13 @@ export const TEST_ADMIN_KEY = 'test-admin-key';
 /** A logger that writes nothing. */
 export const silentLogger = pino({ level: 'silent' });
 
-/** The environment the test service is configured from. */
+/** The environment the test service is configured from: fake credentials and a database that lives only for the test. */
 export const testEnv = (overrides: Record<string, string> = {}): Record<string, string> => ({
   BLOCKFROST_PREPROD_PROJECT_ID: 'preprodTestProjectId',
   SPONSOR_MNEMONIC: TEST_MNEMONIC,
   ACCOUNT_SCRIPT_HASH: '0524f57b785cf3a45b7ed6029b387dc39ffb2411bd1cb4300c58c2c3',
   ADMIN_API_KEY: TEST_ADMIN_KEY,
+  DATABASE_PATH: ':memory:',
   ...overrides,
 });
 
@@ -53,17 +45,9 @@ export class FakeChain extends FakeProvider {
   }
 }
 
-/** The test service: every component the routes and jobs depend on, built on an in memory database and the fake chain. */
-export interface TestService {
-  config: Config;
-  db: Database.Database;
+/** The test service: the real composition on an in memory database and the fake chain, with a clock the tests move. */
+export interface TestService extends Omit<Service, 'provider' | 'start' | 'stop'> {
   provider: FakeChain;
-  serviceWallet: ServiceWallet;
-  sync: PoolSync;
-  leases: LeaseService;
-  witness: WitnessService;
-  replenish: ReplenishFn;
-  app: Express;
   /** The clock the lease service, the witness service and the pool sync read; move it to expire leases and to pass validity bounds. */
   clock: { now: Date };
   /** Issues an API key and returns both the secret and its record. */
@@ -77,51 +61,29 @@ export interface TestService {
 export const createTestService = async (overrides: Record<string, string> = {}): Promise<TestService> => {
   const config = loadConfig(testEnv(overrides));
   const provider = new FakeChain();
-  const serviceWallet = await loadServiceWallet(config, provider);
-  const db = openDatabase(':memory:');
-  applyMigrations(db);
   const clock = { now: new Date('2024-01-01T00:00:00.000Z') };
-  const sync = createPoolSync({ db, provider, sponsorAddress: serviceWallet.address, sizes: config, slots: config.slots, now: () => clock.now });
-  const leases = createLeaseService({ db, sync, settings: config, now: () => clock.now });
-  const replenish = createReplenish({ db, provider, serviceWallet, sync, settings: config });
-  const witness = createWitnessService({ db, provider, serviceWallet, leases, settings: config, now: () => clock.now });
-  const app = createApp({
-    db,
-    logger: silentLogger,
-    network: config.network,
-    adminApiKey: config.adminApiKey,
-    rateLimit: config,
-    lease: { sponsorAddress: serviceWallet.address, maxSponsoredLovelace: config.maxSponsoredLovelace },
-    leases,
-    witness,
-    sync,
-    replenish,
-  });
+  const service = await createService({ config, provider, logger: silentLogger, now: () => clock.now });
   return {
-    config,
-    db,
+    config: service.config,
+    db: service.db,
     provider,
-    serviceWallet,
-    sync,
-    leases,
-    witness,
-    replenish,
-    app,
+    serviceWallet: service.serviceWallet,
+    sync: service.sync,
+    leases: service.leases,
+    witness: service.witness,
+    replenish: service.replenish,
+    app: service.app,
     clock,
     issueKey: (label = 'test', quotas = {}) => {
-      const issued = createApiKey(db, label, quotas);
+      const issued = createApiKey(service.db, label, quotas);
       return { apiKey: issued.apiKey, record: issued.record };
     },
     fund: (txId, index, lovelace) => {
-      const utxo: UTxO = { input: { txId, index }, output: { address: serviceWallet.address, value: { coins: lovelace } } };
+      const utxo: UTxO = { input: { txId, index }, output: { address: service.serviceWallet.address, value: { coins: lovelace } } };
       provider.addUtxo(utxo);
       return utxo;
     },
-    close: () => {
-      sync.stop();
-      leases.stop();
-      db.close();
-    },
+    close: () => service.stop(),
   };
 };
 

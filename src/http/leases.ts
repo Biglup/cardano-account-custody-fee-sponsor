@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3';
 import { type RequestHandler, Router } from 'express';
 import { z } from 'zod';
+import type { LeaseBody, LeasedUtxoBody, WitnessBody } from '../api.js';
 import type { Lease, LeaseService } from '../pool/leases.js';
 import type { PoolUtxo } from '../pool/utxo.js';
 import type { WitnessService } from '../witness.js';
@@ -10,24 +11,6 @@ import { parseBody } from './body.js';
 
 /** The body of a witness request: the unsigned transaction as CBOR hex; whether it decodes is the policy's first rule. */
 const witnessSchema = z.object({ transaction: z.string().min(1) }).strict();
-
-/** A leased UTxO as the API presents it, with the address the client must resolve it at. */
-export interface LeasedUtxoBody {
-  txHash: string;
-  index: number;
-  address: string;
-  lovelace: number;
-}
-
-/** The body of a lease response. */
-export interface LeaseBody {
-  leaseId: string;
-  expiresAt: string;
-  fee: LeasedUtxoBody;
-  collateral: LeasedUtxoBody;
-  sponsorAddress: string;
-  maxSponsoredLovelace: number;
-}
 
 /** What the lease routes need to know about the sponsor. */
 export interface LeaseRouteSettings {
@@ -89,7 +72,8 @@ export const createLeaseRouter = (
     asyncHandler(async (req, res) => {
       const { transaction } = parseBody(witnessSchema, req.body);
       const issued = await witness.issue(apiKeyOf(res), req.params.id ?? '', transaction);
-      res.json({ witnessSet: issued.witnessSet, leaseId: issued.leaseId });
+      const body: WitnessBody = { witnessSet: issued.witnessSet, leaseId: issued.leaseId };
+      res.json(body);
     }),
   );
 

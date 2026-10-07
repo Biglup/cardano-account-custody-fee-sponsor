@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import type { RewardAddress, UTxO } from '@biglup/cometa';
 import { Cometa } from '../../src/cometa.js';
-import type { LeaseBody } from '../../src/http/leases.js';
+import type { LeaseBody } from '../../src/api.js';
 import { parseTransaction } from '../../src/policy/parse.js';
 import type { RuleName } from '../../src/policy/rules.js';
 import {
