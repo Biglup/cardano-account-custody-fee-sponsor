@@ -48,7 +48,7 @@ export class FakeChain extends FakeProvider {
 /** The test service: the real composition on an in memory database and the fake chain, with a clock the tests move. */
 export interface TestService extends Omit<Service, 'provider' | 'start' | 'stop'> {
   provider: FakeChain;
-  /** The clock the lease service, the witness service and the pool sync read; move it to expire leases and to pass validity bounds. */
+  /** The clock the lease service, the witness store, the witness service and the pool sync read; move it to expire leases and to pass validity bounds. */
   clock: { now: Date };
   /** Issues an API key and returns both the secret and its record. */
   issueKey(label?: string, quotas?: QuotaOverrides): { apiKey: string; record: ApiKey };
@@ -69,6 +69,8 @@ export const createTestService = async (overrides: Record<string, string> = {}):
     provider,
     serviceWallet: service.serviceWallet,
     sync: service.sync,
+    collateral: service.collateral,
+    witnesses: service.witnesses,
     leases: service.leases,
     witness: service.witness,
     replenish: service.replenish,

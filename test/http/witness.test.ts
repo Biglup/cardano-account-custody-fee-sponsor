@@ -26,7 +26,7 @@ import {
   strangerAddress,
   unitRedeemer,
 } from '../support/account.js';
-import { buildCreation, buildOwnerOperation, clientBuilder, leasedUtxo, lenientEvaluator, underDeclaringEvaluator } from '../support/client.js';
+import { buildCreation, buildOwnerOperation, clientBuilder, sponsorUtxo, lenientEvaluator, underDeclaringEvaluator } from '../support/client.js';
 import { type TestService, createTestService, txHash } from '../support/service.js';
 import {
   authCommitteeHotCertificate,
@@ -135,7 +135,7 @@ describe('POST /v1/leases/:id/witness', () => {
 
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ leaseId: taken.leaseId, witnessSet: expect.stringMatching(/^[0-9a-f]+$/) });
-    expectSponsorWitness(response.body.witnessSet, transaction, [leasedUtxo(taken.fee), leasedUtxo(taken.collateral)]);
+    expectSponsorWitness(response.body.witnessSet, transaction, [sponsorUtxo(taken.fee), sponsorUtxo(taken.collateral)]);
 
     const parsed = parseTransaction(transaction).transaction;
     const row = service.db.prepare('SELECT * FROM witnesses WHERE lease_id = ?').get(taken.leaseId) as Record<string, unknown>;
@@ -155,7 +155,7 @@ describe('POST /v1/leases/:id/witness', () => {
     const response = await witness(taken.leaseId, transaction);
 
     expect(response.status).toBe(200);
-    expectSponsorWitness(response.body.witnessSet, transaction, [leasedUtxo(taken.fee), leasedUtxo(taken.collateral), control]);
+    expectSponsorWitness(response.body.witnessSet, transaction, [sponsorUtxo(taken.fee), sponsorUtxo(taken.collateral), control]);
     const row = service.db.prepare('SELECT sponsored_lovelace FROM witnesses WHERE lease_id = ?').get(taken.leaseId) as { sponsored_lovelace: number };
     expect(BigInt(row.sponsored_lovelace)).toBe(parseTransaction(transaction).transaction?.fee);
   });
@@ -292,7 +292,7 @@ describe('POST /v1/leases/:id/witness', () => {
     await witness(taken.leaseId, await buildCreation(service, taken));
 
     const health = await request(service.app).get('/health');
-    expect(health.body.pool).toEqual({ fee: { free: 1, leased: 0 }, collateral: { free: 1, leased: 0 } });
+    expect(health.body.pool).toEqual({ fee: { free: 1, leased: 0 }, collateral: { shared: true, spare: 0, consumed: 0 } });
     const next = await lease();
     expect(next.fee.txHash).toBe(txHash(101));
     const third = await request(service.app).post('/v1/leases').set(bearer());
@@ -341,7 +341,7 @@ describe('transaction policy', () => {
     const taken = await lease();
     const otherFee: UTxO = { input: { txId: txHash(101), index: 0 }, output: { address: taken.sponsorAddress, value: { coins: 100_000_000n } } };
     const transaction = await buildOwnerOperation(service, taken, control, {
-      customise: (builder) => builder.addInput({ utxo: leasedUtxo(taken.fee) }).addInput({ utxo: otherFee }),
+      customise: (builder) => builder.addInput({ utxo: sponsorUtxo(taken.fee) }).addInput({ utxo: otherFee }),
     });
 
     expectViolation(await witness(taken.leaseId, transaction), 'uses_leased_fee_input', new RegExp(`Input ${txHash(101)}#0 belongs to the sponsor`));
@@ -407,14 +407,19 @@ describe('transaction policy', () => {
     expectViolation(await witness(taken.leaseId, transaction), 'uses_leased_fee_input', /is not among the inputs/);
   });
 
-  it('uses_leased_collateral: refuses collateral other than the leased UTxO', async () => {
+  it('uses_leased_collateral: refuses collateral other than the shared UTxO, a spare collateral UTxO included', async () => {
     await fundPool(1, 2);
     const control = placeControl();
     const taken = await lease();
-    const otherCollateral: UTxO = { input: { txId: txHash(201), index: 0 }, output: { address: taken.sponsorAddress, value: { coins: 5_000_000n } } };
-    const transaction = await buildOwnerOperation(service, taken, control, { customise: (builder) => builder.setCollateralUtxos([otherCollateral]) });
+    expect(taken.collateral.txHash).toBe(txHash(200));
+    const spare: UTxO = { input: { txId: txHash(201), index: 0 }, output: { address: taken.sponsorAddress, value: { coins: 5_000_000n } } };
+    const transaction = await buildOwnerOperation(service, taken, control, { customise: (builder) => builder.setCollateralUtxos([spare]) });
 
-    expectViolation(await witness(taken.leaseId, transaction), 'uses_leased_collateral', /collateral inputs must be exactly the leased collateral UTxO/);
+    expectViolation(
+      await witness(taken.leaseId, transaction),
+      'uses_leased_collateral',
+      new RegExp(`collateral inputs must be exactly the shared collateral UTxO ${txHash(200)}#0`),
+    );
   });
 
   it('uses_leased_collateral: refuses a transaction without a collateral return to the sponsor', async () => {
@@ -428,7 +433,7 @@ describe('transaction policy', () => {
     expectViolation(await witness(taken.leaseId, transaction), 'uses_leased_collateral', /collateral return must pay the sponsor address/);
   });
 
-  it('uses_leased_collateral: refuses total collateral above what the leased collateral UTxO holds', async () => {
+  it('uses_leased_collateral: refuses total collateral above what the shared collateral UTxO holds', async () => {
     await fundPool();
     const control = placeControl();
     const taken = await lease();

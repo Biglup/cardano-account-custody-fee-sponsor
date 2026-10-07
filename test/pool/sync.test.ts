@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { RESTORE_MARGIN_SLOTS, classifyUtxo } from '../../src/pool/sync.js';
+import { RESTORE_MARGIN_SLOTS, classifyUtxo, createPoolSync } from '../../src/pool/sync.js';
 import { SLOT_SETTINGS_BY_NETWORK, slotAt } from '../../src/slots.js';
 import { type TestService, createTestService, txHash } from '../support/service.js';
 
@@ -37,9 +37,16 @@ const LEASE_EXPIRY_SLOT = Number(slotAt(SLOT_SETTINGS_BY_NETWORK.preprod, new Da
 
 /** Records a witness for the lease, as issuing one for a transaction built on it would. */
 const issueWitness = (leaseId: string, invalidHereafter = LEASE_EXPIRY_SLOT): void => {
+  const { api_key_id: apiKeyId } = service.db.prepare('SELECT api_key_id FROM leases WHERE id = ?').get(leaseId) as { api_key_id: number };
   service.db
-    .prepare('INSERT INTO witnesses (lease_id, tx_hash, sponsored_lovelace, witness_set, invalid_hereafter, issued_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(leaseId, txHash(9), 500_000, 'a10080', invalidHereafter, '2024-01-01T00:01:00.000Z');
+    .prepare('INSERT INTO witnesses (tx_hash, api_key_id, lease_id, sponsored_lovelace, witness_set, invalid_hereafter, issued_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(txHash(9), apiKeyId, leaseId, 500_000, 'a10080', invalidHereafter, '2024-01-01T00:01:00.000Z');
+};
+
+/** The collateral UTxO the pool shares, as the designation table and the pool agree on it. */
+const sharedCollateral = (): string | undefined => {
+  const shared = service.collateral.current();
+  return shared === undefined ? undefined : `${shared.txHash}#${shared.index}`;
 };
 
 describe('classifyUtxo', () => {
@@ -61,10 +68,11 @@ describe('classifyUtxo', () => {
 });
 
 describe('pool sync', () => {
-  it('discovers fee and collateral UTxOs as free and keeps the rest as reserve', async () => {
+  it('discovers fee and collateral UTxOs as free, shares the collateral one and keeps the rest as reserve', async () => {
     service.fund(txHash(1), 0, 100_000_000n);
     service.fund(txHash(1), 1, 5_000_000n);
     service.fund(txHash(2), 0, 9_000_000_000n);
+    expect(sharedCollateral()).toBeUndefined();
 
     const report = await service.sync.run();
 
@@ -73,9 +81,33 @@ describe('pool sync', () => {
       { ref: `${txHash(1)}#0`, kind: 'fee', status: 'free' },
       { ref: `${txHash(1)}#1`, kind: 'collateral', status: 'free' },
     ]);
+    expect(sharedCollateral()).toBe(`${txHash(1)}#1`);
+    expect(auditRows()).toEqual([]);
     expect(report.reserve.lovelace).toBe(9_000_000_000n);
     expect(report.reserve.utxos).toHaveLength(1);
     expect(service.sync.reserve().syncedAt).toBeDefined();
+  });
+
+  it('keeps the collateral UTxO it designated across runs and restarts, whatever older ones appear', async () => {
+    service.fund(txHash(3), 0, 5_000_000n);
+    await service.sync.run();
+    expect(sharedCollateral()).toBe(`${txHash(3)}#0`);
+    service.fund(txHash(2), 0, 5_000_000n);
+    await service.sync.run();
+    service.db.prepare("UPDATE pool_utxos SET discovered_at = '2023-12-31T00:00:00.000Z' WHERE tx_hash = ?").run(txHash(2));
+
+    const restarted = createPoolSync({
+      db: service.db,
+      provider: service.provider,
+      sponsorAddress: service.serviceWallet.address,
+      sizes: service.config,
+      slots: service.config.slots,
+      now: () => service.clock.now,
+    });
+    await restarted.run();
+
+    expect(sharedCollateral()).toBe(`${txHash(3)}#0`);
+    expect(service.db.prepare('SELECT chosen_at FROM shared_collateral').get()).toEqual({ chosen_at: '2024-01-01T00:00:00.000Z' });
   });
 
   it('never leases a UTxO carrying tokens, whatever its lovelace', async () => {
@@ -145,7 +177,7 @@ describe('pool sync', () => {
     });
   });
 
-  it('writes one audit row per lease it closes, whatever closed it', async () => {
+  it('writes one audit row per lease it closes, and none for leases a vanished collateral UTxO leaves open', async () => {
     service.fund(txHash(1), 0, 100_000_000n);
     service.fund(txHash(2), 0, 100_000_000n);
     const collateral = service.fund(txHash(3), 0, 5_000_000n);
@@ -158,44 +190,61 @@ describe('pool sync', () => {
     service.provider.removeUtxo(collateral.input);
     await service.sync.run();
 
-    expect(auditRows().map((row) => [row.outcome, row.detail.leaseId])).toEqual([
-      ['created', first.id],
-      ['created', second.id],
-      ['released', first.id],
-      ['expired', second.id],
+    expect(leaseStatus(second.id)).toBe('open');
+    expect(auditRows().map((row) => [row.action, row.outcome, row.detail.leaseId ?? row.detail.utxo])).toEqual([
+      ['lease', 'created', first.id],
+      ['lease', 'created', second.id],
+      ['lease', 'released', first.id],
+      ['pool', 'collateral_consumed', `${txHash(3)}#0`],
     ]);
   });
 
-  it('frees the fee UTxOs of every lease closed when their shared collateral UTxO vanishes', async () => {
+  it('marks the shared collateral UTxO consumed when it vanishes, records it, designates the next one and never restores the consumed one', async () => {
     service.fund(txHash(1), 0, 100_000_000n);
     service.fund(txHash(2), 0, 100_000_000n);
-    const collateral = service.fund(txHash(3), 0, 5_000_000n);
+    const first = service.fund(txHash(3), 0, 5_000_000n);
+    const second = service.fund(txHash(4), 0, 5_000_000n);
     await service.sync.run();
     const key = service.issueKey().record;
-    const first = await service.leases.create(key);
-    const second = await service.leases.create(key);
-    expect(first.collateral.txHash).toBe(txHash(3));
-    expect(second.collateral.txHash).toBe(txHash(3));
+    const lease = await service.leases.create(key);
+    expect(sharedCollateral()).toBe(`${txHash(3)}#0`);
 
-    service.provider.removeUtxo(collateral.input);
-    service.fund(txHash(4), 0, 5_000_000n);
+    service.provider.removeUtxo(first.input);
     const report = await service.sync.run();
 
-    expect(report.gone).toBe(1);
-    expect(leaseStatus(first.id)).toBe('expired');
-    expect(leaseStatus(second.id)).toBe('expired');
+    expect(report).toMatchObject({ consumed: 1, gone: 0 });
     expect(poolRows()).toEqual([
-      { ref: `${txHash(1)}#0`, kind: 'fee', status: 'free' },
+      { ref: `${txHash(1)}#0`, kind: 'fee', status: 'leased' },
       { ref: `${txHash(2)}#0`, kind: 'fee', status: 'free' },
-      { ref: `${txHash(3)}#0`, kind: 'collateral', status: 'gone' },
+      { ref: `${txHash(3)}#0`, kind: 'collateral', status: 'consumed' },
       { ref: `${txHash(4)}#0`, kind: 'collateral', status: 'free' },
     ]);
-    const next = await service.leases.create(key);
-    expect(next.fee.txHash).toBe(txHash(1));
-    expect(next.collateral.txHash).toBe(txHash(4));
+    expect(sharedCollateral()).toBe(`${txHash(4)}#0`);
+    expect(leaseStatus(lease.id)).toBe('open');
+    expect(auditRows().at(-1)).toEqual({
+      apiKeyId: null,
+      action: 'pool',
+      outcome: 'collateral_consumed',
+      detail: { utxo: `${txHash(3)}#0`, next: `${txHash(4)}#0` },
+    });
+
+    service.provider.removeUtxo(second.input);
+    await service.sync.run();
+    expect(sharedCollateral()).toBeUndefined();
+    expect(auditRows().at(-1)).toEqual({ apiKeyId: null, action: 'pool', outcome: 'collateral_consumed', detail: { utxo: `${txHash(4)}#0`, next: null } });
+    expect(service.db.prepare('SELECT COUNT(*) AS count FROM shared_collateral').get()).toEqual({ count: 0 });
+    await expect(service.leases.create(key)).rejects.toThrow(/The pool has no collateral UTxO/);
+
+    service.provider.addUtxo(first);
+    service.fund(txHash(5), 0, 5_000_000n);
+    const after = await service.sync.run();
+    expect(after.restored).toBe(0);
+    expect(poolRows()).toContainEqual({ ref: `${txHash(3)}#0`, kind: 'collateral', status: 'consumed' });
+    expect(sharedCollateral()).toBe(`${txHash(5)}#0`);
+    expect(auditRows().filter((row) => row.action === 'pool')).toHaveLength(2);
   });
 
-  it('keeps the collateral UTxO of a vanished fee UTxO leased while another lease still holds it', async () => {
+  it('leaves the shared collateral in place when a fee UTxO vanishes', async () => {
     const fee = service.fund(txHash(1), 0, 100_000_000n);
     service.fund(txHash(2), 0, 100_000_000n);
     service.fund(txHash(3), 0, 5_000_000n);
@@ -210,34 +259,29 @@ describe('pool sync', () => {
 
     expect(leaseStatus(first.id)).toBe('expired');
     expect(leaseStatus(second.id)).toBe('open');
-    expect(poolRows()).toContainEqual({ ref: `${txHash(3)}#0`, kind: 'collateral', status: 'leased' });
+    expect(poolRows()).toContainEqual({ ref: `${txHash(3)}#0`, kind: 'collateral', status: 'free' });
+    expect(sharedCollateral()).toBe(`${txHash(3)}#0`);
   });
 
-  it('closes each lease on a vanished collateral UTxO by its own witness, marks the UTxO gone whatever the witnesses, and restores it when it reappears', async () => {
-    service.fund(txHash(1), 0, 100_000_000n);
-    service.fund(txHash(2), 0, 100_000_000n);
-    const collateral = service.fund(txHash(3), 0, 5_000_000n);
+  it('marks a spare collateral UTxO gone when it vanishes and restores it when it reappears, leaving the shared one in place', async () => {
+    service.fund(txHash(3), 0, 5_000_000n);
+    const spare = service.fund(txHash(4), 0, 5_000_000n);
     await service.sync.run();
-    const key = service.issueKey().record;
-    const witnessed = await service.leases.create(key);
-    const unwitnessed = await service.leases.create(key);
-    issueWitness(witnessed.id);
+    expect(sharedCollateral()).toBe(`${txHash(3)}#0`);
 
-    service.provider.removeUtxo(collateral.input);
+    service.provider.removeUtxo(spare.input);
     const report = await service.sync.run();
 
     expect(report).toMatchObject({ consumed: 0, gone: 1 });
-    expect(poolRows()).toContainEqual({ ref: `${txHash(3)}#0`, kind: 'collateral', status: 'gone' });
-    expect(leaseStatus(witnessed.id)).toBe('consumed');
-    expect(leaseStatus(unwitnessed.id)).toBe('expired');
-    expect(poolRows()).toContainEqual({ ref: `${txHash(1)}#0`, kind: 'fee', status: 'free' });
-    expect(poolRows()).toContainEqual({ ref: `${txHash(2)}#0`, kind: 'fee', status: 'free' });
+    expect(poolRows()).toContainEqual({ ref: `${txHash(4)}#0`, kind: 'collateral', status: 'gone' });
+    expect(sharedCollateral()).toBe(`${txHash(3)}#0`);
+    expect(auditRows()).toEqual([]);
 
-    service.provider.addUtxo(collateral);
+    service.provider.addUtxo(spare);
     const restored = await service.sync.run();
 
     expect(restored.restored).toBe(1);
-    expect(poolRows()).toContainEqual({ ref: `${txHash(3)}#0`, kind: 'collateral', status: 'free' });
+    expect(poolRows()).toContainEqual({ ref: `${txHash(4)}#0`, kind: 'collateral', status: 'free' });
   });
 
   it('restores a UTxO marked gone when the chain shows it again, but never one consumed', async () => {

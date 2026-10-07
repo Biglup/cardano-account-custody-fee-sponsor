@@ -1,9 +1,9 @@
 import type { Provider, Redeemer, UTxO } from '@biglup/cometa';
 import type { ParsedRedeemer, ParsedTransaction, ResolvedInput } from './parse.js';
-import type { LeasedUtxo, PolicyContext, Violation } from './rules.js';
+import type { PolicyContext, SponsorUtxo, Violation } from './rules.js';
 
-/** A leased UTxO as a provider needs it to evaluate a transaction that spends it: at the sponsor address, holding lovelace only. */
-const leasedUtxo = (utxo: LeasedUtxo, sponsorAddress: string): UTxO => ({
+/** A sponsor UTxO as a provider needs it to evaluate a transaction that spends or declares it: at the sponsor address, holding lovelace only. */
+const sponsorUtxo = (utxo: SponsorUtxo, sponsorAddress: string): UTxO => ({
   input: { txId: utxo.txHash, index: utxo.index },
   output: { address: sponsorAddress, value: { coins: BigInt(utxo.lovelace) } },
 });
@@ -33,14 +33,20 @@ const withinDeclaredBudget = (declared: ParsedRedeemer[], evaluated: Redeemer[])
   return undefined;
 };
 
+/** The sponsor UTxOs the transaction builds on under the mode: the leased fee UTxO when there is one, and the shared collateral. */
+const sponsorUtxosOf = ({ mode, collateral, sponsor }: PolicyContext): UTxO[] => [
+  ...(mode.kind === 'fee' ? [sponsorUtxo(mode.fee, sponsor.address)] : []),
+  sponsorUtxo(collateral, sponsor.address),
+];
+
 /**
  * The evaluation rule: every input must be known to the chain, the
  * provider must evaluate the transaction's scripts successfully with the
- * leased UTxOs supplied alongside, in case the provider's own view lags
+ * sponsor UTxOs supplied alongside, in case the provider's own view lags
  * behind the pool, and every declared budget must cover what the
  * evaluation found. A transaction that passes can only fail later in
  * phase one, which spends no collateral, so this is what protects the
- * leased collateral UTxO.
+ * shared collateral UTxO.
  */
 export const evaluates = async (
   transaction: ParsedTransaction,
@@ -54,10 +60,7 @@ export const evaluates = async (
   }
   let evaluated: Redeemer[];
   try {
-    evaluated = await provider.evaluateTransaction(transaction.cbor, [
-      leasedUtxo(context.lease.fee, context.sponsor.address),
-      leasedUtxo(context.lease.collateral, context.sponsor.address),
-    ]);
+    evaluated = await provider.evaluateTransaction(transaction.cbor, sponsorUtxosOf(context));
   } catch (err) {
     const message = err instanceof Error ? err.message : 'unknown error';
     return { rule: 'evaluates', detail: `The transaction does not evaluate: ${message}` };

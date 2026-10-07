@@ -8,12 +8,11 @@ import { fileURLToPath } from 'node:url';
 import type { Provider, TransactionBuilder, UTxO, Wallet } from '@biglup/cometa';
 import { type AccountState, type DiscoveredAccount, accountByOwner, createAccount, paymentKeyHashOf } from 'cardano-account-custody-offchain';
 import { config as loadEnvFile } from 'dotenv';
-import { SponsorError, SponsorWallet, type SponsorWalletOptions } from '../src/client/sponsor-wallet.js';
+import { type LeaseBody, SponsorError, SponsorWallet, type SponsorWalletOptions } from '../src/index.js';
 import { Cometa } from '../src/cometa.js';
 import { type Config, loadConfig } from '../src/config.js';
 import type { RecordedAuditEntry } from '../src/audit.js';
 import type { PoolCounts } from '../src/http/health.js';
-import type { LeaseBody } from '../src/api.js';
 import { createLogger } from '../src/logger.js';
 import { type ParsedTransaction, parseTransaction } from '../src/policy/parse.js';
 import { createService } from '../src/service.js';
@@ -38,10 +37,17 @@ const VIEW_POLL_MS = 5_000;
 const FIRST_OWNER_ACCOUNT = 10;
 const OWNER_ACCOUNT_CANDIDATES = 50;
 
-/** The pool the run wants to find, and what it asks for when the pool is short. */
+/** The pool the run wants to find, and what it asks for when the pool is short: the shared collateral UTxO and a spare for it. */
 const MINIMUM_FREE_FEE_UTXOS = 3;
 const REPLENISH_FEE_UTXOS = 5;
 const REPLENISH_COLLATERAL_UTXOS = 2;
+
+/** How many collateral UTxOs the pool holds live: the shared one when there is one, and the spares. */
+const collateralCount = (counts: PoolCounts): number => counts.collateral.spare + (counts.collateral.shared ? 1 : 0);
+
+/** The collateral of the pool as the evidence states it. */
+const collateralSummary = (counts: PoolCounts): string =>
+  `${counts.collateral.shared ? 'one shared collateral UTxO' : 'no shared collateral UTxO'} and ${counts.collateral.spare} spare`;
 
 /** The sponsor lovelace the refused creation tries to pay a third party. */
 const LEAK_LOVELACE = 5_000_000n;
@@ -312,11 +318,11 @@ const evidenceDocument = (evidence: Evidence): string => {
     '',
     `- Sponsor address: \`${evidence.sponsorAddress}\``,
     `- Account script hash: \`${evidence.accountScriptHash}\``,
-    `- Pool before the run: ${evidence.poolBefore.fee.free} free fee UTxOs, ${evidence.poolBefore.collateral.free} free collateral UTxOs`,
+    `- Pool before the run: ${evidence.poolBefore.fee.free} free fee UTxOs, ${collateralSummary(evidence.poolBefore)}`,
     evidence.replenish?.txId
       ? `- Replenished with ${evidence.replenish.feeOutputs} fee and ${evidence.replenish.collateralOutputs} collateral UTxOs: ${link(evidence.replenish.txId)}`
       : '- No replenishment was needed',
-    `- Pool after the run: ${evidence.poolAfter.fee.free} free fee UTxOs, ${evidence.poolAfter.collateral.free} free collateral UTxOs`,
+    `- Pool after the run: ${evidence.poolAfter.fee.free} free fee UTxOs, ${collateralSummary(evidence.poolAfter)}`,
     '',
     '## Sponsored account creation',
     '',
@@ -326,7 +332,7 @@ const evidenceDocument = (evidence: Evidence): string => {
     `- Stake credential: \`${owner.account.stakeScriptHash}\`, reward address \`${owner.account.rewardAddress}\``,
     `- State NFT: \`${owner.account.stateNftAssetId}\``,
     `- Lease \`${lease.leaseId}\`, expiring ${lease.expiresAt}: fee UTxO \`${lease.fee.txHash}#${lease.fee.index}\` of ${ada(lease.fee.lovelace)},`,
-    `  collateral UTxO \`${lease.collateral.txHash}#${lease.collateral.index}\` of ${ada(lease.collateral.lovelace)}`,
+    `  shared collateral UTxO \`${lease.collateral.txHash}#${lease.collateral.index}\` of ${ada(lease.collateral.lovelace)}`,
     `- Validity upper bound: slot ${amounts.invalidHereafter}, the lease expiry, as the adapter presets it`,
     `- Transaction: ${link(evidence.txId)}`,
     '',
@@ -400,14 +406,14 @@ const main = async (): Promise<void> => {
     const apiKey = issued.body.apiKey;
 
     const before = await call<PoolBody>(running.baseUrl, config.adminApiKey, 'GET', '/admin/pool');
-    console.log(`Pool: ${before.body.pool.fee.free} free fee UTxOs, ${before.body.pool.collateral.free} free collateral UTxOs, reserve ${before.body.reserve.lovelace} lovelace`);
+    console.log(`Pool: ${before.body.pool.fee.free} free fee UTxOs, ${collateralSummary(before.body.pool)}, reserve ${before.body.reserve.lovelace} lovelace`);
     let replenish: ReplenishBody | undefined;
-    if (before.body.pool.fee.free < MINIMUM_FREE_FEE_UTXOS) {
-      const collateralCount = Math.max(0, REPLENISH_COLLATERAL_UTXOS - before.body.pool.collateral.free);
-      console.log(`Replenishing the pool with ${REPLENISH_FEE_UTXOS} fee and ${collateralCount} collateral UTxOs; this waits for confirmation`);
+    if (before.body.pool.fee.free < MINIMUM_FREE_FEE_UTXOS || !before.body.pool.collateral.shared) {
+      const collateralWanted = Math.max(0, REPLENISH_COLLATERAL_UTXOS - collateralCount(before.body.pool));
+      console.log(`Replenishing the pool with ${REPLENISH_FEE_UTXOS} fee and ${collateralWanted} collateral UTxOs; this waits for confirmation`);
       const answer = await call<ReplenishBody>(running.baseUrl, config.adminApiKey, 'POST', '/admin/pool/replenish', {
         feeUtxoCount: REPLENISH_FEE_UTXOS,
-        collateralCount,
+        collateralCount: collateralWanted,
       });
       if (answer.status !== 200 || answer.body.txId === null) {
         throw new Error(`Replenishing answered ${answer.status}: ${JSON.stringify(answer.body)}`);

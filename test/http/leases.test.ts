@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
-import { REPLENISH_FEE_MARGIN } from '../../src/pool/replenish.js';
+import { REPLENISH_FEE_MARGIN } from '../../src/pool/sizes.js';
 import { type TestService, createTestService, txHash } from '../support/service.js';
 
 let service: TestService;
@@ -27,7 +27,7 @@ const fundPool = async (fee: number, collateral: number): Promise<void> => {
 const bearer = (apiKey: string): Record<string, string> => ({ Authorization: `Bearer ${apiKey}` });
 
 describe('POST /v1/leases', () => {
-  it('answers 201 with the lease, both UTxOs, the sponsor address and the sponsoring limit', async () => {
+  it('answers 201 with the lease, the fee UTxO, the shared collateral UTxO, the sponsor address and the sponsoring limit', async () => {
     await fundPool(1, 1);
     const { apiKey } = service.issueKey();
 
@@ -43,7 +43,36 @@ describe('POST /v1/leases', () => {
       maxSponsoredLovelace: 6_000_000,
     });
     const health = await request(service.app).get('/health');
-    expect(health.body.pool).toEqual({ fee: { free: 0, leased: 1 }, collateral: { free: 0, leased: 1 } });
+    expect(health.body.pool).toEqual({ fee: { free: 0, leased: 1 }, collateral: { shared: true, spare: 0, consumed: 0 } });
+  });
+
+  it('names the same shared collateral UTxO on every lease, and answers 409 no_utxo_available when the pool holds none', async () => {
+    await fundPool(3, 2);
+    const { apiKey } = service.issueKey();
+
+    const first = await request(service.app).post('/v1/leases').set(bearer(apiKey));
+    const second = await request(service.app).post('/v1/leases').set(bearer(apiKey));
+
+    expect(first.body.collateral).toEqual(second.body.collateral);
+    expect(first.body.collateral.txHash).toBe(txHash(200));
+    const health = await request(service.app).get('/health');
+    expect(health.body.pool.collateral).toEqual({ shared: true, spare: 1, consumed: 0 });
+
+    const bare = await createTestService();
+    try {
+      bare.fund(txHash(100), 0, 100_000_000n);
+      bare.fund(txHash(300), 0, 1_000_000_000n);
+      await bare.sync.run();
+      const refused = await request(bare.app).post('/v1/leases').set(bearer(bare.issueKey().apiKey));
+      expect(refused.status).toBe(409);
+      expect(refused.body).toEqual({
+        error: 'no_utxo_available',
+        detail: 'The pool has no collateral UTxO yet; the reserve holds 1000000000 lovelace and can be split by replenishing',
+      });
+      expect((await request(bare.app).get('/health')).body.pool).toEqual({ fee: { free: 1, leased: 0 }, collateral: { shared: false, spare: 0, consumed: 0 } });
+    } finally {
+      bare.close();
+    }
   });
 
   it('never leases the same fee UTxO twice under concurrent requests', async () => {

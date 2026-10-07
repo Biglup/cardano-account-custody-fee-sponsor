@@ -9,20 +9,12 @@ import { openDatabase } from '../db/connection.js';
 import { applyMigrations } from '../db/migrations.js';
 import { OutOfFundsError } from '../http/errors.js';
 import { type ServiceWallet, loadServiceWallet } from '../wallet.js';
-import { type PoolSizes, type PoolSync, createPoolSync } from './sync.js';
-
-/**
- * The lovelace a split keeps back from the reserve beyond the outputs it
- * creates: enough for the fee of the largest transaction the network
- * accepts and for a change output above the minimum UTxO value.
- */
-export const REPLENISH_FEE_MARGIN = 3_000_000n;
+import { designatedCollateral } from './collateral.js';
+import { REPLENISH_FEE_MARGIN, minimumSplitLovelace } from './sizes.js';
+import { type PoolSync, createPoolSync } from './sync.js';
 
 /** How long a split waits for the chain to confirm it, in milliseconds. */
 const CONFIRMATION_TIMEOUT_MS = 180_000;
-
-/** The least the reserve must hold for a split to create one fee UTxO. */
-export const minimumSplitLovelace = (sizes: PoolSizes): bigint => BigInt(sizes.feeUtxoLovelace) + REPLENISH_FEE_MARGIN;
 
 /** What a split is asked for; every field defaults to the configuration and the pool's current shortfall. */
 export interface ReplenishRequest {
@@ -97,13 +89,18 @@ export const planSplit = (db: Database.Database, settings: ReplenishSettings, re
 
 /**
  * Builds the self transaction of a split: every input comes from the
- * reserve, so pool UTxOs, leased or free, are never touched, and each
- * planned output pays the sponsor address its exact size, with the change
- * returning to the same address. The transaction is returned unsigned.
+ * reserve, so pool UTxOs, leased or free, are never touched, and the
+ * shared collateral UTxO is left out of the inputs the builder may draw
+ * on whatever the reserve says, since a transaction witnessed against it
+ * may land at any moment. Each planned output pays the sponsor address
+ * its exact size, with the change returning to the same address. The
+ * transaction is returned unsigned.
  */
-export const buildSplitTransaction = async (serviceWallet: ServiceWallet, sync: PoolSync, plan: SplitPlan): Promise<string> => {
+export const buildSplitTransaction = async (db: Database.Database, serviceWallet: ServiceWallet, sync: PoolSync, plan: SplitPlan): Promise<string> => {
+  const shared = designatedCollateral(db)?.utxo;
+  const spendable = sync.reserve().utxos.filter((utxo) => !(utxo.input.txId === shared?.txHash && utxo.input.index === shared.index));
   const builder = await serviceWallet.wallet.createTransactionBuilder();
-  builder.setUtxos(sync.reserve().utxos).setChangeAddress(serviceWallet.address);
+  builder.setUtxos(spendable).setChangeAddress(serviceWallet.address);
   for (let i = 0; i < plan.feeOutputs; i += 1) {
     builder.sendLovelace({ address: serviceWallet.address, amount: plan.feeUtxoLovelace });
   }
@@ -130,11 +127,11 @@ export const createReplenish = ({ db, provider, serviceWallet, sync, settings, l
     }
     if (plan.feeOutputs + plan.collateralOutputs === 0) {
       throw new OutOfFundsError(
-        `The reserve holds ${reserve.lovelace} lovelace; a split needs at least ${minimumSplitLovelace(settings)} to create one fee UTxO`,
+        `The reserve holds ${reserve.lovelace} lovelace; a split needs at least ${minimumSplitLovelace(settings.feeUtxoLovelace)} to create one fee UTxO`,
       );
     }
 
-    const unsigned = await buildSplitTransaction(serviceWallet, sync, plan);
+    const unsigned = await buildSplitTransaction(db, serviceWallet, sync, plan);
     const witnesses = await serviceWallet.wallet.signTransaction(unsigned, false);
     const signed = Cometa.applyVkeyWitnessSet(unsigned, witnesses);
     const txId = await provider.submitTransaction(signed);

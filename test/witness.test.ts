@@ -6,6 +6,7 @@ import { toLeaseBody } from '../src/http/leases.js';
 import type { ApiKey } from '../src/keys.js';
 import { parseTransaction } from '../src/policy/parse.js';
 import type { Lease, LeaseService } from '../src/pool/leases.js';
+import type { WitnessStore } from '../src/pool/witnesses.js';
 import { type WitnessService, createWitnessService } from '../src/witness.js';
 import { controlUtxo } from './support/account.js';
 import { buildCreation, buildOwnerOperation } from './support/client.js';
@@ -23,8 +24,17 @@ beforeEach(async () => {
   await service.sync.run();
   apiKey = service.issueKey().record;
   lease = await service.leases.create(apiKey);
-  leaseBody = toLeaseBody(lease, { sponsorAddress: service.serviceWallet.address, maxSponsoredLovelace: service.config.maxSponsoredLovelace });
+  leaseBody = bodyOf(lease);
 });
+
+/** The lease body of a lease, as the API would answer it, naming the shared collateral. */
+const bodyOf = (taken: Lease): LeaseBody => {
+  const shared = service.collateral.current();
+  if (shared === undefined) {
+    throw new Error('The pool shares no collateral');
+  }
+  return toLeaseBody(taken, shared, { sponsorAddress: service.serviceWallet.address, maxSponsoredLovelace: service.config.maxSponsoredLovelace });
+};
 
 afterEach(() => {
   service.close();
@@ -48,16 +58,18 @@ const staleLeases = (leases: LeaseService): LeaseService => ({
   find: (key, leaseId) => ({ ...leases.find(key, leaseId), status: 'open' }),
 });
 
-/** A lease service whose quota check ahead of the policy never fires, as a request that passed it before other requests consumed the quota sees. */
-const unguardedLeases = (leases: LeaseService): LeaseService => ({ ...leases, witnessQuotaShortfall: () => undefined });
+/** A witness store whose quota check ahead of the policy never fires, as a request that passed it before other requests consumed the quota sees. */
+const unguardedWitnesses = (witnesses: WitnessStore): WitnessStore => ({ ...witnesses, quotaShortfall: () => undefined });
 
 /** A witness service on the test service's components, with some of them replaced. */
-const witnessWith = (overrides: { wallet?: Wallet; leases?: LeaseService }): WitnessService =>
+const witnessWith = (overrides: { wallet?: Wallet; leases?: LeaseService; witnesses?: WitnessStore }): WitnessService =>
   createWitnessService({
     db: service.db,
     provider: service.provider,
     serviceWallet: { ...service.serviceWallet, wallet: overrides.wallet ?? service.serviceWallet.wallet },
     leases: overrides.leases ?? service.leases,
+    witnesses: overrides.witnesses ?? service.witnesses,
+    collateral: service.collateral,
     settings: service.config,
     now: () => service.clock.now,
   });
@@ -79,7 +91,7 @@ describe('witness service', () => {
     await service.witness.issue(apiKey, lease.id, await buildCreation(service, leaseBody));
     const today = BigInt((service.db.prepare('SELECT sponsored_lovelace FROM witnesses').get() as { sponsored_lovelace: number }).sponsored_lovelace);
     const next = await service.leases.create(apiKey);
-    const nextBody = toLeaseBody(next, { sponsorAddress: service.serviceWallet.address, maxSponsoredLovelace: service.config.maxSponsoredLovelace });
+    const nextBody = bodyOf(next);
     const transaction = await buildOwnerOperation(service, nextBody, control);
     const sponsored = parseTransaction(transaction).transaction?.fee ?? 0n;
 
@@ -104,11 +116,11 @@ describe('witness service', () => {
     service.fund(txHash(101), 0, 100_000_000n);
     service.fund(txHash(102), 0, 100_000_000n);
     await service.sync.run();
-    const witness = witnessWith({ leases: unguardedLeases(service.leases) });
+    const witness = witnessWith({ witnesses: unguardedWitnesses(service.witnesses) });
     const hourly: ApiKey = { ...apiKey, quotas: { ...apiKey.quotas, witnessesPerHour: 1 } };
     await witness.issue(hourly, lease.id, await buildCreation(service, leaseBody));
     const second = await service.leases.create(apiKey);
-    const secondBody = toLeaseBody(second, { sponsorAddress: service.serviceWallet.address, maxSponsoredLovelace: service.config.maxSponsoredLovelace });
+    const secondBody = bodyOf(second);
 
     const overHourly = await witness.issue(hourly, second.id, await buildCreation(service, secondBody)).catch((err: unknown) => err);
 

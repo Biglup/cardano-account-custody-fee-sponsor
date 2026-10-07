@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { OutOfFundsError } from '../../src/http/errors.js';
-import { REPLENISH_FEE_MARGIN, buildSplitTransaction, planSplit } from '../../src/pool/replenish.js';
+import { buildSplitTransaction, planSplit } from '../../src/pool/replenish.js';
+import { REPLENISH_FEE_MARGIN } from '../../src/pool/sizes.js';
+import type { PoolSync } from '../../src/pool/sync.js';
 import { type TestService, createTestService, txHash } from '../support/service.js';
 import { transactionParts } from '../support/transaction.js';
 
@@ -65,7 +67,7 @@ describe('buildSplitTransaction', () => {
     await service.sync.run();
     const plan = planSplit(service.db, SETTINGS, 1_000_000_000n, { feeUtxoCount: 3, collateralCount: 2 });
 
-    const tx = await buildSplitTransaction(service.serviceWallet, service.sync, plan);
+    const tx = await buildSplitTransaction(service.db, service.serviceWallet, service.sync, plan);
 
     const parts = transactionParts(tx);
     expect(parts.inputs).toEqual([reserve.input]);
@@ -83,10 +85,24 @@ describe('buildSplitTransaction', () => {
     expect(parts.fee).toBeGreaterThan(0n);
     expect(parts.fee).toBeLessThan(REPLENISH_FEE_MARGIN);
   });
+
+  it('leaves the shared collateral UTxO out of the inputs, even when the reserve it is handed lists it', async () => {
+    const collateral = service.fund(txHash(1), 0, 5_000_000n);
+    const reserve = service.fund(txHash(2), 0, 1_000_000_000n);
+    await service.sync.run();
+    expect(service.collateral.current()?.txHash).toBe(txHash(1));
+    const plan = planSplit(service.db, SETTINGS, 1_000_000_000n, { feeUtxoCount: 2, collateralCount: 0 });
+    expect(service.sync.reserve().utxos).toEqual([reserve]);
+    const widened: PoolSync = { ...service.sync, reserve: () => ({ ...service.sync.reserve(), utxos: [collateral, reserve] }) };
+
+    const tx = await buildSplitTransaction(service.db, service.serviceWallet, widened, plan);
+
+    expect(transactionParts(tx).inputs).toEqual([reserve.input]);
+  });
 });
 
 describe('replenish', () => {
-  it('signs, submits, waits for confirmation and resyncs so the new UTxOs become leasable', async () => {
+  it('signs, submits, waits for confirmation and resyncs so the new UTxOs become leasable and one collateral is shared', async () => {
     service.fund(txHash(2), 0, 2_000_000_000n);
 
     const result = await service.replenish();
@@ -108,6 +124,22 @@ describe('replenish', () => {
 
     const lease = await service.leases.create(service.issueKey().record);
     expect(lease.fee.txHash).toBe(result.txId);
+    expect(service.collateral.current()?.txHash).toBe(result.txId);
+    expect(service.db.prepare("SELECT COUNT(*) AS count FROM pool_utxos WHERE kind = 'collateral' AND status = 'free'").get()).toEqual({ count: 2 });
+  });
+
+  it('never spends the shared collateral UTxO, whatever the reserve holds', async () => {
+    const collateral = service.fund(txHash(1), 0, 5_000_000n);
+    service.fund(txHash(2), 0, 500_000_000n);
+    await service.sync.run();
+    expect(service.collateral.current()?.txHash).toBe(txHash(1));
+
+    await service.replenish({ feeUtxoCount: 1, collateralCount: 1 });
+
+    const parts = transactionParts(service.provider.submitted[0] as string);
+    expect(parts.inputs).toEqual([{ txId: txHash(2), index: 0 }]);
+    expect(await service.provider.resolveUnspentOutputs([collateral.input])).toEqual([collateral]);
+    expect(service.collateral.current()?.txHash).toBe(txHash(1));
   });
 
   it('carries a signature from the sponsor wallet', async () => {

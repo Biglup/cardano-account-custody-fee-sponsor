@@ -47,7 +47,7 @@ describe('POST /admin/keys', () => {
 });
 
 describe('GET /admin/pool', () => {
-  it('reports the counts, the reserve, the open leases and every live UTxO', async () => {
+  it('reports the counts, the reserve, the open leases, the shared collateral and every live UTxO', async () => {
     service.fund(txHash(1), 0, 100_000_000n);
     service.fund(txHash(2), 0, 5_000_000n);
     service.fund(txHash(3), 0, 700_000_000n);
@@ -58,11 +58,12 @@ describe('GET /admin/pool', () => {
 
     expect(response.status).toBe(200);
     expect(response.body).toEqual({
-      pool: { fee: { free: 0, leased: 1 }, collateral: { free: 0, leased: 1 } },
+      pool: { fee: { free: 0, leased: 1 }, collateral: { shared: true, spare: 0, consumed: 0 } },
       reserve: { utxos: 1, lovelace: '700000000', syncedAt: expect.any(String) },
       leases: { open: 1 },
+      sharedCollateral: { txHash: txHash(2), index: 0, lovelace: 5_000_000, chosenAt: '2024-01-01T00:00:00.000Z' },
       utxos: [
-        { txHash: txHash(2), index: 0, lovelace: 5_000_000, kind: 'collateral', status: 'leased', discoveredAt: expect.any(String) },
+        { txHash: txHash(2), index: 0, lovelace: 5_000_000, kind: 'collateral', status: 'free', discoveredAt: expect.any(String) },
         { txHash: txHash(1), index: 0, lovelace: 100_000_000, kind: 'fee', status: 'leased', discoveredAt: expect.any(String) },
       ],
     });
@@ -92,7 +93,7 @@ describe('GET /admin/audit', () => {
         apiKeyId: record.id,
         action: 'lease',
         outcome: 'created',
-        detail: { leaseId: lease.body.leaseId, feeUtxo: `${txHash(1)}#0`, collateralUtxo: `${txHash(2)}#0`, expiresAt: '2024-01-01T00:10:00.000Z' },
+        detail: { leaseId: lease.body.leaseId, feeUtxo: `${txHash(1)}#0`, expiresAt: '2024-01-01T00:10:00.000Z' },
       },
       { id: 2, ts: '2024-01-01T00:05:00.000Z', apiKeyId: record.id, action: 'lease', outcome: 'released', detail: { leaseId: lease.body.leaseId } },
     ]);
@@ -149,7 +150,7 @@ describe('POST /admin/pool/replenish', () => {
       reserveLovelace: expect.stringMatching(/^\d+$/),
     });
     const health = await request(service.app).get('/health');
-    expect(health.body.pool).toEqual({ fee: { free: 2, leased: 0 }, collateral: { free: 1, leased: 0 } });
+    expect(health.body.pool).toEqual({ fee: { free: 2, leased: 0 }, collateral: { shared: true, spare: 0, consumed: 0 } });
   });
 
   it('answers 503 out_of_funds when the reserve cannot fund the split', async () => {

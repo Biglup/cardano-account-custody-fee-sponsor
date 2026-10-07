@@ -7,25 +7,28 @@ interface Migration {
 }
 
 /**
- * The initial schema: api keys, the sponsor's own pool of UTxOs, the
- * leases clients hold against that pool, the witnesses issued for leases,
- * and an audit trail of every decision the service makes.
+ * The initial schema: api keys, the sponsor's own pool of UTxOs, the one
+ * collateral UTxO shared by every transaction, the leases clients hold
+ * against the fee pool, the witnesses issued, and an audit trail of every
+ * decision the service makes.
  *
- * A witness keeps the witness set it issued so that the same transaction
- * presented again receives the same one, and the slot the transaction
- * stops being valid at, so that the fee UTxO it spends can return to the
- * pool once the chain can no longer accept it. A witness set holds public
- * keys and signatures only; the transaction itself is never stored, only
- * its hash.
+ * A witness is keyed by the hash of the transaction it signs, so that the
+ * same transaction presented again receives the same witness set whatever
+ * route it arrives by. It keeps the witness set it issued and the slot the
+ * transaction stops being valid at, so that the fee UTxO it spends can
+ * return to the pool once the chain can no longer accept it. A witness
+ * issued for a lease names it; one issued in collateral mode names none,
+ * since no sponsor UTxO is spent and nothing has to be restored. A witness
+ * set holds public keys and signatures only; the transaction itself is
+ * never stored, only its hash.
  *
- * A pool UTxO is identified by its transaction hash and output index.
- * A lease records which fee and collateral UTxO it holds as
- * `tx_hash#index` references into `pool_utxos`. The partial unique index
- * on `leases.fee_utxo` is what stops two concurrent requests from leasing
- * the same fee UTxO; collateral UTxOs are deliberately left unindexed
- * because the design lets several open leases share one, since a
- * collateral UTxO is only ever spent on a phase two failure the policy
- * already refuses to witness.
+ * A pool UTxO is identified by its transaction hash and output index. A
+ * lease records the fee UTxO it holds as a `tx_hash#index` reference into
+ * `pool_utxos`; the partial unique index on `leases.fee_utxo` is what stops
+ * two concurrent requests from leasing the same fee UTxO. Collateral is
+ * never leased: `shared_collateral` names the one collateral UTxO every
+ * transaction declares, which the pool sync designates and replaces, so
+ * that a restart keeps the same one.
  */
 const INITIAL_SCHEMA = `
 CREATE TABLE api_keys (
@@ -47,11 +50,18 @@ CREATE TABLE pool_utxos (
   PRIMARY KEY (tx_hash, tx_index)
 );
 
+CREATE TABLE shared_collateral (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  tx_hash TEXT NOT NULL,
+  tx_index INTEGER NOT NULL,
+  chosen_at TEXT NOT NULL,
+  FOREIGN KEY (tx_hash, tx_index) REFERENCES pool_utxos (tx_hash, tx_index)
+);
+
 CREATE TABLE leases (
   id TEXT PRIMARY KEY,
   api_key_id INTEGER NOT NULL REFERENCES api_keys (id),
   fee_utxo TEXT NOT NULL,
-  collateral_utxo TEXT NOT NULL,
   expires_at TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('open', 'released', 'consumed', 'expired')),
   created_at TEXT NOT NULL
@@ -60,13 +70,16 @@ CREATE TABLE leases (
 CREATE UNIQUE INDEX leases_open_fee_utxo ON leases (fee_utxo) WHERE status = 'open';
 
 CREATE TABLE witnesses (
-  lease_id TEXT PRIMARY KEY REFERENCES leases (id),
-  tx_hash TEXT NOT NULL,
+  tx_hash TEXT PRIMARY KEY,
+  api_key_id INTEGER NOT NULL REFERENCES api_keys (id),
+  lease_id TEXT REFERENCES leases (id),
   sponsored_lovelace INTEGER NOT NULL,
   witness_set TEXT NOT NULL,
   invalid_hereafter INTEGER NOT NULL,
   issued_at TEXT NOT NULL
 );
+
+CREATE UNIQUE INDEX witnesses_lease ON witnesses (lease_id) WHERE lease_id IS NOT NULL;
 
 CREATE TABLE audit (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

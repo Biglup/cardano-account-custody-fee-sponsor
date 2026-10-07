@@ -6,9 +6,11 @@ import type { Config } from './config.js';
 import { openDatabase } from './db/connection.js';
 import { applyMigrations } from './db/migrations.js';
 import { createApp } from './http/app.js';
+import { type SharedCollateral, createSharedCollateral } from './pool/collateral.js';
 import { type LeaseService, createLeaseService } from './pool/leases.js';
 import { type ReplenishFn, createReplenish } from './pool/replenish.js';
 import { type PoolSync, createPoolSync } from './pool/sync.js';
+import { type WitnessStore, createWitnessStore } from './pool/witnesses.js';
 import { type ServiceWallet, loadServiceWallet } from './wallet.js';
 import { type WitnessService, createWitnessService } from './witness.js';
 
@@ -27,6 +29,8 @@ export interface Service {
   provider: Provider;
   serviceWallet: ServiceWallet;
   sync: PoolSync;
+  collateral: SharedCollateral;
+  witnesses: WitnessStore;
   leases: LeaseService;
   witness: WitnessService;
   replenish: ReplenishFn;
@@ -41,8 +45,9 @@ export interface Service {
  * Assembles the service from its configuration and a provider: the
  * sponsor wallet derived from the mnemonic, which is wiped from the
  * configuration in the process, the database at the configured path with
- * its migrations applied, the pool sync, the lease, replenish and witness
- * services, and the express application over them. Nothing is started;
+ * its migrations applied, the pool sync, the shared collateral, the
+ * witness store, the lease, replenish and witness services, and the
+ * express application over them. Nothing is started;
  * the caller starts the jobs and listens where it sees fit, which is what
  * lets the same composition serve the process, the test suite and a
  * script that runs the service in its own process.
@@ -59,9 +64,11 @@ export const createService = async ({ config, provider, logger, now = () => new 
   applyMigrations(db);
 
   const sync = createPoolSync({ db, provider, sponsorAddress: serviceWallet.address, sizes: config, slots: config.slots, now, logger });
-  const leases = createLeaseService({ db, sync, settings: config, now, logger });
+  const collateral = createSharedCollateral({ db, sync, settings: config });
+  const witnesses = createWitnessStore({ db, now });
+  const leases = createLeaseService({ db, sync, witnesses, settings: config, now, logger });
   const replenish = createReplenish({ db, provider, serviceWallet, sync, settings: config, logger });
-  const witness = createWitnessService({ db, provider, serviceWallet, leases, settings: config, now, logger });
+  const witness = createWitnessService({ db, provider, serviceWallet, leases, witnesses, collateral, settings: config, now, logger });
 
   const app = createApp({
     db,
@@ -70,7 +77,9 @@ export const createService = async ({ config, provider, logger, now = () => new 
     adminApiKey: config.adminApiKey,
     rateLimit: config,
     lease: { sponsorAddress: serviceWallet.address, maxSponsoredLovelace: config.maxSponsoredLovelace },
+    collateralSettings: { sponsorAddress: serviceWallet.address, collateralValiditySeconds: config.collateralValiditySeconds },
     leases,
+    collateral,
     witness,
     sync,
     replenish,
@@ -82,6 +91,8 @@ export const createService = async ({ config, provider, logger, now = () => new 
     provider,
     serviceWallet,
     sync,
+    collateral,
+    witnesses,
     leases,
     witness,
     replenish,

@@ -1,16 +1,13 @@
 import type Database from 'better-sqlite3';
 import { type RequestHandler, Router } from 'express';
-import { z } from 'zod';
-import type { LeaseBody, LeasedUtxoBody, WitnessBody } from '../api.js';
+import type { LeaseBody, SponsorUtxoBody, WitnessBody } from '../api.js';
+import type { SharedCollateral } from '../pool/collateral.js';
 import type { Lease, LeaseService } from '../pool/leases.js';
 import type { PoolUtxo } from '../pool/utxo.js';
 import type { WitnessService } from '../witness.js';
 import { asyncHandler } from './async.js';
 import { apiKeyOf, requireApiKey } from './auth.js';
-import { parseBody } from './body.js';
-
-/** The body of a witness request: the unsigned transaction as CBOR hex; whether it decodes is the policy's first rule. */
-const witnessSchema = z.object({ transaction: z.string().min(1) }).strict();
+import { parseBody, witnessSchema } from './body.js';
 
 /** What the lease routes need to know about the sponsor. */
 export interface LeaseRouteSettings {
@@ -18,19 +15,20 @@ export interface LeaseRouteSettings {
   maxSponsoredLovelace: number;
 }
 
-const toUtxoBody = (utxo: PoolUtxo, address: string): LeasedUtxoBody => ({
+/** A sponsor UTxO as the API presents it, at the sponsor address. */
+export const toUtxoBody = (utxo: PoolUtxo, address: string): SponsorUtxoBody => ({
   txHash: utxo.txHash,
   index: utxo.index,
   address,
   lovelace: utxo.lovelace,
 });
 
-/** The response body for a lease. */
-export const toLeaseBody = (lease: Lease, settings: LeaseRouteSettings): LeaseBody => ({
+/** The response body for a lease, with the collateral UTxO shared as of the answer. */
+export const toLeaseBody = (lease: Lease, collateral: PoolUtxo, settings: LeaseRouteSettings): LeaseBody => ({
   leaseId: lease.id,
   expiresAt: lease.expiresAt,
   fee: toUtxoBody(lease.fee, settings.sponsorAddress),
-  collateral: toUtxoBody(lease.collateral, settings.sponsorAddress),
+  collateral: toUtxoBody(collateral, settings.sponsorAddress),
   sponsorAddress: settings.sponsorAddress,
   maxSponsoredLovelace: settings.maxSponsoredLovelace,
 });
@@ -38,14 +36,15 @@ export const toLeaseBody = (lease: Lease, settings: LeaseRouteSettings): LeaseBo
 /**
  * The lease routes under `/v1/leases`: every one requires an API key and
  * counts against that key's rate limit. Creating a lease reserves a fee
- * and a collateral UTxO for the key; deleting one releases it early so
- * its UTxOs return to the pool; posting a transaction to a lease's
- * witness route has it checked against the policy and, when it passes,
- * signed by the sponsor.
+ * UTxO for the key and names the shared collateral UTxO alongside it;
+ * deleting one releases it early so its fee UTxO returns to the pool;
+ * posting a transaction to a lease's witness route has it checked against
+ * the policy and, when it passes, signed by the sponsor.
  */
 export const createLeaseRouter = (
   db: Database.Database,
   leases: LeaseService,
+  collateral: SharedCollateral,
   witness: WitnessService,
   settings: LeaseRouteSettings,
   keyRateLimit: RequestHandler,
@@ -58,7 +57,7 @@ export const createLeaseRouter = (
     '/',
     asyncHandler(async (_req, res) => {
       const lease = await leases.create(apiKeyOf(res));
-      res.status(201).json(toLeaseBody(lease, settings));
+      res.status(201).json(toLeaseBody(lease, await collateral.require(), settings));
     }),
   );
 

@@ -25,13 +25,13 @@ describe('loadConfig', () => {
     expect(config.leaseTtlSeconds).toBe(600);
     expect(config.maxSponsoredLovelace).toBe(6_000_000);
     expect(config.maxFeeLovelace).toBe(2_000_000);
-    expect(config.collateralSharing).toBe(20);
     expect(config.feeUtxoLovelace).toBe(100_000_000);
     expect(config.collateralUtxoLovelace).toBe(5_000_000);
     expect(config.feeUtxoCount).toBe(10);
     expect(config.collateralUtxoCount).toBe(2);
     expect(config.slots).toEqual(SLOT_SETTINGS_BY_NETWORK.preprod);
     expect(config.validityMarginSeconds).toBe(120);
+    expect(config.collateralValiditySeconds).toBe(600);
     expect(config.ipRateLimitPerMinute).toBe(120);
     expect(config.keyRateLimitPerMinute).toBe(60);
     expect(config.trustProxyHops).toBe(0);
@@ -44,6 +44,7 @@ describe('loadConfig', () => {
       LEASE_TTL_SECONDS: '120',
       MAX_FEE_LOVELACE: '1000000',
       VALIDITY_MARGIN_SECONDS: '0',
+      COLLATERAL_VALIDITY_SECONDS: '300',
       IP_RATE_LIMIT_PER_MINUTE: '10',
       KEY_RATE_LIMIT_PER_MINUTE: '5',
       TRUST_PROXY_HOPS: '1',
@@ -53,6 +54,7 @@ describe('loadConfig', () => {
     expect(config.leaseTtlSeconds).toBe(120);
     expect(config.maxFeeLovelace).toBe(1_000_000);
     expect(config.validityMarginSeconds).toBe(0);
+    expect(config.collateralValiditySeconds).toBe(300);
     expect(config.ipRateLimitPerMinute).toBe(10);
     expect(config.keyRateLimitPerMinute).toBe(5);
     expect(config.trustProxyHops).toBe(1);

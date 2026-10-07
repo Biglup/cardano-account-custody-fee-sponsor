@@ -7,7 +7,7 @@ import {
   QuotaExceededError,
   UnknownLeaseError,
 } from '../../src/http/errors.js';
-import { REPLENISH_FEE_MARGIN } from '../../src/pool/replenish.js';
+import { REPLENISH_FEE_MARGIN } from '../../src/pool/sizes.js';
 import { type TestService, createTestService, txHash } from '../support/service.js';
 
 let service: TestService;
@@ -38,7 +38,7 @@ const leaseStatus = (id: string): string =>
   (service.db.prepare('SELECT status FROM leases WHERE id = ?').get(id) as { status: string }).status;
 
 describe('lease creation', () => {
-  it('leases the oldest free fee UTxO and a collateral UTxO until the TTL', async () => {
+  it('leases the oldest free fee UTxO until the TTL and leaves the shared collateral UTxO free', async () => {
     service.fund(txHash(2), 0, 100_000_000n);
     await service.sync.run();
     service.db.prepare("UPDATE pool_utxos SET discovered_at = '2023-12-31T00:00:00.000Z'").run();
@@ -51,40 +51,54 @@ describe('lease creation', () => {
 
     expect(lease.fee.txHash).toBe(txHash(2));
     expect(lease.fee.lovelace).toBe(100_000_000);
-    expect(lease.collateral.txHash).toBe(txHash(3));
+    expect(lease).not.toHaveProperty('collateral');
     expect(lease.status).toBe('open');
     expect(lease.expiresAt).toBe('2024-01-01T00:10:00.000Z');
     expect(utxoStatus(txHash(2))).toBe('leased');
-    expect(utxoStatus(txHash(3))).toBe('leased');
     expect(utxoStatus(txHash(1))).toBe('free');
+    expect(service.collateral.current()?.txHash).toBe(txHash(3));
+    expect(utxoStatus(txHash(3))).toBe('free');
   });
 
-  it('spreads leases over collateral UTxOs by their open lease count and stops at the sharing limit', async () => {
-    const limited = await createTestService({ COLLATERAL_SHARING: '2' });
-    try {
-      for (let i = 0; i < 5; i += 1) {
-        limited.fund(txHash(100 + i), 0, 100_000_000n);
-      }
-      limited.fund(txHash(200), 0, 5_000_000n);
-      limited.fund(txHash(201), 0, 5_000_000n);
-      await limited.sync.run();
-      const key = limited.issueKey('wide', { openLeases: 10 }).record;
+  it('never leases the shared collateral UTxO as the fee UTxO, even when no other fee UTxO is free', async () => {
+    service.fund(txHash(200), 0, 5_000_000n);
+    await service.sync.run();
+    expect(service.collateral.current()?.txHash).toBe(txHash(200));
+    const key = service.issueKey().record;
 
-      const leases = [];
-      for (let i = 0; i < 4; i += 1) {
-        leases.push(await limited.leases.create(key));
-      }
-      const byCollateral = new Map<string, number>();
-      for (const lease of leases) {
-        byCollateral.set(lease.collateral.txHash, (byCollateral.get(lease.collateral.txHash) ?? 0) + 1);
-      }
-      expect(byCollateral.get(txHash(200))).toBe(2);
-      expect(byCollateral.get(txHash(201))).toBe(2);
+    const starved = await service.leases.create(key).catch((err: unknown) => err);
+    expect(starved).toBeInstanceOf(OutOfFundsError);
+    expect((starved as OutOfFundsError).detail).toMatch(/^The pool has no fee UTxO and the reserve holds 0 lovelace/);
 
-      await expect(limited.leases.create(key)).rejects.toThrow(NoUtxoAvailableError);
-    } finally {
-      limited.close();
-    }
+    service.fund(txHash(300), 0, 1_000_000_000n);
+    const splittable = await service.leases.create(key).catch((err: unknown) => err);
+    expect(splittable).toBeInstanceOf(NoUtxoAvailableError);
+    expect((splittable as NoUtxoAvailableError).detail).toMatch(/^The pool has no fee UTxO yet/);
+    expect(utxoStatus(txHash(200))).toBe('free');
+    expect(service.db.prepare('SELECT COUNT(*) AS count FROM leases').get()).toEqual({ count: 0 });
+  });
+
+  it('refuses a lease while the pool holds no collateral UTxO to share, resyncing with the chain first', async () => {
+    service.fund(txHash(100), 0, 100_000_000n);
+    await service.sync.run();
+    const key = service.issueKey().record;
+
+    const starved = await service.leases.create(key).catch((err: unknown) => err);
+    expect(starved).toBeInstanceOf(OutOfFundsError);
+    expect((starved as OutOfFundsError).toResponseBody()).toEqual({
+      error: 'out_of_funds',
+      detail: `The pool has no collateral UTxO and the reserve holds 0 lovelace; a split needs at least ${5_000_000n + REPLENISH_FEE_MARGIN}`,
+    });
+    expect(utxoStatus(txHash(100))).toBe('free');
+
+    service.fund(txHash(300), 0, 1_000_000_000n);
+    const splittable = await service.leases.create(key).catch((err: unknown) => err);
+    expect(splittable).toBeInstanceOf(NoUtxoAvailableError);
+    expect((splittable as NoUtxoAvailableError).detail).toBe('The pool has no collateral UTxO yet; the reserve holds 1000000000 lovelace and can be split by replenishing');
+
+    service.fund(txHash(200), 0, 5_000_000n);
+    const lease = await service.leases.create(key);
+    expect(lease.fee.txHash).toBe(txHash(100));
   });
 
   it('retries once when the insert loses a race on the fee UTxO', async () => {
@@ -92,10 +106,10 @@ describe('lease creation', () => {
     const key = service.issueKey().record;
     service.db
       .prepare(
-        `INSERT INTO leases (id, api_key_id, fee_utxo, collateral_utxo, expires_at, status, created_at)
-         VALUES ('other-process', ?, ?, ?, '2024-01-01T00:10:00.000Z', 'open', '2024-01-01T00:00:00.000Z')`,
+        `INSERT INTO leases (id, api_key_id, fee_utxo, expires_at, status, created_at)
+         VALUES ('other-process', ?, ?, '2024-01-01T00:10:00.000Z', 'open', '2024-01-01T00:00:00.000Z')`,
       )
-      .run(key.id, `${txHash(100)}#0`, `${txHash(200)}#0`);
+      .run(key.id, `${txHash(100)}#0`);
 
     const lease = await service.leases.create(key);
 
@@ -212,15 +226,19 @@ describe('lease expiry and release', () => {
     expect(next.fee.txHash).toBe(txHash(100));
   });
 
-  it('keeps a shared collateral UTxO leased while another lease still holds it', async () => {
+  it('leaves the shared collateral UTxO free whatever is leased, released or consumed', async () => {
     await fundPool(2, 1);
     const key = service.issueKey().record;
     const first = await service.leases.create(key);
-    await service.leases.create(key);
+    const second = await service.leases.create(key);
+    expect(utxoStatus(txHash(200))).toBe('free');
 
     service.leases.release(key, first.id);
+    service.leases.consume(key, second, { txHash: txHash(9), sponsoredLovelace: 0, witnessSet: 'a10080', invalidHereafter: 1 });
 
-    expect(utxoStatus(txHash(200))).toBe('leased');
+    expect(utxoStatus(txHash(200))).toBe('free');
+    expect(utxoStatus(txHash(101))).toBe('consumed');
+    expect(service.collateral.current()?.txHash).toBe(txHash(200));
   });
 
   it('refuses to release a lease another key holds as unknown', async () => {

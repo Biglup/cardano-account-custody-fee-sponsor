@@ -1,13 +1,13 @@
 import { randomBytes } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
-import type { Wallet } from '@biglup/cometa';
+import type { UTxO, Wallet } from '@biglup/cometa';
 import { SponsorError, SponsorWallet } from '../../src/client/sponsor-wallet.js';
 import { Cometa } from '../../src/cometa.js';
 import { parseTransaction } from '../../src/policy/parse.js';
 import { slotAt } from '../../src/slots.js';
-import { strangerAddress } from '../support/account.js';
-import { leasedUtxo, shapeCreation } from '../support/client.js';
+import { accountAddress, fundUtxo, initialStateOf, stateNftAssetId, strangerAddress, unitRedeemer } from '../support/account.js';
+import { shapeCreation, shapeOwnerOperation, sponsorUtxo } from '../support/client.js';
 import { appFetch } from '../support/http.js';
 import { TEST_MNEMONIC, type TestService, createTestService, txHash } from '../support/service.js';
 
@@ -64,6 +64,32 @@ const paymentKeyHashOf = async (wallet: Wallet): Promise<string> => {
 /** The hash of a verification key, as a credential names it. */
 const keyHashOf = (vkey: string): string => Cometa.uint8ArrayToHex(Cometa.Blake2b.computeHash(Cometa.hexToUint8Array(vkey), 28));
 
+/** The key hashes of the verification key witnesses a signed transaction carries, sorted. */
+const signersOf = (signed: string): string[] =>
+  (Cometa.inspectTx(signed).witness_set.vkey_witnesses as { vkey: string }[]).map((witness) => keyHashOf(witness.vkey)).sort();
+
+/** A sponsor wallet in collateral mode over the test service. */
+const collateralSponsor = (): SponsorWallet =>
+  new SponsorWallet({ baseUrl: 'http://sponsor.test', apiKey, provider: service.provider, mode: 'collateral', fetch: appFetch(service.app), now: () => service.clock.now });
+
+/** The account of `device` on the fake chain: its control UTxO with the state naming that one device, and a fund UTxO of 20 ADA. */
+const placeAccountOf = (device: string): { control: UTxO; fund: UTxO } => {
+  const control: UTxO = {
+    input: { txId: txHash(300), index: 0 },
+    output: { address: accountAddress, value: { coins: 2_000_000n, assets: { [stateNftAssetId]: 1n } }, datum: initialStateOf(device) },
+  };
+  const fund = fundUtxo(txHash(301), 20_000_000n);
+  service.provider.addUtxo(control);
+  service.provider.addUtxo(fund);
+  return { control, fund };
+};
+
+/** An owner operation the account pays for, built on the collateral mode sponsor's builder: the control and a fund UTxO in, the change back to the account. */
+const buildAccountPaid = async (sponsor: SponsorWallet, device: string, control: UTxO, fund: UTxO): Promise<string> => {
+  const builder = shapeOwnerOperation((await sponsor.createTransactionBuilder()).setChangeAddress(accountAddress), control, device);
+  return builder.addInput({ utxo: fund, redeemer: unitRedeemer }).build();
+};
+
 describe('SponsorWallet', () => {
   it('takes a lease on first use and answers every question about itself from it', async () => {
     await fundPool();
@@ -76,8 +102,8 @@ describe('SponsorWallet', () => {
     expect(leaseStatuses()).toEqual(['open']);
     const lease = sponsor.lease;
     expect(lease).toMatchObject({ sponsorAddress: service.serviceWallet.address, fee: { txHash: txHash(100) }, collateral: { txHash: txHash(200) } });
-    expect(await sponsor.getUnspentOutputs()).toEqual([leasedUtxo(lease?.fee ?? { txHash: '', index: 0, address: '', lovelace: 0 })]);
-    expect(await sponsor.getCollateral()).toEqual([leasedUtxo(lease?.collateral ?? { txHash: '', index: 0, address: '', lovelace: 0 })]);
+    expect(await sponsor.getUnspentOutputs()).toEqual([sponsorUtxo(lease?.fee ?? { txHash: '', index: 0, address: '', lovelace: 0 })]);
+    expect(await sponsor.getCollateral()).toEqual([sponsorUtxo(lease?.collateral ?? { txHash: '', index: 0, address: '', lovelace: 0 })]);
     expect(await sponsor.getBalance()).toEqual({ coins: 100_000_000n });
     expect((await sponsor.getChangeAddress()).toString()).toBe(service.serviceWallet.address);
     expect(await sponsor.getNetworkId()).toBe(Cometa.NetworkId.Testnet);
@@ -92,8 +118,8 @@ describe('SponsorWallet', () => {
     expect(leaseStatuses()).toEqual(['open']);
     const lease = sponsor.lease;
     expect(address.toString()).toBe(lease?.sponsorAddress);
-    expect(utxos).toEqual([leasedUtxo(lease?.fee ?? { txHash: '', index: 0, address: '', lovelace: 0 })]);
-    expect(collateral).toEqual([leasedUtxo(lease?.collateral ?? { txHash: '', index: 0, address: '', lovelace: 0 })]);
+    expect(utxos).toEqual([sponsorUtxo(lease?.fee ?? { txHash: '', index: 0, address: '', lovelace: 0 })]);
+    expect(collateral).toEqual([sponsorUtxo(lease?.collateral ?? { txHash: '', index: 0, address: '', lovelace: 0 })]);
     const health = await request(service.app).get('/health');
     expect(health.body.pool.fee).toEqual({ free: 2, leased: 1 });
   });
@@ -134,8 +160,7 @@ describe('SponsorWallet', () => {
     const ownerWitnesses = await owner.signTransaction(transaction, true);
     const signed = Cometa.applyVkeyWitnessSet(transaction, [...sponsorWitnesses, ...ownerWitnesses]);
 
-    const vkeyWitnesses = Cometa.inspectTx(signed).witness_set.vkey_witnesses as { vkey: string }[];
-    expect(vkeyWitnesses.map((witness) => keyHashOf(witness.vkey)).sort()).toEqual([service.serviceWallet.paymentKeyHash, ownerKey].sort());
+    expect(signersOf(signed)).toEqual([service.serviceWallet.paymentKeyHash, ownerKey].sort());
     expect(service.db.prepare('SELECT status FROM leases WHERE id = ?').get(leaseId)).toEqual({ status: 'consumed' });
     expect(sponsor.lease).toBeUndefined();
     expect(await sponsor.submitTransaction(signed)).toMatch(/^[0-9a-f]{64}$/);
@@ -205,6 +230,19 @@ describe('SponsorWallet', () => {
     await expect(proxied.getAddress()).rejects.toMatchObject({ status: 502, code: 'unexpected_response' });
   });
 
+  it('releases what a lease request in flight resolves to, so it holds nothing afterwards', async () => {
+    await fundPool();
+    const taking = sponsor.getAddress();
+
+    await sponsor.release();
+
+    expect(sponsor.lease).toBeUndefined();
+    expect(leaseStatuses()).toEqual(['released']);
+    expect((await taking).toString()).toBe(service.serviceWallet.address);
+    const health = await request(service.app).get('/health');
+    expect(health.body.pool.fee).toEqual({ free: 1, leased: 0 });
+  });
+
   it('releases an unused lease, and releasing again or without a lease does nothing', async () => {
     await fundPool();
     await sponsor.getAddress();
@@ -241,5 +279,86 @@ describe('SponsorWallet', () => {
     await sponsor.getAddress();
     expect(sponsor.lease?.leaseId).not.toBe(second);
     expect(leaseStatuses()).toEqual(['expired', 'released', 'open']);
+  });
+});
+
+describe('SponsorWallet in collateral mode', () => {
+  it('takes no lease, offers the shared collateral and nothing to spend, and witnesses an operation the account pays for', async () => {
+    await fundPool(0, 1);
+    const owner = await ownerWallet();
+    const ownerKey = await paymentKeyHashOf(owner);
+    const { control, fund } = placeAccountOf(ownerKey);
+    const sponsor = collateralSponsor();
+    expect(sponsor.collateral).toBeUndefined();
+
+    const [address, utxos, balance, held] = await Promise.all([sponsor.getAddress(), sponsor.getUnspentOutputs(), sponsor.getBalance(), sponsor.getCollateral()]);
+
+    expect(address.toString()).toBe(service.serviceWallet.address);
+    expect(utxos).toEqual([]);
+    expect(balance).toEqual({ coins: 0n });
+    expect(held).toEqual([sponsorUtxo({ txHash: txHash(200), index: 0, address: service.serviceWallet.address, lovelace: 5_000_000 })]);
+    expect(sponsor.lease).toBeUndefined();
+    expect(sponsor.collateral).toMatchObject({ txHash: txHash(200), validitySeconds: 600 });
+    expect(leaseStatuses()).toEqual([]);
+
+    const transaction = await buildAccountPaid(sponsor, ownerKey, control, fund);
+    const parsed = parseTransaction(transaction).transaction;
+    expect(parsed?.invalidHereafter).toBe(slotAt(service.config.slots, new Date('2024-01-01T00:09:00.000Z')));
+    expect(parsed?.collateralInputs).toEqual([{ txId: txHash(200), index: 0 }]);
+    expect(parsed?.outputs.every((output) => output.address === accountAddress)).toBe(true);
+
+    const sponsorWitnesses = await sponsor.signTransaction(transaction, true);
+    const ownerWitnesses = await owner.signTransaction(transaction, true);
+    const signed = Cometa.applyVkeyWitnessSet(transaction, [...sponsorWitnesses, ...ownerWitnesses]);
+
+    expect(sponsorWitnesses).toHaveLength(1);
+    expect(signersOf(signed)).toEqual([service.serviceWallet.paymentKeyHash, ownerKey].sort());
+    expect(leaseStatuses()).toEqual([]);
+    expect(service.db.prepare('SELECT lease_id, sponsored_lovelace FROM witnesses WHERE tx_hash = ?').get(parsed?.hash)).toEqual({ lease_id: null, sponsored_lovelace: 0 });
+    expect(await sponsor.signTransaction(transaction, true)).toEqual(sponsorWitnesses);
+    expect((service.db.prepare("SELECT outcome FROM audit WHERE action = 'witness' ORDER BY id").all() as { outcome: string }[]).map((row) => row.outcome)).toEqual([
+      'issued',
+      'reissued',
+    ]);
+    expect(await sponsor.submitTransaction(signed)).toMatch(/^[0-9a-f]{64}$/);
+    expect(service.provider.submitted).toEqual([signed]);
+    expect(sponsor.collateral).toMatchObject({ txHash: txHash(200) });
+  });
+
+  it('drops the collateral it holds when the service says it was replaced, and builds on the current one next', async () => {
+    await fundPool(0, 2);
+    const owner = await ownerWallet();
+    const ownerKey = await paymentKeyHashOf(owner);
+    const { control, fund } = placeAccountOf(ownerKey);
+    const sponsor = collateralSponsor();
+    const stale = await buildAccountPaid(sponsor, ownerKey, control, fund);
+    expect(sponsor.collateral?.txHash).toBe(txHash(200));
+    service.provider.removeUtxo({ txId: txHash(200), index: 0 });
+    await service.sync.run();
+
+    await expect(sponsor.signTransaction(stale, true)).rejects.toMatchObject({ status: 422, code: 'invalid_transaction', rule: 'uses_shared_collateral' });
+
+    expect(sponsor.collateral).toBeUndefined();
+    const fresh = await buildAccountPaid(sponsor, ownerKey, control, fund);
+    expect(sponsor.collateral?.txHash).toBe(txHash(201));
+    expect(parseTransaction(fresh).transaction?.collateralInputs).toEqual([{ txId: txHash(201), index: 0 }]);
+    expect(await sponsor.signTransaction(fresh, true)).toHaveLength(1);
+  });
+
+  it('surfaces a pool without collateral as a SponsorError, and release forgets the collateral it read', async () => {
+    const sponsor = collateralSponsor();
+    await expect(sponsor.getCollateral()).rejects.toMatchObject({ status: 503, code: 'out_of_funds' });
+
+    await fundPool(0, 1);
+    const reading = sponsor.getCollateral();
+    await sponsor.release();
+    expect(sponsor.collateral).toBeUndefined();
+    expect(await reading).toHaveLength(1);
+
+    await sponsor.getAddress();
+    expect(sponsor.collateral?.txHash).toBe(txHash(200));
+    await sponsor.release();
+    expect(sponsor.collateral).toBeUndefined();
+    expect(leaseStatuses()).toEqual([]);
   });
 });

@@ -1,9 +1,9 @@
 import type Database from 'better-sqlite3';
 
-/** What a pool UTxO is for: paying a client's fee, or backing its collateral. */
+/** What a pool UTxO is for: paying a client's fee, or backing collateral. */
 export type UtxoKind = 'fee' | 'collateral';
 
-/** Where a pool UTxO is in its life: leasable, held by a lease, spent by a witnessed transaction, or vanished without one. */
+/** Where a pool UTxO is in its life: leasable, held by a lease, spent by a witnessed transaction or taken as collateral, or vanished without either. */
 export type UtxoStatus = 'free' | 'leased' | 'consumed' | 'gone';
 
 /** One sponsor UTxO as the pool table tracks it. */
@@ -56,8 +56,8 @@ export const findPoolUtxo = (db: Database.Database, ref: string): PoolUtxo | und
 };
 
 /**
- * Brings a UTxO's status in line with the leases on it: leased while any
- * open lease references it, free otherwise. A UTxO already consumed or
+ * Brings a fee UTxO's status in line with the leases on it: leased while
+ * an open lease references it, free otherwise. A UTxO already consumed or
  * gone is left alone, since the chain, not a lease, decided that.
  */
 export const refreshUtxoStatus = (db: Database.Database, ref: string): void => {
@@ -65,9 +65,9 @@ export const refreshUtxoStatus = (db: Database.Database, ref: string): void => {
   db.prepare(
     `UPDATE pool_utxos
      SET status = CASE
-       WHEN EXISTS (SELECT 1 FROM leases WHERE status = 'open' AND (fee_utxo = ? OR collateral_utxo = ?)) THEN 'leased'
+       WHEN EXISTS (SELECT 1 FROM leases WHERE status = 'open' AND fee_utxo = ?) THEN 'leased'
        ELSE 'free'
      END
      WHERE tx_hash = ? AND tx_index = ? AND status IN ('free', 'leased')`,
-  ).run(ref, ref, txHash, index);
+  ).run(ref, txHash, index);
 };

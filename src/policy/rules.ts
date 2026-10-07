@@ -6,14 +6,22 @@ import { type SlotSettings, slotAt, slotToTime } from '../slots.js';
 import { evaluates } from './evaluate.js';
 import type { ParsedCertificate, ParsedOutput, ParsedTransaction, ResolvedInput } from './parse.js';
 
-/** The machine name of a policy rule, listed in the order the rules are checked; the first one that fails is the one reported. */
+/**
+ * The machine name of a policy rule, listed in the order the rules are
+ * checked; the first one that fails is the one reported. Three rules take
+ * a different name in each mode, since what they ask differs: the sponsor
+ * inputs, the collateral and the sponsor outflow rules.
+ */
 export type RuleName =
   | 'well_formed'
   | 'uses_leased_fee_input'
+  | 'no_sponsor_inputs'
   | 'uses_leased_collateral'
+  | 'uses_shared_collateral'
   | 'bounded_validity'
   | 'account_transaction'
   | 'sponsor_outflow_bounded'
+  | 'sponsor_outflow_zero'
   | 'no_sponsor_value_elsewhere'
   | 'no_foreign_scripts'
   | 'evaluates'
@@ -25,15 +33,36 @@ export interface Violation {
   detail: string;
 }
 
-/** A leased UTxO as the policy needs it: where it is and what it holds. */
-export type LeasedUtxo = Pick<PoolUtxo, 'txHash' | 'index' | 'lovelace'>;
+/** A sponsor UTxO as the policy needs it: where it is and what it holds. */
+export type SponsorUtxo = Pick<PoolUtxo, 'txHash' | 'index' | 'lovelace'>;
 
-/** What the policy knows about the sponsor, the account contract, the lease under check, its limits, the network's clock and the time of the check. */
+/** The sponsor paying the fee from the UTxO a lease reserved, which the transaction must spend, until the lease expiry. */
+export interface FeeMode {
+  kind: 'fee';
+  fee: SponsorUtxo;
+  expiresAt: string;
+}
+
+/** The sponsor contributing the shared collateral alone, with the fee paid by whoever else signs. */
+export interface CollateralMode {
+  kind: 'collateral';
+}
+
+/** How the sponsor takes part in the transaction under check. */
+export type PolicyMode = FeeMode | CollateralMode;
+
+/**
+ * What the policy knows about the sponsor, the account contract, the mode
+ * the transaction is checked under, the shared collateral every
+ * transaction declares, the limits, the network's clock and the time of
+ * the check.
+ */
 export interface PolicyContext {
   sponsor: { address: string; paymentKeyHash: string; stakeKeyHash: string };
   accountScriptHash: string;
-  lease: { fee: LeasedUtxo; collateral: LeasedUtxo; expiresAt: string };
-  limits: { maxSponsoredLovelace: number; maxFeeLovelace: number; validityMarginSeconds: number };
+  mode: PolicyMode;
+  collateral: SponsorUtxo;
+  limits: { maxSponsoredLovelace: number; maxFeeLovelace: number; validityMarginSeconds: number; collateralValiditySeconds: number };
   slots: SlotSettings;
   now: Date;
   /** Whether the pool knows a `txHash#index` reference as one of the sponsor's own UTxOs, whatever its status. */
@@ -219,7 +248,7 @@ const analyse = (transaction: ParsedTransaction, inputs: ResolvedInput[], contex
     creation: typeof creation === 'string' ? undefined : creation,
     notAccountTransaction: typeof creation === 'string' ? creation : undefined,
     stakeScriptHashes: stakeScriptHashesOf(controlInputs, typeof creation === 'string' ? undefined : creation),
-    sponsoredLovelace: BigInt(context.lease.fee.lovelace) - returned,
+    sponsoredLovelace: context.mode.kind === 'fee' ? BigInt(context.mode.fee.lovelace) - returned : 0n,
   };
 };
 
@@ -227,90 +256,110 @@ const analyse = (transaction: ParsedTransaction, inputs: ResolvedInput[], contex
 const violation = (rule: RuleName, detail: string): Violation => ({ rule, detail });
 
 /**
- * The inputs include the leased fee UTxO and no other UTxO of the
- * sponsor. An input the chain knows but whose payment credential cannot
- * be read, as at a Byron address, cannot be told from the sponsor's and
- * is refused too.
+ * In fee mode, the inputs include the leased fee UTxO and no other UTxO of
+ * the sponsor; in collateral mode, no input is the sponsor's at all. In
+ * either, an input the chain knows but whose payment credential cannot be
+ * read, as at a Byron address, cannot be told from the sponsor's and is
+ * refused too.
  */
-const usesLeasedFeeInput: Rule = ({ inputs, sponsorInputs }, { lease }) => {
-  const feeRef = utxoRef(lease.fee.txHash, lease.fee.index);
-  if (!inputs.some((input) => input.ref === feeRef)) {
-    return violation('uses_leased_fee_input', `The leased fee UTxO ${feeRef} is not among the inputs`);
+const sponsorInputs: Rule = ({ inputs, sponsorInputs }, { mode }) => {
+  const rule = mode.kind === 'fee' ? 'uses_leased_fee_input' : 'no_sponsor_inputs';
+  const feeRef = mode.kind === 'fee' ? utxoRef(mode.fee.txHash, mode.fee.index) : undefined;
+  if (feeRef !== undefined && !inputs.some((input) => input.ref === feeRef)) {
+    return violation(rule, `The leased fee UTxO ${feeRef} is not among the inputs`);
   }
   const unclassifiable = inputs.find((input) => input.output !== undefined && input.output.paymentCredential === undefined);
   if (unclassifiable !== undefined) {
-    return violation('uses_leased_fee_input', `Input ${unclassifiable.ref} is at an address whose payment credential the policy cannot read`);
+    return violation(rule, `Input ${unclassifiable.ref} is at an address whose payment credential the policy cannot read`);
   }
   const extra = sponsorInputs.find((input) => input.ref !== feeRef);
   if (extra !== undefined) {
-    return violation('uses_leased_fee_input', `Input ${extra.ref} belongs to the sponsor but is not the leased fee UTxO`);
-  }
-  return undefined;
-};
-
-/**
- * The collateral is exactly the leased collateral UTxO, returned to the
- * sponsor, with total collateral set within what it holds, and the
- * transaction is not flagged as failing phase two, which would hand the
- * collateral to the ledger outright.
- */
-const usesLeasedCollateral: Rule = ({ transaction }, { lease, sponsor }) => {
-  if (!transaction.isValid) {
-    return violation('uses_leased_collateral', 'The transaction is flagged as failing phase two, which would forfeit the collateral');
-  }
-  const collateralRef = utxoRef(lease.collateral.txHash, lease.collateral.index);
-  const refs = transaction.collateralInputs.map((input) => utxoRef(input.txId, input.index));
-  if (refs.length !== 1 || refs[0] !== collateralRef) {
-    return violation('uses_leased_collateral', `The collateral inputs must be exactly the leased collateral UTxO ${collateralRef}`);
-  }
-  if (transaction.collateralReturn === undefined) {
-    return violation('uses_leased_collateral', 'The transaction has no collateral return output');
-  }
-  if (transaction.collateralReturn.address !== sponsor.address) {
-    return violation('uses_leased_collateral', 'The collateral return must pay the sponsor address');
-  }
-  const carried = carries(transaction.collateralReturn);
-  if (carried !== undefined) {
-    return violation('uses_leased_collateral', `The collateral return carries a ${carried}, which the pool could not spend plainly`);
-  }
-  if (transaction.totalCollateral === undefined) {
-    return violation('uses_leased_collateral', 'Total collateral is not set');
-  }
-  if (transaction.totalCollateral > BigInt(lease.collateral.lovelace)) {
     return violation(
-      'uses_leased_collateral',
-      `Total collateral ${transaction.totalCollateral} exceeds the ${lease.collateral.lovelace} lovelace the leased collateral UTxO holds`,
+      rule,
+      feeRef === undefined
+        ? `Input ${extra.ref} belongs to the sponsor, which contributes collateral only`
+        : `Input ${extra.ref} belongs to the sponsor but is not the leased fee UTxO`,
     );
   }
   return undefined;
 };
 
 /**
- * The transaction stops being valid no later than the lease expiry plus
- * the configured margin, so that a witnessed transaction the client never
- * submits cannot hold the fee UTxO out of the pool for longer than that,
- * and later than now, so that the bound stored with the witness is one
- * the pool sync can wait out. Slots are compared as the integers they
- * are, never as times: a bound far enough out has no time at all, and
- * must still be refused. Returns the bound once it is verified.
+ * The collateral is exactly the shared collateral UTxO, returned to the
+ * sponsor, with total collateral set within what it holds, and the
+ * transaction is not flagged as failing phase two, which would hand the
+ * collateral to the ledger outright. The rule is named after the mode:
+ * the lease named the UTxO in fee mode, the collateral route in the other.
  */
-const boundedValidity = ({ transaction }: Analysis, { lease, limits, slots, now }: PolicyContext): bigint | Violation => {
+const sponsorCollateral: Rule = ({ transaction }, { mode, collateral, sponsor }) => {
+  const rule = mode.kind === 'fee' ? 'uses_leased_collateral' : 'uses_shared_collateral';
+  if (!transaction.isValid) {
+    return violation(rule, 'The transaction is flagged as failing phase two, which would forfeit the collateral');
+  }
+  const collateralRef = utxoRef(collateral.txHash, collateral.index);
+  const refs = transaction.collateralInputs.map((input) => utxoRef(input.txId, input.index));
+  if (refs.length !== 1 || refs[0] !== collateralRef) {
+    return violation(rule, `The collateral inputs must be exactly the shared collateral UTxO ${collateralRef}`);
+  }
+  if (transaction.collateralReturn === undefined) {
+    return violation(rule, 'The transaction has no collateral return output');
+  }
+  if (transaction.collateralReturn.address !== sponsor.address) {
+    return violation(rule, 'The collateral return must pay the sponsor address');
+  }
+  const carried = carries(transaction.collateralReturn);
+  if (carried !== undefined) {
+    return violation(rule, `The collateral return carries a ${carried}, which the pool could not spend plainly`);
+  }
+  if (transaction.totalCollateral === undefined) {
+    return violation(rule, 'Total collateral is not set');
+  }
+  if (transaction.totalCollateral > BigInt(collateral.lovelace)) {
+    return violation(rule, `Total collateral ${transaction.totalCollateral} exceeds the ${collateral.lovelace} lovelace the shared collateral UTxO holds`);
+  }
+  return undefined;
+};
+
+/** The latest slot a validity upper bound may name under the mode, and the words for how it was found. */
+const latestBound = ({ mode, limits, slots, now }: PolicyContext): { slot: bigint; reason: string } =>
+  mode.kind === 'fee'
+    ? {
+        slot: slotAt(slots, new Date(new Date(mode.expiresAt).getTime() + limits.validityMarginSeconds * 1000)),
+        reason: `the lease expiry plus ${limits.validityMarginSeconds} seconds`,
+      }
+    : {
+        slot: slotAt(slots, new Date(now.getTime() + limits.collateralValiditySeconds * 1000)),
+        reason: `now plus ${limits.collateralValiditySeconds} seconds`,
+      };
+
+/**
+ * The transaction stops being valid no later than the lease expiry plus
+ * the configured margin in fee mode, so that a witnessed transaction the
+ * client never submits cannot hold the fee UTxO out of the pool for
+ * longer than that, or than now plus the collateral validity window in
+ * collateral mode, so that a signed transaction cannot linger; and later
+ * than now, so that the bound stored with the witness is one the pool
+ * sync can wait out. Slots are compared as the integers they are, never
+ * as times: a bound far enough out has no time at all, and must still be
+ * refused. Returns the bound once it is verified.
+ */
+const boundedValidity = ({ transaction }: Analysis, context: PolicyContext): bigint | Violation => {
   const bound = transaction.invalidHereafter;
   if (bound === undefined) {
     return violation('bounded_validity', 'The transaction carries no validity upper bound');
   }
-  const latestSlot = slotAt(slots, new Date(new Date(lease.expiresAt).getTime() + limits.validityMarginSeconds * 1000));
-  if (bound > latestSlot) {
+  const latest = latestBound(context);
+  if (bound > latest.slot) {
     return violation(
       'bounded_validity',
-      `The validity upper bound at slot ${bound} is later than slot ${latestSlot} (${slotToTime(slots, latestSlot).toISOString()}), the lease expiry plus ${limits.validityMarginSeconds} seconds`,
+      `The validity upper bound at slot ${bound} is later than slot ${latest.slot} (${slotToTime(context.slots, latest.slot).toISOString()}), ${latest.reason}`,
     );
   }
-  const currentSlot = slotAt(slots, now);
+  const currentSlot = slotAt(context.slots, context.now);
   if (bound <= currentSlot) {
     return violation(
       'bounded_validity',
-      `The validity upper bound at slot ${bound} (${slotToTime(slots, bound).toISOString()}) is not later than the current slot ${currentSlot}`,
+      `The validity upper bound at slot ${bound} (${slotToTime(context.slots, bound).toISOString()}) is not later than the current slot ${currentSlot}`,
     );
   }
   return bound;
@@ -355,6 +404,29 @@ const sponsorOutflowBounded: Rule = ({ transaction, creation, sponsorOutputs, sp
   }
   return undefined;
 };
+
+/**
+ * In collateral mode the sponsor contributes nothing but the collateral:
+ * no output pays the sponsor payment key, at any address, and no sponsor
+ * value enters the transaction, neither through an input, which the
+ * sponsor inputs rule already refused, nor through a withdrawal from the
+ * sponsor's reward account.
+ */
+const sponsorOutflowZero: Rule = ({ transaction }, { sponsor }) => {
+  const paid = transaction.outputs.find((output) => isKey(output.paymentCredential) && output.paymentCredential.hash === sponsor.paymentKeyHash);
+  if (paid !== undefined) {
+    return violation('sponsor_outflow_zero', `An output pays ${paid.lovelace} lovelace to the sponsor, which contributes collateral only`);
+  }
+  const withdrawal = transaction.withdrawals.find((entry) => isKey(entry.credential) && entry.credential.hash === sponsor.stakeKeyHash);
+  if (withdrawal !== undefined) {
+    return violation('sponsor_outflow_zero', `The transaction withdraws from the sponsor's reward account ${withdrawal.rewardAddress}, which contributes nothing`);
+  }
+  return undefined;
+};
+
+/** The sponsor outflow rule of the mode: bounded to the fee and the creation amounts in fee mode, nothing at all in collateral mode. */
+const sponsorOutflow: Rule = (analysis, context) =>
+  context.mode.kind === 'fee' ? sponsorOutflowBounded(analysis, context) : sponsorOutflowZero(analysis, context);
 
 /** Every output away from the sponsor and the account is covered by what the non sponsor inputs and withdrawals bring in. */
 const noSponsorValueElsewhere: Rule = ({ transaction, otherInputs, foreignOutputs }, { sponsor }) => {
@@ -450,19 +522,22 @@ const signers: Rule = ({ transaction }, { sponsor }) => {
 };
 
 /** The rules checked before the validity bound, in order. */
-const BEFORE_VALIDITY: Rule[] = [usesLeasedFeeInput, usesLeasedCollateral];
+const BEFORE_VALIDITY: Rule[] = [sponsorInputs, sponsorCollateral];
 
 /** The rules checked after the validity bound and before evaluation, in order. */
-const BEFORE_EVALUATION: Rule[] = [accountTransaction, sponsorOutflowBounded, noSponsorValueElsewhere, noForeignScripts];
+const BEFORE_EVALUATION: Rule[] = [accountTransaction, sponsorOutflow, noSponsorValueElsewhere, noForeignScripts];
 
 /**
  * Applies the policy to a transaction that already parsed, in rule
  * order: the structural rules first, then evaluation through the
  * provider, then the signer rules, stopping at the first violation. The
- * verdict also says what the transaction was read as and how much
- * sponsor lovelace it draws, which is what the audit trail records, and
- * an approval carries the validity upper bound as verified, which is
- * what the witness is recorded with.
+ * same rules serve both modes; the mode in the context decides what the
+ * sponsor inputs, the collateral, the validity bound and the sponsor
+ * outflow rules ask, and the name each answers under. The verdict also
+ * says what the transaction was read as and how much sponsor lovelace it
+ * draws, which is what the audit trail records, and an approval carries
+ * the validity upper bound as verified, which is what the witness is
+ * recorded with.
  */
 export const applyPolicy = async (
   transaction: ParsedTransaction,

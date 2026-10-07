@@ -2,8 +2,9 @@ import type Database from 'better-sqlite3';
 import type { Provider, UTxO } from '@biglup/cometa';
 import type { Logger } from 'pino';
 import { recordAudit } from '../audit.js';
-import type { Config } from '../config.js';
 import { type SlotSettings, slotAt } from '../slots.js';
+import { designatedCollateral, refreshSharedCollateral } from './collateral.js';
+import type { PoolSizes } from './sizes.js';
 import { type PoolUtxoRow, type UtxoKind, refreshUtxoStatus, utxoRef } from './utxo.js';
 
 /** How often the pool is reconciled with the chain. */
@@ -25,9 +26,6 @@ export const RESTORE_MARGIN_SLOTS = 120n;
  * funded by hand.
  */
 const CLASSIFICATION_TOLERANCE = 0.1;
-
-/** The pool sizes a UTxO is classified against. */
-export type PoolSizes = Pick<Config, 'feeUtxoLovelace' | 'collateralUtxoLovelace'>;
 
 /** What the sponsor address holds outside the pool: UTxOs that are neither fee nor collateral sized, and so can be split. */
 export interface ReserveSnapshot {
@@ -92,8 +90,8 @@ export const classifyUtxo = (lovelace: bigint, sizes: PoolSizes): UtxoKind | 're
 /** A row of the pool table restricted to what reconciliation reads. */
 type TrackedRow = Pick<PoolUtxoRow, 'tx_hash' | 'tx_index' | 'kind' | 'status'>;
 
-/** An open lease on a vanished UTxO: its key and UTxOs, and whether a witness was issued for it, as sqlite reports a boolean. */
-type OpenLeaseRow = { id: string; api_key_id: number; fee_utxo: string; collateral_utxo: string; witnessed: 0 | 1 };
+/** An open lease on a vanished fee UTxO: its key, and whether a witness was issued for it, as sqlite reports a boolean. */
+type OpenLeaseRow = { id: string; api_key_id: number; witnessed: 0 | 1 };
 
 /** Whether a UTxO holds only lovelace, as every pool UTxO must. */
 const holdsOnlyLovelace = (utxo: UTxO): boolean => Object.keys(utxo.output.value.assets ?? {}).length === 0;
@@ -107,21 +105,22 @@ const poolOf = (utxo: UTxO, sizes: PoolSizes): UtxoKind | 'reserve' =>
  * provider, classifies what it finds by lovelace, inserts unknown fee and
  * collateral UTxOs as free, and settles the ones the pool knew but the
  * chain no longer shows: a fee UTxO is consumed when a witness was issued
- * for a lease on it, gone otherwise; a collateral UTxO is always gone,
- * since no witnessed transaction spends it, so whatever took it was not a
- * witness and a rollback may bring it back. A lease still open on a
- * vanished UTxO is closed, since nothing can be built on it any more:
- * consumed when the witness was issued for that lease, expired otherwise,
- * so that a lease sharing a collateral UTxO with a witnessed one is not
- * reported as consumed. The other UTxO of a closed lease is freed unless
- * another open lease still holds it, and every lease closed here is
- * written to the audit trail like one closed by its expiry or its client.
- * A UTxO marked gone that reappears after a rollback becomes free again.
- * One marked consumed that the chain still lists stays consumed while any
- * witness issued on it can still land, and becomes free once the current
- * slot, read off the clock, is more than `RESTORE_MARGIN_SLOTS` past the
- * validity upper bound of every one of them, since no block can include
- * those transactions any more.
+ * for a lease on it, gone otherwise; the shared collateral UTxO is
+ * consumed, since only a phase two failure of a witnessed transaction
+ * takes it, and any other collateral UTxO is gone, since no witnessed
+ * transaction declares it and a rollback may bring it back. A lease still
+ * open on a vanished fee UTxO is closed, since nothing can be built on it
+ * any more: consumed when the witness was issued for that lease, expired
+ * otherwise, and written to the audit trail like one closed by its expiry
+ * or its client. A UTxO marked gone that reappears after a rollback
+ * becomes free again. A fee UTxO marked consumed that the chain still
+ * lists stays consumed while any witness issued on it can still land, and
+ * becomes free once the current slot, read off the clock, is more than
+ * `RESTORE_MARGIN_SLOTS` past the validity upper bound of every one of
+ * them, since no block can include those transactions any more. Every run
+ * ends by keeping the shared collateral designated: the same UTxO while
+ * the chain lists it, the next free collateral UTxO once it is consumed,
+ * which is written to the audit trail with what replaced it.
  */
 export const createPoolSync = ({ db, provider, sponsorAddress, sizes, slots, now = () => new Date(), logger }: PoolSyncDependencies): PoolSync => {
   let reserve: ReserveSnapshot = { utxos: [], lovelace: 0n, syncedAt: undefined };
@@ -141,10 +140,9 @@ export const createPoolSync = ({ db, provider, sponsorAddress, sizes, slots, now
   );
   const freeConsumed = db.prepare("UPDATE pool_utxos SET status = 'free' WHERE tx_hash = ? AND tx_index = ? AND status = 'consumed'");
   const selectOpenLeases = db.prepare(
-    `SELECT l.id, l.api_key_id, l.fee_utxo, l.collateral_utxo,
-       EXISTS (SELECT 1 FROM witnesses w WHERE w.lease_id = l.id) AS witnessed
+    `SELECT l.id, l.api_key_id, EXISTS (SELECT 1 FROM witnesses w WHERE w.lease_id = l.id) AS witnessed
      FROM leases l
-     WHERE l.status = 'open' AND (l.fee_utxo = ? OR l.collateral_utxo = ?)`,
+     WHERE l.status = 'open' AND l.fee_utxo = ?`,
   );
   const settleLease = db.prepare("UPDATE leases SET status = ? WHERE id = ? AND status = 'open'");
 
@@ -154,12 +152,24 @@ export const createPoolSync = ({ db, provider, sponsorAddress, sizes, slots, now
     return bound !== null && BigInt(bound) + RESTORE_MARGIN_SLOTS < slot;
   };
 
+  /** Closes every open lease on a vanished fee UTxO by its own witness, freeing nothing, since the UTxO itself is settled. */
+  const closeLeasesOn = (ref: string): void => {
+    for (const lease of selectOpenLeases.all(ref) as OpenLeaseRow[]) {
+      const outcome = lease.witnessed ? 'consumed' : 'expired';
+      settleLease.run(outcome, lease.id);
+      refreshUtxoStatus(db, ref);
+      recordAudit(db, { apiKeyId: lease.api_key_id, action: 'lease', outcome, detail: { leaseId: lease.id, reason: 'utxo_vanished', utxo: ref } });
+    }
+  };
+
   const reconcile = db.transaction((listed: UTxO[], now: string, slot: bigint): Omit<SyncReport, 'reserve'> => {
     const report = { discovered: 0, consumed: 0, gone: 0, restored: 0 };
     const tracked = new Map<string, TrackedRow>();
     for (const row of selectTracked.all() as TrackedRow[]) {
       tracked.set(utxoRef(row.tx_hash, row.tx_index), row);
     }
+    const designated = designatedCollateral(db);
+    const sharedRef = designated === undefined ? undefined : utxoRef(designated.utxo.txHash, designated.utxo.index);
 
     const seen = new Set<string>();
     for (const utxo of listed) {
@@ -176,27 +186,36 @@ export const createPoolSync = ({ db, provider, sponsorAddress, sizes, slots, now
       } else if (known.status === 'gone') {
         restoreUtxo.run(utxo.input.txId, utxo.input.index);
         report.restored += 1;
-      } else if (known.status === 'consumed' && everyWitnessLapsed(ref, slot)) {
+      } else if (known.status === 'consumed' && known.kind === 'fee' && everyWitnessLapsed(ref, slot)) {
         freeConsumed.run(utxo.input.txId, utxo.input.index);
         recordAudit(db, { action: 'pool', outcome: 'restored', detail: { utxo: ref, slot: slot.toString() } });
         report.restored += 1;
       }
     }
 
+    let consumedShared: string | undefined;
     for (const [ref, row] of tracked) {
       if (seen.has(ref) || row.status === 'gone' || row.status === 'consumed') {
         continue;
       }
-      const status = row.kind === 'fee' && hasWitness.get(ref) !== undefined ? 'consumed' : 'gone';
+      const shared = ref === sharedRef;
+      const witnessed = row.kind === 'fee' && hasWitness.get(ref) !== undefined;
+      const status = shared || witnessed ? 'consumed' : 'gone';
       settleUtxo.run(status, row.tx_hash, row.tx_index);
-      for (const lease of selectOpenLeases.all(ref, ref) as OpenLeaseRow[]) {
-        const outcome = lease.witnessed ? 'consumed' : 'expired';
-        settleLease.run(outcome, lease.id);
-        refreshUtxoStatus(db, lease.fee_utxo);
-        refreshUtxoStatus(db, lease.collateral_utxo);
-        recordAudit(db, { apiKeyId: lease.api_key_id, action: 'lease', outcome, detail: { leaseId: lease.id, reason: 'utxo_vanished', utxo: ref } });
+      if (row.kind === 'fee') {
+        closeLeasesOn(ref);
+      }
+      if (shared) {
+        consumedShared = ref;
       }
       report[status] += 1;
+    }
+
+    const chosen = refreshSharedCollateral(db, now, logger);
+    if (consumedShared !== undefined) {
+      const next = chosen === undefined ? null : utxoRef(chosen.txHash, chosen.index);
+      recordAudit(db, { action: 'pool', outcome: 'collateral_consumed', detail: { utxo: consumedShared, next } });
+      logger?.warn({ utxo: consumedShared, next }, 'Shared collateral consumed');
     }
     return report;
   });

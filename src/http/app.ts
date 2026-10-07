@@ -4,11 +4,13 @@ import helmet from 'helmet';
 import type { Logger } from 'pino';
 import { pinoHttp } from 'pino-http';
 import type { Config } from '../config.js';
+import type { SharedCollateral } from '../pool/collateral.js';
 import type { LeaseService } from '../pool/leases.js';
 import type { ReplenishFn } from '../pool/replenish.js';
 import type { PoolSync } from '../pool/sync.js';
 import type { WitnessService } from '../witness.js';
 import { createAdminRouter } from './admin.js';
+import { type CollateralRouteSettings, createCollateralRouter } from './collateral.js';
 import { errorHandler, notFoundHandler } from './errors.js';
 import { createHealthRouter } from './health.js';
 import { type LeaseRouteSettings, createLeaseRouter } from './leases.js';
@@ -28,7 +30,9 @@ export interface AppDependencies {
   adminApiKey: string;
   rateLimit: RateLimitSettings;
   lease: LeaseRouteSettings;
+  collateralSettings: CollateralRouteSettings;
   leases: LeaseService;
+  collateral: SharedCollateral;
   witness: WitnessService;
   sync: PoolSync;
   replenish: ReplenishFn;
@@ -48,7 +52,20 @@ export interface AppDependencies {
  * configured number of proxy hops, since trusting every hop would let any
  * caller choose the address it is limited as.
  */
-export const createApp = ({ db, logger, network, adminApiKey, rateLimit, lease, leases, witness, sync, replenish }: AppDependencies): Express => {
+export const createApp = ({
+  db,
+  logger,
+  network,
+  adminApiKey,
+  rateLimit,
+  lease,
+  collateralSettings,
+  leases,
+  collateral,
+  witness,
+  sync,
+  replenish,
+}: AppDependencies): Express => {
   const app = express();
   app.disable('x-powered-by');
   if (rateLimit.trustProxyHops > 0) {
@@ -60,7 +77,9 @@ export const createApp = ({ db, logger, network, adminApiKey, rateLimit, lease, 
   app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
   app.use('/health', createHealthRouter(db, network));
-  app.use('/v1/leases', createLeaseRouter(db, leases, witness, lease, keyRateLimiter(rateLimit.keyRateLimitPerMinute)));
+  const keyRateLimit = keyRateLimiter(rateLimit.keyRateLimitPerMinute);
+  app.use('/v1/leases', createLeaseRouter(db, leases, collateral, witness, lease, keyRateLimit));
+  app.use('/v1/collateral', createCollateralRouter(db, collateral, witness, collateralSettings, keyRateLimit));
   app.use('/admin', createAdminRouter({ db, adminApiKey, sync, leases, replenish }));
 
   app.use(notFoundHandler);

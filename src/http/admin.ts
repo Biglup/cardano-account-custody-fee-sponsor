@@ -3,6 +3,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { type AuditRow, toAuditEntry } from '../audit.js';
 import { createApiKey, quotasSchema } from '../keys.js';
+import { designatedCollateral } from '../pool/collateral.js';
 import type { LeaseService } from '../pool/leases.js';
 import type { ReplenishFn } from '../pool/replenish.js';
 import type { PoolSync } from '../pool/sync.js';
@@ -56,7 +57,8 @@ export interface AdminDependencies {
 
 /**
  * The admin routes under `/admin`: every one requires the admin key.
- * Keys are issued here and shown once; the pool can be inspected and
+ * Keys are issued here and shown once; the pool can be inspected, with
+ * the collateral UTxO currently shared and when it was chosen, and
  * replenished from the sponsor wallet; the audit trail can be read back
  * from a point in time, so an operator can follow what every key did.
  */
@@ -77,10 +79,15 @@ export const createAdminRouter = ({ db, adminApiKey, sync, leases, replenish }: 
       toPoolUtxo,
     );
     const openLeases = (db.prepare("SELECT COUNT(*) AS count FROM leases WHERE status = 'open'").get() as { count: number }).count;
+    const designated = designatedCollateral(db);
     res.json({
       pool: poolCounts(db),
       reserve: { utxos: reserve.utxos.length, lovelace: reserve.lovelace.toString(), syncedAt: reserve.syncedAt ?? null },
       leases: { open: openLeases },
+      sharedCollateral:
+        designated === undefined || designated.utxo.status !== 'free'
+          ? null
+          : { txHash: designated.utxo.txHash, index: designated.utxo.index, lovelace: designated.utxo.lovelace, chosenAt: designated.chosenAt },
       utxos,
     });
   });

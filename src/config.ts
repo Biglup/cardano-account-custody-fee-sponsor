@@ -35,12 +35,12 @@ const envSchema = z.object({
   LEASE_TTL_SECONDS: z.coerce.number().int().positive().default(600),
   MAX_SPONSORED_LOVELACE: z.coerce.number().int().positive().default(6_000_000),
   MAX_FEE_LOVELACE: z.coerce.number().int().positive().default(2_000_000),
-  COLLATERAL_SHARING: z.coerce.number().int().positive().default(20),
   FEE_UTXO_LOVELACE: z.coerce.number().int().positive().default(100_000_000),
   COLLATERAL_UTXO_LOVELACE: z.coerce.number().int().positive().default(5_000_000),
   FEE_UTXO_COUNT: z.coerce.number().int().positive().default(10),
   COLLATERAL_UTXO_COUNT: z.coerce.number().int().positive().default(2),
   VALIDITY_MARGIN_SECONDS: z.coerce.number().int().min(0).default(120),
+  COLLATERAL_VALIDITY_SECONDS: z.coerce.number().int().positive().default(600),
   IP_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().positive().default(120),
   KEY_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().positive().default(60),
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).default(0),
@@ -58,7 +58,6 @@ export interface Config {
   leaseTtlSeconds: number;
   maxSponsoredLovelace: number;
   maxFeeLovelace: number;
-  collateralSharing: number;
   feeUtxoLovelace: number;
   collateralUtxoLovelace: number;
   feeUtxoCount: number;
@@ -67,6 +66,8 @@ export interface Config {
   slots: SlotSettings;
   /** How far past a lease's expiry a transaction's validity upper bound may reach. */
   validityMarginSeconds: number;
+  /** How far from now the validity upper bound of a transaction witnessed in collateral mode may reach. */
+  collateralValiditySeconds: number;
   /** How many requests one address may make per minute, whatever key it presents. */
   ipRateLimitPerMinute: number;
   /** How many requests one API key may make per minute. */
@@ -111,13 +112,13 @@ export const loadConfig = (env: Record<string, string | undefined> = process.env
     leaseTtlSeconds: data.LEASE_TTL_SECONDS,
     maxSponsoredLovelace: data.MAX_SPONSORED_LOVELACE,
     maxFeeLovelace: data.MAX_FEE_LOVELACE,
-    collateralSharing: data.COLLATERAL_SHARING,
     feeUtxoLovelace: data.FEE_UTXO_LOVELACE,
     collateralUtxoLovelace: data.COLLATERAL_UTXO_LOVELACE,
     feeUtxoCount: data.FEE_UTXO_COUNT,
     collateralUtxoCount: data.COLLATERAL_UTXO_COUNT,
     slots: SLOT_SETTINGS_BY_NETWORK[network],
     validityMarginSeconds: data.VALIDITY_MARGIN_SECONDS,
+    collateralValiditySeconds: data.COLLATERAL_VALIDITY_SECONDS,
     ipRateLimitPerMinute: data.IP_RATE_LIMIT_PER_MINUTE,
     keyRateLimitPerMinute: data.KEY_RATE_LIMIT_PER_MINUTE,
     trustProxyHops: data.TRUST_PROXY_HOPS,

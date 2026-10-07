@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
+import type { UTxO } from '@biglup/cometa';
 import { Cometa } from '../src/cometa.js';
-import type { LeaseBody } from '../src/api.js';
+import type { CollateralBody, LeaseBody } from '../src/api.js';
 import type { RuleName } from '../src/policy/rules.js';
 import {
   CONTROL_LOVELACE,
@@ -12,15 +13,16 @@ import {
   controlUtxo,
   foreignScript,
   foreignScriptHash,
+  fundUtxo,
   initialState,
   stakeScriptHash,
   stateNftAssetId,
   strangerAddress,
   unitRedeemer,
 } from './support/account.js';
-import { buildCreation, buildOwnerOperation, clientBuilder, leasedUtxo } from './support/client.js';
+import { buildAccountPaidOperation, buildCreation, buildOwnerOperation, clientBuilder, sponsorUtxo, underDeclaringEvaluator } from './support/client.js';
 import { type TestService, createTestService, txHash } from './support/service.js';
-import { withValidityUpperBound } from './support/transaction.js';
+import { withTotalCollateral, withValidityUpperBound } from './support/transaction.js';
 
 let service: TestService;
 let apiKey: string;
@@ -57,6 +59,16 @@ const lease = async (key: string = apiKey): Promise<LeaseBody> => {
 /** Asks for the witness of a transaction on a lease. */
 const witness = (leaseId: string, transaction: unknown, key: string = apiKey): request.Test =>
   request(service.app).post(`/v1/leases/${leaseId}/witness`).set(bearer(key)).send({ transaction });
+
+/** Reads the shared collateral through the API. */
+const collateral = async (): Promise<CollateralBody> => {
+  const response = await request(service.app).get('/v1/collateral').set(bearer());
+  expect(response.status).toBe(200);
+  return response.body as CollateralBody;
+};
+
+/** Asks for the collateral witness of a transaction. */
+const collateralWitness = (transaction: unknown): request.Test => request(service.app).post('/v1/collateral/witness').set(bearer()).send({ transaction });
 
 /** The number of witnesses issued so far. */
 const witnessCount = (): number => (service.db.prepare('SELECT COUNT(*) AS count FROM witnesses').get() as { count: number }).count;
@@ -135,20 +147,67 @@ describe('a client trying to drain the sponsor', () => {
     expect(witnessCount()).toBe(0);
   });
 
-  it('cannot spend the leased collateral UTxO as a regular input', async () => {
+  it('cannot spend the shared collateral UTxO as a regular input, in either mode', async () => {
     await fundPool();
     const control = controlUtxo(txHash(300));
+    const fund = fundUtxo(txHash(301), 20_000_000n);
     service.provider.addUtxo(control);
+    service.provider.addUtxo(fund);
     const taken = await lease();
-    const transaction = await buildOwnerOperation(service, taken, control, {
-      customise: (builder) => builder.addInput({ utxo: leasedUtxo(taken.collateral) }).sendLovelace({ address: strangerAddress, amount: 5_000_000n }),
+    const onLease = await buildOwnerOperation(service, taken, control, {
+      customise: (builder) => builder.addInput({ utxo: sponsorUtxo(taken.collateral) }).sendLovelace({ address: strangerAddress, amount: 5_000_000n }),
     });
-
     expectViolation(
-      await witness(taken.leaseId, transaction),
+      await witness(taken.leaseId, onLease),
       'uses_leased_fee_input',
       new RegExp(`Input ${taken.collateral.txHash}#${taken.collateral.index} belongs to the sponsor but is not the leased fee UTxO`),
     );
+
+    const shared = await collateral();
+    expect(shared.txHash).toBe(taken.collateral.txHash);
+    const onCollateral = await buildAccountPaidOperation(service, shared, control, fund, {
+      customise: (builder) => builder.addInput({ utxo: sponsorUtxo(shared) }).sendLovelace({ address: strangerAddress, amount: 5_000_000n }),
+    });
+    expectViolation(await collateralWitness(onCollateral), 'no_sponsor_inputs', new RegExp(`Input ${shared.txHash}#${shared.index} belongs to the sponsor, which contributes collateral only`));
+    expect(witnessCount()).toBe(0);
+    expect(service.db.prepare('SELECT status FROM pool_utxos WHERE tx_hash = ?').get(shared.txHash)).toEqual({ status: 'free' });
+  });
+
+  it('cannot draw sponsor value through the collateral route, which contributes collateral and nothing else', async () => {
+    await fundPool();
+    const control = controlUtxo(txHash(300));
+    const fund = fundUtxo(txHash(301), 20_000_000n);
+    service.provider.addUtxo(control);
+    service.provider.addUtxo(fund);
+    const shared = await collateral();
+    const fee: UTxO = { input: { txId: txHash(100), index: 0 }, output: { address: shared.sponsorAddress, value: { coins: 100_000_000n } } };
+
+    const spendingFee = await buildAccountPaidOperation(service, shared, control, fund, {
+      customise: (builder) => builder.addInput({ utxo: fee }).sendLovelace({ address: strangerAddress, amount: 97_000_000n }),
+    });
+    expectViolation(await collateralWitness(spendingFee), 'no_sponsor_inputs', new RegExp(`Input ${txHash(100)}#0 belongs to the sponsor, which contributes collateral only`));
+
+    const paidBack = await buildAccountPaidOperation(service, shared, control, fund, {
+      customise: (builder) => builder.sendLovelace({ address: shared.sponsorAddress, amount: 3_000_000n }),
+    });
+    expectViolation(await collateralWitness(paidBack), 'sponsor_outflow_zero', /An output pays 3000000 lovelace to the sponsor, which contributes collateral only/);
+    expect(witnessCount()).toBe(0);
+  });
+
+  it('cannot put the shared collateral at risk with a budget below what the scripts need, or with a transaction declared failing', async () => {
+    await fundPool();
+    const control = controlUtxo(txHash(300));
+    const fund = fundUtxo(txHash(301), 20_000_000n);
+    service.provider.addUtxo(control);
+    service.provider.addUtxo(fund);
+    const shared = await collateral();
+
+    const underDeclared = await buildAccountPaidOperation(service, shared, control, fund, { evaluator: underDeclaringEvaluator });
+    expectViolation(await collateralWitness(underDeclared), 'evaluates', /declares 1 memory and 1 steps but needs/);
+
+    const failing = withTotalCollateral(await buildAccountPaidOperation(service, shared, control, fund), 5_000_001n);
+    expectViolation(await collateralWitness(failing), 'uses_shared_collateral', /Total collateral 5000001 exceeds the 5000000 lovelace/);
+    expect(witnessCount()).toBe(0);
   });
 
   it('cannot mint under a policy that merely resembles the account policy', async () => {
@@ -287,6 +346,25 @@ describe('a client griefing the pool', () => {
     await service.sync.run();
 
     expect(await feeCounts()).toEqual({ free: 1, leased: 0 });
+  });
+
+  it('cannot keep a collateral witness alive past the validity window', async () => {
+    await fundPool();
+    const control = controlUtxo(txHash(300));
+    const fund = fundUtxo(txHash(301), 20_000_000n);
+    service.provider.addUtxo(control);
+    service.provider.addUtxo(fund);
+    const shared = await collateral();
+    const transaction = await buildAccountPaidOperation(service, shared, control, fund);
+
+    for (const slot of [48_384_601n, 10_000_000_000_000n, 2n ** 64n - 1n]) {
+      expectViolation(await collateralWitness(withValidityUpperBound(transaction, slot)), 'bounded_validity', /is later than slot 48384600 \(2024-01-01T00:10:00.000Z\), now plus 600 seconds/);
+    }
+
+    expect(witnessCount()).toBe(0);
+    expect((await collateralWitness(transaction)).status).toBe(200);
+    const stored = service.db.prepare('SELECT invalid_hereafter, lease_id FROM witnesses').get() as { invalid_hereafter: number; lease_id: null };
+    expect(stored).toEqual({ invalid_hereafter: 48_384_540, lease_id: null });
   });
 
   it('cannot freeze a fee UTxO for good with a validity upper bound no time can express', async () => {
