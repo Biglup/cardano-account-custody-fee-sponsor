@@ -40,6 +40,7 @@ import {
   withExtraOutput,
   withInfoProposal,
   withTotalCollateral,
+  withValidityUpperBound,
 } from '../support/transaction.js';
 
 let service: TestService;
@@ -77,6 +78,15 @@ const lease = async (): Promise<LeaseBody> => {
 /** Asks for the witness of a transaction on a lease. */
 const witness = (leaseId: string, transaction: unknown, key: string = apiKey): request.Test =>
   request(service.app).post(`/v1/leases/${leaseId}/witness`).set(bearer(key)).send({ transaction });
+
+/** The last audit row written about a witness request: its outcome and its parsed detail. */
+const lastWitnessAudit = (): { outcome: string; detail: Record<string, unknown> } => {
+  const row = service.db.prepare("SELECT outcome, detail FROM audit WHERE action = 'witness' ORDER BY id DESC LIMIT 1").get() as {
+    outcome: string;
+    detail: string;
+  };
+  return { outcome: row.outcome, detail: JSON.parse(row.detail) as Record<string, unknown> };
+};
 
 /** Puts the account's control UTxO on the fake chain. */
 const placeControl = (): UTxO => {
@@ -192,6 +202,10 @@ describe('POST /v1/leases/:id/witness', () => {
 
     expect(response.status).toBe(409);
     expect(response.body).toEqual({ error: 'lease_consumed', detail: `Lease ${taken.leaseId} already issued a witness` });
+    expect(lastWitnessAudit()).toEqual({
+      outcome: 'lease_consumed',
+      detail: { leaseId: taken.leaseId, txHash: expect.stringMatching(/^[0-9a-f]{64}$/), reason: `Lease ${taken.leaseId} already issued a witness` },
+    });
   });
 
   it('answers 404 unknown_lease for a lease another key holds, or that does not exist', async () => {
@@ -207,6 +221,7 @@ describe('POST /v1/leases/:id/witness', () => {
     const missing = await witness('missing', transaction);
     expect(missing.status).toBe(404);
     expect(missing.body.error).toBe('unknown_lease');
+    expect(lastWitnessAudit()).toEqual({ outcome: 'unknown_lease', detail: { leaseId: 'missing', txHash: null, reason: 'No lease missing exists' } });
   });
 
   it('answers 410 lease_expired once the lease has run out, and for a released lease', async () => {
@@ -218,12 +233,20 @@ describe('POST /v1/leases/:id/witness', () => {
     const response = await witness(expired.leaseId, transaction);
     expect(response.status).toBe(410);
     expect(response.body).toEqual({ error: 'lease_expired', detail: `Lease ${expired.leaseId} has expired` });
+    expect(lastWitnessAudit()).toEqual({
+      outcome: 'lease_expired',
+      detail: { leaseId: expired.leaseId, txHash: null, reason: `Lease ${expired.leaseId} has expired` },
+    });
 
     const released = await lease();
     await request(service.app).delete(`/v1/leases/${released.leaseId}`).set(bearer());
     const afterRelease = await witness(released.leaseId, await buildCreation(service, released));
     expect(afterRelease.status).toBe(410);
     expect(afterRelease.body).toEqual({ error: 'lease_expired', detail: `Lease ${released.leaseId} was released` });
+    expect(lastWitnessAudit()).toEqual({
+      outcome: 'lease_released',
+      detail: { leaseId: released.leaseId, txHash: null, reason: `Lease ${released.leaseId} was released` },
+    });
   });
 
   it('answers 400 invalid_request when the body carries no transaction', async () => {
@@ -434,6 +457,83 @@ describe('transaction policy', () => {
     expect(Cometa.inspectTx(transaction).is_valid).toBe(false);
 
     expectViolation(await witness(taken.leaseId, transaction), 'uses_leased_collateral', /flagged as failing phase two/);
+  });
+
+  it('bounded_validity: refuses a transaction without a validity upper bound, or one past the lease expiry plus the margin', async () => {
+    await fundPool();
+    const taken = await lease();
+
+    const unbounded = await buildCreation(service, taken, { validUntil: null });
+    expectViolation(await witness(taken.leaseId, unbounded), 'bounded_validity', /carries no validity upper bound/);
+
+    const late = await buildCreation(service, taken, { validUntil: new Date('2024-01-01T00:12:01.000Z') });
+    expectViolation(
+      await witness(taken.leaseId, late),
+      'bounded_validity',
+      /The validity upper bound at slot 48384721 is later than slot 48384720 \(2024-01-01T00:12:00.000Z\), the lease expiry plus 120 seconds/,
+    );
+  });
+
+  it('bounded_validity: refuses a bound past the range a time can express, and the largest a body can carry', async () => {
+    await fundPool();
+    const taken = await lease();
+    const transaction = await buildCreation(service, taken);
+
+    const beyondTime = withValidityUpperBound(transaction, 10_000_000_000_000n);
+    expectViolation(await witness(taken.leaseId, beyondTime), 'bounded_validity', /at slot 10000000000000 is later than slot 48384720/);
+
+    const largest = withValidityUpperBound(transaction, 2n ** 64n - 1n);
+    expectViolation(await witness(taken.leaseId, largest), 'bounded_validity', /at slot 18446744073709551615 is later than slot 48384720/);
+    expect((service.db.prepare('SELECT COUNT(*) AS count FROM witnesses').get() as { count: number }).count).toBe(0);
+  });
+
+  it('bounded_validity: refuses a bound at or before the current slot', async () => {
+    await fundPool();
+    const taken = await lease();
+
+    const current = await buildCreation(service, taken, { validUntil: service.clock.now });
+    expectViolation(
+      await witness(taken.leaseId, current),
+      'bounded_validity',
+      /The validity upper bound at slot 48384000 \(2024-01-01T00:00:00.000Z\) is not later than the current slot 48384000/,
+    );
+
+    const past = await buildCreation(service, taken, { validUntil: new Date('2023-12-31T23:59:59.000Z') });
+    expectViolation(await witness(taken.leaseId, past), 'bounded_validity', /at slot 48383999 \(2023-12-31T23:59:59.000Z\) is not later than the current slot 48384000/);
+
+    const next = await buildCreation(service, taken, { validUntil: new Date('2024-01-01T00:00:01.000Z') });
+    expect((await witness(taken.leaseId, next)).status).toBe(200);
+  });
+
+  it('bounded_validity: accepts a bound within the margin and records its slot with the witness', async () => {
+    await fundPool();
+    const taken = await lease();
+    const transaction = await buildCreation(service, taken, { validUntil: new Date('2024-01-01T00:12:00.000Z') });
+
+    const response = await witness(taken.leaseId, transaction);
+
+    expect(response.status).toBe(200);
+    const row = service.db.prepare('SELECT invalid_hereafter FROM witnesses WHERE lease_id = ?').get(taken.leaseId) as { invalid_hereafter: number };
+    expect(row.invalid_hereafter).toBe(48_384_720);
+  });
+
+  it('frees a witnessed fee UTxO once its validity bound has passed by the restore margin and the chain still lists it', async () => {
+    await fundPool();
+    const taken = await lease();
+    await witness(taken.leaseId, await buildCreation(service, taken));
+    await service.sync.run();
+    expect((await request(service.app).get('/health')).body.pool.fee).toEqual({ free: 0, leased: 0 });
+
+    service.clock.now = new Date('2024-01-01T00:12:00.000Z');
+    await service.sync.run();
+    expect((await request(service.app).get('/health')).body.pool.fee).toEqual({ free: 0, leased: 0 });
+
+    service.clock.now = new Date('2024-01-01T00:12:01.000Z');
+    await service.sync.run();
+
+    expect((await request(service.app).get('/health')).body.pool.fee).toEqual({ free: 1, leased: 0 });
+    const next = await lease();
+    expect(next.fee.txHash).toBe(taken.fee.txHash);
   });
 
   it('account_transaction: refuses a script transaction that neither spends a control UTxO nor creates an account', async () => {

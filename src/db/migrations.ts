@@ -12,9 +12,11 @@ interface Migration {
  * and an audit trail of every decision the service makes.
  *
  * A witness keeps the witness set it issued so that the same transaction
- * presented again receives the same one. A witness set holds public keys
- * and signatures only; the transaction itself is never stored, only its
- * hash.
+ * presented again receives the same one, and the slot the transaction
+ * stops being valid at, so that the fee UTxO it spends can return to the
+ * pool once the chain can no longer accept it. A witness set holds public
+ * keys and signatures only; the transaction itself is never stored, only
+ * its hash.
  *
  * A pool UTxO is identified by its transaction hash and output index.
  * A lease records which fee and collateral UTxO it holds as
@@ -62,6 +64,7 @@ CREATE TABLE witnesses (
   tx_hash TEXT NOT NULL,
   sponsored_lovelace INTEGER NOT NULL,
   witness_set TEXT NOT NULL,
+  invalid_hereafter INTEGER NOT NULL,
   issued_at TEXT NOT NULL
 );
 

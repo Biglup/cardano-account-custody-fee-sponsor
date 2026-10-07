@@ -119,8 +119,11 @@ export class RateLimitedError extends ServiceError {
 
 /** The caller's API key reached one of its quotas; the detail names the quota first. */
 export class QuotaExceededError extends ServiceError {
+  readonly quota: string;
+
   constructor(quota: string, detail: string) {
     super(429, 'quota_exceeded', `${quota}: ${detail}`);
+    this.quota = quota;
   }
 }
 

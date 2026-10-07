@@ -69,6 +69,72 @@ describe('GET /admin/pool', () => {
   });
 });
 
+describe('GET /admin/audit', () => {
+  it('lists the audit trail from a point in time, oldest first, with the key and the parsed detail', async () => {
+    service.fund(txHash(1), 0, 100_000_000n);
+    service.fund(txHash(2), 0, 5_000_000n);
+    await service.sync.run();
+    const { apiKey, record } = service.issueKey();
+    const lease = await request(service.app).post('/v1/leases').set('Authorization', `Bearer ${apiKey}`);
+    await request(service.app).delete(`/v1/leases/${lease.body.leaseId}`).set('Authorization', `Bearer ${apiKey}`);
+    service.db.prepare("UPDATE audit SET ts = '2024-01-01T00:00:00.000Z' WHERE outcome = 'created'").run();
+    service.db.prepare("UPDATE audit SET ts = '2024-01-01T00:05:00.000Z' WHERE outcome = 'released'").run();
+
+    const everything = await request(service.app).get('/admin/audit').set(admin);
+    const later = await request(service.app).get('/admin/audit').query({ since: '2024-01-01T00:05:00.000Z' }).set(admin);
+    const one = await request(service.app).get('/admin/audit').query({ limit: 1 }).set(admin);
+
+    expect(everything.status).toBe(200);
+    expect(everything.body.entries).toEqual([
+      {
+        id: 1,
+        ts: '2024-01-01T00:00:00.000Z',
+        apiKeyId: record.id,
+        action: 'lease',
+        outcome: 'created',
+        detail: { leaseId: lease.body.leaseId, feeUtxo: `${txHash(1)}#0`, collateralUtxo: `${txHash(2)}#0`, expiresAt: '2024-01-01T00:10:00.000Z' },
+      },
+      { id: 2, ts: '2024-01-01T00:05:00.000Z', apiKeyId: record.id, action: 'lease', outcome: 'released', detail: { leaseId: lease.body.leaseId } },
+    ]);
+    expect(later.body.entries.map((entry: { outcome: string }) => entry.outcome)).toEqual(['released']);
+    expect(one.body.entries.map((entry: { outcome: string }) => entry.outcome)).toEqual(['created']);
+  });
+
+  it('reads since with an offset or without a fraction as the same instant the trail stores', async () => {
+    service.fund(txHash(1), 0, 100_000_000n);
+    service.fund(txHash(2), 0, 5_000_000n);
+    await service.sync.run();
+    const { apiKey } = service.issueKey();
+    const lease = await request(service.app).post('/v1/leases').set('Authorization', `Bearer ${apiKey}`);
+    await request(service.app).delete(`/v1/leases/${lease.body.leaseId}`).set('Authorization', `Bearer ${apiKey}`);
+    service.db.prepare("UPDATE audit SET ts = '2024-01-01T00:00:00.000Z' WHERE outcome = 'created'").run();
+    service.db.prepare("UPDATE audit SET ts = '2024-01-01T00:05:00.000Z' WHERE outcome = 'released'").run();
+    const outcomes = async (since: string): Promise<string[]> => {
+      const response = await request(service.app).get('/admin/audit').query({ since }).set(admin);
+      expect(response.status).toBe(200);
+      return response.body.entries.map((entry: { outcome: string }) => entry.outcome);
+    };
+
+    expect(await outcomes('2024-01-01T01:05:00.000+01:00')).toEqual(['released']);
+    expect(await outcomes('2024-01-01T00:05:00Z')).toEqual(['released']);
+    expect(await outcomes('2023-12-31T19:00:00-05:00')).toEqual(['created', 'released']);
+    expect(await outcomes('2024-01-01T00:05:01Z')).toEqual([]);
+  });
+
+  it('refuses a since that is not a timestamp, a limit over the page size and an unknown parameter', async () => {
+    const since = await request(service.app).get('/admin/audit').query({ since: 'yesterday' }).set(admin);
+    expect(since.status).toBe(400);
+    expect(since.body.error).toBe('invalid_request');
+    expect(since.body.detail).toContain('since');
+
+    const limit = await request(service.app).get('/admin/audit').query({ limit: 1001 }).set(admin);
+    expect(limit.status).toBe(400);
+
+    const unknown = await request(service.app).get('/admin/audit').query({ key: 1 }).set(admin);
+    expect(unknown.status).toBe(400);
+  });
+});
+
 describe('POST /admin/pool/replenish', () => {
   it('splits the reserve and reports the transaction and counts', async () => {
     service.fund(txHash(3), 0, 400_000_000n);

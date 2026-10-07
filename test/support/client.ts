@@ -18,9 +18,11 @@ import type { TestService } from './service.js';
 /** A step a test applies to a builder before it builds, to bend an otherwise valid transaction. */
 export type Customise = (builder: TransactionBuilder) => void;
 
-/** How a client builds on a lease: optionally with an evaluator of its own instead of the fake chain's. */
+/** How a client builds on a lease: optionally with an evaluator of its own instead of the fake chain's, and a validity bound of its own. */
 export interface ClientOptions {
   evaluator?: TxEvaluator;
+  /** When the transaction stops being valid; the lease expiry unless said otherwise, and never set when null. */
+  validUntil?: Date | null;
   customise?: Customise;
 }
 
@@ -51,15 +53,19 @@ export const underDeclaringEvaluator: TxEvaluator = {
 /**
  * A builder set up the way a client of the service sets one up: the
  * leased fee UTxO is the only spendable UTxO, the leased collateral UTxO
- * the only collateral, and both change outputs go to the sponsor.
+ * the only collateral, both change outputs go to the sponsor, and the
+ * transaction expires with the lease.
  */
-export const clientBuilder = (service: TestService, lease: LeaseBody, options: ClientOptions = {}): TransactionBuilder =>
-  Cometa.TransactionBuilder.create({ params: PROTOCOL_PARAMETERS, slotConfig: Cometa.CARDANO_PREPROD_SLOT_CONFIG })
+export const clientBuilder = (service: TestService, lease: LeaseBody, options: ClientOptions = {}): TransactionBuilder => {
+  const builder = Cometa.TransactionBuilder.create({ params: PROTOCOL_PARAMETERS, slotConfig: Cometa.CARDANO_PREPROD_SLOT_CONFIG })
     .setTxEvaluator(options.evaluator ?? { getName: () => 'Fake chain', evaluate: (tx) => service.provider.evaluateTransaction(tx) })
     .setUtxos([leasedUtxo(lease.fee)])
     .setCollateralUtxos([leasedUtxo(lease.collateral)])
     .setChangeAddress(lease.sponsorAddress)
     .setCollateralChangeAddress(lease.sponsorAddress);
+  const validUntil = options.validUntil === undefined ? new Date(lease.expiresAt) : options.validUntil;
+  return validUntil === null ? builder : builder.expiresAfter(validUntil);
+};
 
 /** The inline datum of a control output carrying the initial state. */
 const stateDatum = { type: Cometa.DatumType.InlineData, inlineDatum: initialState } as const;

@@ -75,12 +75,13 @@ describe('applyMigrations', () => {
     ).not.toThrow();
   });
 
-  it('keeps the witness set with the witness so it can be issued again', () => {
+  it('keeps the witness set and the validity bound with the witness, so it can be issued again and its fee UTxO freed once it lapses', () => {
     applyMigrations(db);
 
     const columns = (db.prepare('PRAGMA table_info(witnesses)').all() as { name: string }[]).map((column) => column.name);
 
     expect(columns).toContain('witness_set');
+    expect(columns).toContain('invalid_hereafter');
   });
 
   it('is idempotent', () => {

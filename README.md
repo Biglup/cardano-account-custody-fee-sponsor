@@ -21,15 +21,38 @@ the sponsor address, classifies every UTxO it finds by lovelace (fee sized,
 collateral sized, or reserve) and keeps the pool in step with the chain
 every 30 seconds.
 
+The service reads the chain's current slot off its own clock, so keep the
+clock disciplined with NTP; a clock ahead of the chain shortens the time a
+witnessed fee UTxO is held back, and the restore margin described under
+the transaction policy is what absorbs the usual drift.
+
+The database schema is defined in the initial migration and created on
+first start at `DATABASE_PATH`. A database created by an earlier
+development build is not migrated and must be deleted before starting.
+
 Optional tunables, all with defaults: `LEASE_TTL_SECONDS`,
 `MAX_SPONSORED_LOVELACE`, `MAX_FEE_LOVELACE`, `COLLATERAL_SHARING`,
-`FEE_UTXO_LOVELACE`, `COLLATERAL_UTXO_LOVELACE`, `FEE_UTXO_COUNT` and
-`COLLATERAL_UTXO_COUNT`.
+`FEE_UTXO_LOVELACE`, `COLLATERAL_UTXO_LOVELACE`, `FEE_UTXO_COUNT`,
+`COLLATERAL_UTXO_COUNT`, `VALIDITY_MARGIN_SECONDS`,
+`IP_RATE_LIMIT_PER_MINUTE`, `KEY_RATE_LIMIT_PER_MINUTE` and
+`TRUST_PROXY_HOPS`.
+
+The threat model, what the sponsor can lose and how to run the service
+safely are in [docs/security.md](docs/security.md).
 
 ## API
 
 Every route except `/health` takes `Authorization: Bearer <key>`. Client
 keys are issued by the admin routes, which take the `ADMIN_API_KEY`.
+Every request counts against its address's `IP_RATE_LIMIT_PER_MINUTE`,
+and every client route against the key's `KEY_RATE_LIMIT_PER_MINUTE`;
+past either the answer is 429 `rate_limited`, with `RateLimit` headers
+saying when the window resets. Behind a reverse proxy, set
+`TRUST_PROXY_HOPS` to the number of proxies so the address limited is
+the client's and not the proxy's. With it unset, a request that carries
+an `X-Forwarded-For` header makes the rate limiter print a one time
+warning to stderr about the untrusted header; the request is limited by
+its own address and the warning is harmless.
 
 - `POST /v1/leases` reserves one fee UTxO and one collateral UTxO for the
   lease TTL and answers 201 with the lease id, the expiry, both UTxOs, the
@@ -58,11 +81,14 @@ keys are issued by the admin routes, which take the `ADMIN_API_KEY`.
   already obtained its hourly witnesses or when what its witnesses
   sponsored over the last day, plus this transaction, would pass its daily
   sponsored lovelace; the lease stays open after either.
-
 - `POST /admin/keys` with `{ label, quotas? }` issues a client key, shown
   once and stored as its SHA-256 hash. Quotas: `openLeases`,
   `witnessesPerHour`, `sponsoredLovelacePerDay`.
 - `GET /admin/pool` shows the pool counts, the reserve and every live UTxO.
+- `GET /admin/audit?since=<ISO 8601>&limit=<n>` lists the audit trail from
+  `since` (the beginning without it), oldest first, at most `limit`
+  entries (100 without it, 1000 at most), each with its id, time, key id,
+  action, outcome and detail.
 - `POST /admin/pool/replenish` with optional `feeUtxoLovelace`,
   `feeUtxoCount`, `collateralLovelace` and `collateralCount` splits the
   reserve into pool UTxOs with a self transaction from the sponsor wallet,
@@ -87,47 +113,67 @@ this order; the first failure is the one reported.
 3. `uses_leased_collateral`: the collateral is exactly the leased collateral
    UTxO, the collateral return pays the sponsor address and carries neither
    a datum nor a reference script, and total collateral is set and within
-   what the UTxO holds.
-4. `account_transaction`: an input is an account control UTxO (at an address
+   what the UTxO holds. A transaction flagged `is_valid = false`, which
+   declares its scripts fail and hands the collateral to the ledger, is
+   refused under this rule.
+4. `bounded_validity`: the body sets a validity upper bound
+   (`invalid_hereafter`) whose slot is later than the slot of the service's
+   current time and no later than the slot of the lease expiry plus
+   `VALIDITY_MARGIN_SECONDS`, so that a witnessed transaction that is never
+   submitted cannot keep its fee UTxO out of the pool for longer than that.
+   Slots are compared as numbers, whatever their size, and the expiry slot
+   is read as one second per slot from the network's Shelley start, which
+   is what every network has had since. A bound already in the past is
+   refused too, since no node would accept the transaction.
+5. `account_transaction`: an input is an account control UTxO (at an address
    paying to `ACCOUNT_SCRIPT_HASH`, holding a token of that policy), or the
    transaction creates an account: it mints exactly one token under the
    policy, registers exactly one script stake credential with its deposit,
    names the token after that credential and locks it in one output at an
    account address staked to that credential.
-5. `sponsor_outflow_bounded`: the fee is at most `MAX_FEE_LOVELACE`; every
+6. `sponsor_outflow_bounded`: the fee is at most `MAX_FEE_LOVELACE`; every
    output back to the sponsor is plain lovelace with neither a datum nor a
    reference script; what the fee input is drawn down by, after the change
    back to the sponsor, is exactly the fee plus, at creation only, the
    registration deposit and the control output's lovelace, and at most
    `MAX_SPONSORED_LOVELACE`.
-6. `no_sponsor_value_elsewhere`: every output away from the sponsor and the
+7. `no_sponsor_value_elsewhere`: every output away from the sponsor and the
    account is covered by the non sponsor inputs and withdrawals.
-7. `no_foreign_scripts`: every script input, mint policy, script credential
+8. `no_foreign_scripts`: every script input, mint policy, script credential
    of a certificate, withdrawal or vote, and attached script is the account
    script or the account's stake script: the stake script of a control UTxO
    the transaction spends, or at creation the one it registers. Outputs
    never widen this set.
-8. `evaluates`: the provider resolves the inputs in one lookup and every
+9. `evaluates`: the provider resolves the inputs in one lookup and every
    one of them exists, the provider evaluates the transaction with the
    leased UTxOs supplied, and every redeemer declares at least the memory
    and steps the evaluation found it needs, so that a witnessed
    transaction can only fail in phase one, which spends no collateral.
-9. `signers`: neither sponsor key is a required signer, and no withdrawal,
-   certificate of any kind (stake, DRep, committee, pool operator, owner or
-   reward account) or vote names a sponsor credential, so the sponsor's
-   signature authorises nothing but paying.
+10. `signers`: neither sponsor key is a required signer, and no withdrawal,
+    certificate of any kind (stake, DRep, committee, pool operator, owner or
+    reward account) or vote names a sponsor credential, so the sponsor's
+    signature authorises nothing but paying.
 
 Every decision is recorded in the audit table with the lease, the
-transaction hash and the rule outcome; the transaction body is never stored.
-A fee UTxO whose spend was witnessed is marked consumed at once and is never
-leased again, since the signature is out there; the collateral UTxO stays
-leasable because the policy never witnesses a transaction that could spend it.
+transaction hash and the rule outcome, as is every refusal for a lease
+that is unknown, expired, released or consumed, every key refused under a
+quota, and every lease taken, released, expired or closed by the pool
+sync; the transaction body is never stored. A fee UTxO whose spend was
+witnessed is marked consumed at once, since the signature is out there,
+and is leased again only once the chain still lists it more than 120
+slots after the validity upper bound of every witness issued on it, which
+the pool sync checks on every run; the margin covers a clock a little
+ahead of the chain and a block the provider has not shown yet. The
+collateral UTxO stays leasable because the policy never witnesses a
+transaction that could spend it.
 
 A key's quotas are measured against the witnesses it was issued: the hourly
 witness quota is checked before the policy runs, and the daily sponsored
 lovelace quota against what the transaction would sponsor, once the policy
-has established it. A witness set answered again for the same transaction
-counts once.
+has established it. Both are checked once more in the step that consumes
+the lease, so that requests in flight at the same time cannot pass them
+together. A witness set answered again for the same transaction counts
+once.
 
 ## Commands
 

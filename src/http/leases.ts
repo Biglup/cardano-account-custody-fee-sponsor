@@ -1,5 +1,5 @@
 import type Database from 'better-sqlite3';
-import { Router } from 'express';
+import { type RequestHandler, Router } from 'express';
 import { z } from 'zod';
 import type { Lease, LeaseService } from '../pool/leases.js';
 import type { PoolUtxo } from '../pool/utxo.js';
@@ -53,20 +53,23 @@ export const toLeaseBody = (lease: Lease, settings: LeaseRouteSettings): LeaseBo
 });
 
 /**
- * The lease routes under `/v1/leases`: every one requires an API key.
- * Creating a lease reserves a fee and a collateral UTxO for the key;
- * deleting one releases it early so its UTxOs return to the pool; posting
- * a transaction to a lease's witness route has it checked against the
- * policy and, when it passes, signed by the sponsor.
+ * The lease routes under `/v1/leases`: every one requires an API key and
+ * counts against that key's rate limit. Creating a lease reserves a fee
+ * and a collateral UTxO for the key; deleting one releases it early so
+ * its UTxOs return to the pool; posting a transaction to a lease's
+ * witness route has it checked against the policy and, when it passes,
+ * signed by the sponsor.
  */
 export const createLeaseRouter = (
   db: Database.Database,
   leases: LeaseService,
   witness: WitnessService,
   settings: LeaseRouteSettings,
+  keyRateLimit: RequestHandler,
 ): Router => {
   const router = Router();
   router.use(requireApiKey(db));
+  router.use(keyRateLimit);
 
   router.post(
     '/',

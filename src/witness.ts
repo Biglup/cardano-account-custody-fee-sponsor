@@ -4,7 +4,15 @@ import type { Logger } from 'pino';
 import { recordAudit } from './audit.js';
 import { Cometa } from './cometa.js';
 import type { Config } from './config.js';
-import { InvalidTransactionError, LeaseConsumedError, LeaseExpiredError, LeaseReleasedError, QuotaExceededError } from './http/errors.js';
+import {
+  InvalidTransactionError,
+  LeaseConsumedError,
+  LeaseExpiredError,
+  LeaseReleasedError,
+  QuotaExceededError,
+  type ServiceError,
+  UnknownLeaseError,
+} from './http/errors.js';
 import type { ApiKey } from './keys.js';
 import { parseTransaction, resolveInputs } from './policy/parse.js';
 import { type PolicyContext, type Violation, applyPolicy } from './policy/rules.js';
@@ -25,9 +33,9 @@ export interface WitnessService {
 }
 
 /** The tunables the policy depends on. */
-export type WitnessSettings = Pick<Config, 'accountScriptHash' | 'maxSponsoredLovelace' | 'maxFeeLovelace'>;
+export type WitnessSettings = Pick<Config, 'accountScriptHash' | 'maxSponsoredLovelace' | 'maxFeeLovelace' | 'validityMarginSeconds' | 'slots'>;
 
-/** Everything the witness service needs injected; `now` lets tests move the clock the quotas are measured against. */
+/** Everything the witness service needs injected; `now` lets tests move the clock the validity bounds are measured against. */
 export interface WitnessServiceDependencies {
   db: Database.Database;
   provider: Provider;
@@ -37,10 +45,6 @@ export interface WitnessServiceDependencies {
   now?: () => Date;
   logger?: Logger;
 }
-
-/** The windows the witness quotas are measured over. */
-const HOUR_MS = 60 * 60 * 1000;
-const DAY_MS = 24 * HOUR_MS;
 
 /** The CBOR map key of the verification key witnesses within a transaction witness set. */
 const VKEY_WITNESSES_KEY = 0;
@@ -68,13 +72,17 @@ const encodeVkeyWitnessSet = (witnesses: VkeyWitnessSet): string => {
  * Creates the witness service. A request walks the lease state machine
  * first: an unknown lease is refused, an expired or released one too,
  * and a consumed one answers with the witness set it already issued when
- * the transaction is the same, or refuses a different one. An open lease
+ * the transaction is the same, or refuses a different one; each of these
+ * refusals is written to the audit trail under the lease's state. An open lease
  * has its transaction parsed, the key's hourly witness quota checked, its
  * inputs resolved through the provider and the policy applied in rule
  * order; only a transaction that passes every rule, and whose sponsored
  * lovelace fits in what the key's daily quota still allows, is signed.
  * Both quotas count witnesses actually issued, so a witness set answered
- * again for the same transaction counts once. The wallet signs with every
+ * again for the same transaction counts once; the lease service measures
+ * them, here ahead of the provider calls so a key over quota costs
+ * nothing, and again in the step that consumes the lease, where the
+ * bound is final. The wallet signs with every
  * key of its own the transaction asks for, so the witness set it returns
  * is checked to be the sponsor payment key's signature and nothing else
  * before it leaves; anything more is refused as if the policy had caught
@@ -94,27 +102,26 @@ export const createWitnessService = ({
   logger,
 }: WitnessServiceDependencies): WitnessService => {
   const knowsUtxo = db.prepare('SELECT 1 FROM pool_utxos WHERE tx_hash = ? AND tx_index = ?');
-  const countRecentWitnesses = db.prepare(
-    'SELECT COUNT(*) AS count FROM witnesses w JOIN leases l ON l.id = w.lease_id WHERE l.api_key_id = ? AND w.issued_at > ?',
-  );
-  const sumRecentSponsored = db.prepare(
-    'SELECT COALESCE(SUM(w.sponsored_lovelace), 0) AS total FROM witnesses w JOIN leases l ON l.id = w.lease_id WHERE l.api_key_id = ? AND w.issued_at > ?',
-  );
 
-  /** The start of the window of `length` milliseconds ending now, as the witness table stores times. */
-  const windowStart = (length: number): string => new Date(now().getTime() - length).toISOString();
-
+  /** What the policy knows when it checks a transaction against this lease, as of now. */
   const policyContext = (lease: Lease): PolicyContext => ({
     sponsor: { address: serviceWallet.address, paymentKeyHash: serviceWallet.paymentKeyHash, stakeKeyHash: serviceWallet.stakeKeyHash },
     accountScriptHash: settings.accountScriptHash,
-    lease: { fee: lease.fee, collateral: lease.collateral },
-    limits: { maxSponsoredLovelace: settings.maxSponsoredLovelace, maxFeeLovelace: settings.maxFeeLovelace },
+    lease: { fee: lease.fee, collateral: lease.collateral, expiresAt: lease.expiresAt },
+    limits: {
+      maxSponsoredLovelace: settings.maxSponsoredLovelace,
+      maxFeeLovelace: settings.maxFeeLovelace,
+      validityMarginSeconds: settings.validityMarginSeconds,
+    },
+    slots: settings.slots,
+    now: now(),
     isSponsorUtxo: (ref) => {
       const { txHash, index } = parseUtxoRef(ref);
       return knowsUtxo.get(txHash, index) !== undefined;
     },
   });
 
+  /** Refuses the transaction under a policy rule and records the refusal; the lease stays open for a later attempt. */
   const refuse = (apiKey: ApiKey, lease: Lease, txHash: string | undefined, violation: Violation): never => {
     recordAudit(db, {
       apiKeyId: apiKey.id,
@@ -125,58 +132,80 @@ export const createWitnessService = ({
     throw new InvalidTransactionError(violation.rule, violation.detail);
   };
 
-  /** Refuses the transaction under a quota and records the refusal; the lease stays open for a later attempt. */
-  const refuseQuota = (apiKey: ApiKey, lease: Lease, txHash: string, quota: string, detail: string): never => {
-    const error = new QuotaExceededError(quota, detail);
+  /** Records a refusal under a quota and rethrows it; the lease stays open for a later attempt. */
+  const refuseQuota = (apiKey: ApiKey, lease: Lease, txHash: string, error: QuotaExceededError): never => {
     recordAudit(db, {
       apiKeyId: apiKey.id,
       action: 'witness',
       outcome: error.code,
-      detail: { leaseId: lease.id, txHash, quota, reason: detail },
+      detail: { leaseId: lease.id, txHash, quota: error.quota, reason: error.detail },
     });
     throw error;
   };
 
-  /** The key may still obtain a witness this hour. */
-  const checkHourlyQuota = (apiKey: ApiKey, lease: Lease, txHash: string): void => {
-    const issued = (countRecentWitnesses.get(apiKey.id, windowStart(HOUR_MS)) as { count: number }).count;
-    if (issued >= apiKey.quotas.witnessesPerHour) {
-      refuseQuota(apiKey, lease, txHash, 'witnesses_per_hour', `at most ${apiKey.quotas.witnessesPerHour} witnesses per hour per key`);
+  /** The key may still obtain a witness, sponsoring `sponsoredLovelace` once the policy has established it. */
+  const checkQuotas = (apiKey: ApiKey, lease: Lease, txHash: string, sponsoredLovelace?: bigint): void => {
+    const shortfall = leases.witnessQuotaShortfall(apiKey, sponsoredLovelace === undefined ? undefined : Number(sponsoredLovelace));
+    if (shortfall !== undefined) {
+      refuseQuota(apiKey, lease, txHash, new QuotaExceededError(shortfall.quota, shortfall.detail));
     }
   };
 
-  /** What the key's witnesses sponsored today, plus this transaction, fits its daily quota. */
-  const checkDailyQuota = (apiKey: ApiKey, lease: Lease, txHash: string, sponsoredLovelace: bigint): void => {
-    const total = BigInt((sumRecentSponsored.get(apiKey.id, windowStart(DAY_MS)) as { total: number }).total);
-    if (total + sponsoredLovelace > BigInt(apiKey.quotas.sponsoredLovelacePerDay)) {
-      refuseQuota(
-        apiKey,
-        lease,
-        txHash,
-        'sponsored_lovelace_per_day',
-        `at most ${apiKey.quotas.sponsoredLovelacePerDay} sponsored lovelace per day per key`,
-      );
+  /** The audit outcome a refusal by the lease's state is recorded under: the state itself, or the lease being unknown. */
+  const leaseOutcome = (error: ServiceError): string => {
+    if (error instanceof LeaseReleasedError) {
+      return 'lease_released';
     }
+    if (error instanceof LeaseExpiredError) {
+      return 'lease_expired';
+    }
+    if (error instanceof LeaseConsumedError) {
+      return 'lease_consumed';
+    }
+    return error.code;
+  };
+
+  /** Records a refusal by the lease's state and rethrows it; nothing about the lease changes. */
+  const refuseLease = (apiKey: ApiKey, leaseId: string, txHash: string | undefined, error: ServiceError): never => {
+    recordAudit(db, {
+      apiKeyId: apiKey.id,
+      action: 'witness',
+      outcome: leaseOutcome(error),
+      detail: { leaseId, txHash: txHash ?? null, reason: error.detail ?? error.code },
+    });
+    throw error;
   };
 
   /** The witness set a consumed lease already issued for this very transaction, or the refusal of a different one. */
   const reissue = (apiKey: ApiKey, leaseId: string, txHash: string): IssuedWitness => {
     const issued = leases.witnessOf(leaseId);
     if (issued === undefined || issued.txHash !== txHash) {
-      throw new LeaseConsumedError(leaseId);
+      return refuseLease(apiKey, leaseId, txHash, new LeaseConsumedError(leaseId));
     }
     recordAudit(db, { apiKeyId: apiKey.id, action: 'witness', outcome: 'reissued', detail: { leaseId, txHash } });
     return { leaseId, witnessSet: issued.witnessSet };
   };
 
+  /** The lease the key holds under the id, or the audited refusal of an id it does not. */
+  const findLease = (apiKey: ApiKey, leaseId: string): Lease => {
+    try {
+      return leases.find(apiKey, leaseId);
+    } catch (err) {
+      if (err instanceof UnknownLeaseError) {
+        return refuseLease(apiKey, leaseId, undefined, err);
+      }
+      throw err;
+    }
+  };
+
   const issue = async (apiKey: ApiKey, leaseId: string, transaction: string): Promise<IssuedWitness> => {
     leases.expireStale();
-    const lease = leases.find(apiKey, leaseId);
+    const lease = findLease(apiKey, leaseId);
     if (lease.status === 'expired') {
-      throw new LeaseExpiredError(leaseId);
+      return refuseLease(apiKey, leaseId, undefined, new LeaseExpiredError(leaseId));
     }
     if (lease.status === 'released') {
-      throw new LeaseReleasedError(leaseId);
+      return refuseLease(apiKey, leaseId, undefined, new LeaseReleasedError(leaseId));
     }
 
     const parsed = parseTransaction(transaction);
@@ -189,7 +218,7 @@ export const createWitnessService = ({
       return reissue(apiKey, leaseId, tx.hash);
     }
 
-    checkHourlyQuota(apiKey, lease, tx.hash);
+    checkQuotas(apiKey, lease, tx.hash);
     const resolved = await resolveInputs(provider, tx.inputs);
     if (resolved.violation !== undefined) {
       return refuse(apiKey, lease, tx.hash, resolved.violation);
@@ -198,7 +227,7 @@ export const createWitnessService = ({
     if (verdict.violation !== undefined) {
       return refuse(apiKey, lease, tx.hash, verdict.violation);
     }
-    checkDailyQuota(apiKey, lease, tx.hash, verdict.sponsoredLovelace);
+    checkQuotas(apiKey, lease, tx.hash, verdict.sponsoredLovelace);
 
     const witnesses = await serviceWallet.wallet.signTransaction(tx.cbor, true);
     const only = witnesses.length === 1 ? witnesses[0] : undefined;
@@ -210,11 +239,18 @@ export const createWitnessService = ({
     }
     const witnessSet = encodeVkeyWitnessSet(witnesses);
     const sponsoredLovelace = Number(verdict.sponsoredLovelace);
+    const invalidHereafter = Number(verdict.invalidHereafter);
     try {
-      leases.consume(lease, { txHash: tx.hash, sponsoredLovelace, witnessSet });
+      leases.consume(apiKey, lease, { txHash: tx.hash, sponsoredLovelace, witnessSet, invalidHereafter });
     } catch (err) {
       if (err instanceof LeaseConsumedError) {
         return reissue(apiKey, leaseId, tx.hash);
+      }
+      if (err instanceof LeaseExpiredError) {
+        return refuseLease(apiKey, leaseId, tx.hash, err);
+      }
+      if (err instanceof QuotaExceededError) {
+        return refuseQuota(apiKey, lease, tx.hash, err);
       }
       throw err;
     }

@@ -47,6 +47,9 @@ const staleLeases = (leases: LeaseService): LeaseService => ({
   find: (key, leaseId) => ({ ...leases.find(key, leaseId), status: 'open' }),
 });
 
+/** A lease service whose quota check ahead of the policy never fires, as a request that passed it before other requests consumed the quota sees. */
+const unguardedLeases = (leases: LeaseService): LeaseService => ({ ...leases, witnessQuotaShortfall: () => undefined });
+
 /** A witness service on the test service's components, with some of them replaced. */
 const witnessWith = (overrides: { wallet?: Wallet; leases?: LeaseService }): WitnessService =>
   createWitnessService({
@@ -55,6 +58,7 @@ const witnessWith = (overrides: { wallet?: Wallet; leases?: LeaseService }): Wit
     serviceWallet: { ...service.serviceWallet, wallet: overrides.wallet ?? service.serviceWallet.wallet },
     leases: overrides.leases ?? service.leases,
     settings: service.config,
+    now: () => service.clock.now,
   });
 
 const witnessCount = (): number => (service.db.prepare('SELECT COUNT(*) AS count FROM witnesses').get() as { count: number }).count;
@@ -93,6 +97,35 @@ describe('witness service', () => {
 
     expect(issued.leaseId).toBe(next.id);
     expect(witnessCount()).toBe(2);
+  });
+
+  it('holds both quotas in the step that consumes the lease when the check ahead of the policy let the request through', async () => {
+    service.fund(txHash(101), 0, 100_000_000n);
+    service.fund(txHash(102), 0, 100_000_000n);
+    await service.sync.run();
+    const witness = witnessWith({ leases: unguardedLeases(service.leases) });
+    const hourly: ApiKey = { ...apiKey, quotas: { ...apiKey.quotas, witnessesPerHour: 1 } };
+    await witness.issue(hourly, lease.id, await buildCreation(service, leaseBody));
+    const second = await service.leases.create(apiKey);
+    const secondBody = toLeaseBody(second, { sponsorAddress: service.serviceWallet.address, maxSponsoredLovelace: service.config.maxSponsoredLovelace });
+
+    const overHourly = await witness.issue(hourly, second.id, await buildCreation(service, secondBody)).catch((err: unknown) => err);
+
+    expect(overHourly).toBeInstanceOf(QuotaExceededError);
+    expect((overHourly as QuotaExceededError).toResponseBody()).toEqual({
+      error: 'quota_exceeded',
+      detail: 'witnesses_per_hour: at most 1 witnesses per hour per key',
+    });
+    expect(witnessCount()).toBe(1);
+    expect(lastOutcome()).toBe('quota_exceeded');
+    expect(service.leases.find(apiKey, second.id).status).toBe('open');
+
+    const today = BigInt((service.db.prepare('SELECT sponsored_lovelace FROM witnesses').get() as { sponsored_lovelace: number }).sponsored_lovelace);
+    const overDaily = await witness.issue(withDailyQuota(today), second.id, await buildCreation(service, secondBody)).catch((err: unknown) => err);
+
+    expect(overDaily).toBeInstanceOf(QuotaExceededError);
+    expect((overDaily as QuotaExceededError).quota).toBe('sponsored_lovelace_per_day');
+    expect(witnessCount()).toBe(1);
   });
 
   it('refuses a witness set holding anything but the sponsor payment key signature and returns nothing', async () => {

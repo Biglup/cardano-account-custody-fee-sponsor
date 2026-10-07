@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { type Network, SLOT_SETTINGS_BY_NETWORK, type SlotSettings } from './slots.js';
 
 /** A single BIP39 mnemonic word as the service accepts it: lowercase ASCII letters only. */
 const MNEMONIC_WORD = /^[a-z]+$/;
@@ -39,11 +40,15 @@ const envSchema = z.object({
   COLLATERAL_UTXO_LOVELACE: z.coerce.number().int().positive().default(5_000_000),
   FEE_UTXO_COUNT: z.coerce.number().int().positive().default(10),
   COLLATERAL_UTXO_COUNT: z.coerce.number().int().positive().default(2),
+  VALIDITY_MARGIN_SECONDS: z.coerce.number().int().min(0).default(120),
+  IP_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().positive().default(120),
+  KEY_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().positive().default(60),
+  TRUST_PROXY_HOPS: z.coerce.number().int().min(0).default(0),
 });
 
 /** The service configuration, derived once from the environment at startup. */
 export interface Config {
-  network: 'preprod';
+  network: Network;
   blockfrostProjectId: string;
   sponsorMnemonic: string[];
   accountScriptHash: string;
@@ -58,6 +63,16 @@ export interface Config {
   collateralUtxoLovelace: number;
   feeUtxoCount: number;
   collateralUtxoCount: number;
+  /** How the network's slots map to time, for the validity bound a witnessed transaction must carry. */
+  slots: SlotSettings;
+  /** How far past a lease's expiry a transaction's validity upper bound may reach. */
+  validityMarginSeconds: number;
+  /** How many requests one address may make per minute, whatever key it presents. */
+  ipRateLimitPerMinute: number;
+  /** How many requests one API key may make per minute. */
+  keyRateLimitPerMinute: number;
+  /** How many reverse proxies stand in front of the service, so the client address is read from the right forwarded hop. */
+  trustProxyHops: number;
 }
 
 /**
@@ -84,8 +99,9 @@ export const loadConfig = (env: Record<string, string | undefined> = process.env
     throw new ConfigError(issues);
   }
   const data = result.data;
+  const network: Network = 'preprod';
   return {
-    network: 'preprod',
+    network,
     blockfrostProjectId: data.BLOCKFROST_PREPROD_PROJECT_ID,
     sponsorMnemonic: data.SPONSOR_MNEMONIC,
     accountScriptHash: data.ACCOUNT_SCRIPT_HASH,
@@ -100,5 +116,10 @@ export const loadConfig = (env: Record<string, string | undefined> = process.env
     collateralUtxoLovelace: data.COLLATERAL_UTXO_LOVELACE,
     feeUtxoCount: data.FEE_UTXO_COUNT,
     collateralUtxoCount: data.COLLATERAL_UTXO_COUNT,
+    slots: SLOT_SETTINGS_BY_NETWORK[network],
+    validityMarginSeconds: data.VALIDITY_MARGIN_SECONDS,
+    ipRateLimitPerMinute: data.IP_RATE_LIMIT_PER_MINUTE,
+    keyRateLimitPerMinute: data.KEY_RATE_LIMIT_PER_MINUTE,
+    trustProxyHops: data.TRUST_PROXY_HOPS,
   };
 };

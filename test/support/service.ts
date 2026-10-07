@@ -64,7 +64,7 @@ export interface TestService {
   witness: WitnessService;
   replenish: ReplenishFn;
   app: Express;
-  /** The clock the lease service reads; move it to expire leases. */
+  /** The clock the lease service, the witness service and the pool sync read; move it to expire leases and to pass validity bounds. */
   clock: { now: Date };
   /** Issues an API key and returns both the secret and its record. */
   issueKey(label?: string, quotas?: QuotaOverrides): { apiKey: string; record: ApiKey };
@@ -81,7 +81,7 @@ export const createTestService = async (overrides: Record<string, string> = {}):
   const db = openDatabase(':memory:');
   applyMigrations(db);
   const clock = { now: new Date('2024-01-01T00:00:00.000Z') };
-  const sync = createPoolSync({ db, provider, sponsorAddress: serviceWallet.address, sizes: config });
+  const sync = createPoolSync({ db, provider, sponsorAddress: serviceWallet.address, sizes: config, slots: config.slots, now: () => clock.now });
   const leases = createLeaseService({ db, sync, settings: config, now: () => clock.now });
   const replenish = createReplenish({ db, provider, serviceWallet, sync, settings: config });
   const witness = createWitnessService({ db, provider, serviceWallet, leases, settings: config, now: () => clock.now });
@@ -90,6 +90,7 @@ export const createTestService = async (overrides: Record<string, string> = {}):
     logger: silentLogger,
     network: config.network,
     adminApiKey: config.adminApiKey,
+    rateLimit: config,
     lease: { sponsorAddress: serviceWallet.address, maxSponsoredLovelace: config.maxSponsoredLovelace },
     leases,
     witness,

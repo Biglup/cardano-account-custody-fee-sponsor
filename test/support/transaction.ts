@@ -13,6 +13,7 @@ export interface TransactionParts {
 const BODY_INPUTS = 0n;
 const BODY_OUTPUTS = 1n;
 const BODY_FEE = 2n;
+const BODY_VALIDITY_UPPER_BOUND = 3n;
 const BODY_CERTIFICATES = 4n;
 const BODY_COLLATERAL_RETURN = 16n;
 const BODY_TOTAL_COLLATERAL = 17n;
@@ -167,6 +168,10 @@ export const withBodyField = (txCbor: string, key: bigint, valueCbor: string): s
   }
   return writeTransaction({ ...items, body: bytes(writer.encodeHex()) });
 };
+
+/** The same transaction with `slot` as its validity upper bound, whatever the slot, as a client editing the body by hand can set. */
+export const withValidityUpperBound = (txCbor: string, slot: bigint): string =>
+  withBodyField(txCbor, BODY_VALIDITY_UPPER_BOUND, new Cometa.CborWriter().writeUnsignedInt(slot).encodeHex());
 
 /** The same transaction declaring `lovelace` as its total collateral. */
 export const withTotalCollateral = (txCbor: string, lovelace: bigint): string =>

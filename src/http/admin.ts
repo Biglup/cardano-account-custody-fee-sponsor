@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3';
 import { Router } from 'express';
 import { z } from 'zod';
+import { type AuditRow, toAuditEntry } from '../audit.js';
 import { createApiKey, quotasSchema } from '../keys.js';
 import type { LeaseService } from '../pool/leases.js';
 import type { ReplenishFn } from '../pool/replenish.js';
@@ -24,6 +25,26 @@ const replenishSchema = z
   })
   .strict();
 
+/** The most audit entries one request returns, and how many it returns when asked for no particular number. */
+const AUDIT_PAGE_LIMIT = 1000;
+const AUDIT_PAGE_DEFAULT = 100;
+
+/**
+ * The query of an audit request: entries at or after `since`, at most
+ * `limit` of them, oldest first. `since` may carry an offset or omit the
+ * fraction, and is brought to the UTC millisecond form the trail stores,
+ * since the comparison is on text.
+ */
+const auditQuerySchema = z
+  .object({
+    since: z.iso
+      .datetime({ offset: true })
+      .transform((value) => new Date(value).toISOString())
+      .optional(),
+    limit: z.coerce.number().int().positive().max(AUDIT_PAGE_LIMIT).default(AUDIT_PAGE_DEFAULT),
+  })
+  .strict();
+
 /** What the admin routes need injected. */
 export interface AdminDependencies {
   db: Database.Database;
@@ -36,7 +57,8 @@ export interface AdminDependencies {
 /**
  * The admin routes under `/admin`: every one requires the admin key.
  * Keys are issued here and shown once; the pool can be inspected and
- * replenished from the sponsor wallet.
+ * replenished from the sponsor wallet; the audit trail can be read back
+ * from a point in time, so an operator can follow what every key did.
  */
 export const createAdminRouter = ({ db, adminApiKey, sync, leases, replenish }: AdminDependencies): Router => {
   const router = Router();
@@ -61,6 +83,14 @@ export const createAdminRouter = ({ db, adminApiKey, sync, leases, replenish }: 
       leases: { open: openLeases },
       utxos,
     });
+  });
+
+  router.get('/audit', (req, res) => {
+    const { since, limit } = parseBody(auditQuerySchema, req.query);
+    const rows = db
+      .prepare('SELECT id, ts, api_key_id, action, outcome, detail FROM audit WHERE ts >= ? ORDER BY id LIMIT ?')
+      .all(since ?? '', limit) as AuditRow[];
+    res.json({ entries: rows.map(toAuditEntry) });
   });
 
   router.post(

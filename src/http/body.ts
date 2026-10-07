@@ -1,7 +1,7 @@
 import type { z } from 'zod';
 import { ValidationError } from './errors.js';
 
-/** Parses a request body against `schema`, reporting the first issue as a validation error. */
+/** Parses a request body, or its query, against `schema`, reporting the first issue as a validation error. */
 export const parseBody = <T>(schema: z.ZodType<T>, body: unknown): T => {
   const result = schema.safeParse(body ?? {});
   if (!result.success) {

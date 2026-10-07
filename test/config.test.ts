@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ConfigError, loadConfig } from '../src/config.js';
+import { SLOT_SETTINGS_BY_NETWORK } from '../src/slots.js';
 
 const VALID_MNEMONIC = 'alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima';
 
@@ -29,14 +30,32 @@ describe('loadConfig', () => {
     expect(config.collateralUtxoLovelace).toBe(5_000_000);
     expect(config.feeUtxoCount).toBe(10);
     expect(config.collateralUtxoCount).toBe(2);
+    expect(config.slots).toEqual(SLOT_SETTINGS_BY_NETWORK.preprod);
+    expect(config.validityMarginSeconds).toBe(120);
+    expect(config.ipRateLimitPerMinute).toBe(120);
+    expect(config.keyRateLimitPerMinute).toBe(60);
+    expect(config.trustProxyHops).toBe(0);
   });
 
   it('honours overrides for the operational tunables', () => {
-    const config = loadConfig({ ...validEnv(), PORT: '9000', LEASE_TTL_SECONDS: '120', MAX_FEE_LOVELACE: '1000000' });
+    const config = loadConfig({
+      ...validEnv(),
+      PORT: '9000',
+      LEASE_TTL_SECONDS: '120',
+      MAX_FEE_LOVELACE: '1000000',
+      VALIDITY_MARGIN_SECONDS: '0',
+      IP_RATE_LIMIT_PER_MINUTE: '10',
+      KEY_RATE_LIMIT_PER_MINUTE: '5',
+      TRUST_PROXY_HOPS: '1',
+    });
 
     expect(config.port).toBe(9000);
     expect(config.leaseTtlSeconds).toBe(120);
     expect(config.maxFeeLovelace).toBe(1_000_000);
+    expect(config.validityMarginSeconds).toBe(0);
+    expect(config.ipRateLimitPerMinute).toBe(10);
+    expect(config.keyRateLimitPerMinute).toBe(5);
+    expect(config.trustProxyHops).toBe(1);
   });
 
   it('fails with a clear message when SPONSOR_MNEMONIC is missing, without echoing any value', () => {

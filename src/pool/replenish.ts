@@ -166,7 +166,7 @@ const main = async (): Promise<void> => {
   const serviceWallet = await loadServiceWallet(config, provider);
   const db = openDatabase(config.databasePath);
   applyMigrations(db);
-  const sync = createPoolSync({ db, provider, sponsorAddress: serviceWallet.address, sizes: config });
+  const sync = createPoolSync({ db, provider, sponsorAddress: serviceWallet.address, sizes: config, slots: config.slots });
   const replenish = createReplenish({ db, provider, serviceWallet, sync, settings: config });
 
   const result = await replenish();

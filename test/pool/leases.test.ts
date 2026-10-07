@@ -116,6 +116,13 @@ describe('lease creation', () => {
       error: 'quota_exceeded',
       detail: 'open_leases: at most 2 open leases per key',
     });
+    const audit = service.db.prepare("SELECT api_key_id, outcome, detail FROM audit WHERE action = 'lease' ORDER BY id DESC LIMIT 1").get() as {
+      api_key_id: number;
+      outcome: string;
+      detail: string;
+    };
+    expect(audit).toEqual({ api_key_id: key.id, outcome: 'quota_exceeded', detail: expect.any(String) });
+    expect(JSON.parse(audit.detail)).toEqual({ quota: 'open_leases', reason: 'open_leases: at most 2 open leases per key' });
   });
 
   it('answers no_utxo_available with the leased count and the soonest expiry when every fee UTxO is leased', async () => {

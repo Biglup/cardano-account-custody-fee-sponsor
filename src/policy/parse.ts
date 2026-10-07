@@ -85,6 +85,8 @@ export interface ParsedTransaction {
   redeemers: ParsedRedeemer[];
   /** The phase two flag: false marks a transaction whose scripts are expected to fail, which forfeits the collateral. */
   isValid: boolean;
+  /** The validity upper bound: the first slot the transaction is no longer valid at, when the body sets one. */
+  invalidHereafter: bigint | undefined;
 }
 
 /** An input of the transaction paired with the output it spends, when the chain knows it. */
@@ -133,11 +135,13 @@ const executionUnitsSchema = z.object({ mem: integer, steps: integer });
 const redeemerSchema = z.object({ tag: z.string(), index: z.coerce.number().int().min(0), ex_units: executionUnitsSchema }).loose();
 const plutusScriptSchema = z.object({ language: z.string(), bytes: hex });
 
+/** The fields of a transaction body the policy reads, each left loose so a field it does not read never fails the parse. */
 const bodySchema = z
   .object({
     inputs: z.array(inputSchema),
     outputs: z.array(outputSchema),
     fee: integer,
+    ttl: integer.optional(),
     certs: z.array(certificateSchema).optional(),
     withdrawals: z.array(withdrawalSchema).optional(),
     voting_procedures: z.array(votingProcedureSchema).optional(),
@@ -152,6 +156,7 @@ const bodySchema = z
   })
   .loose();
 
+/** The parts of a witness set the policy reads: the scripts and redeemers, which say what runs and with what budget. */
 const witnessSetSchema = z
   .object({
     native_scripts: z.array(z.unknown()).optional(),
@@ -400,6 +405,7 @@ export const parseTransaction = (cbor: string): ParseResult => {
       nativeScriptCount: (witnessSet.native_scripts ?? []).length,
       redeemers: (witnessSet.redeemers ?? []).map(toRedeemer),
       isValid,
+      invalidHereafter: body.ttl === undefined ? undefined : BigInt(body.ttl),
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : 'unknown error';

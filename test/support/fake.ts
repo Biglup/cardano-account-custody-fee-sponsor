@@ -92,11 +92,16 @@ const isScriptAddress = (address: string): boolean => paymentCredentialOf(addres
  * `setEvaluationFailure` to make the next call to `evaluateTransaction`
  * reject the way a real node would for a transaction that fails phase two,
  * and those that need a failing lookup call `setResolutionFailure`.
+ * Evaluation yields to the event loop, for as long as `setEvaluationDelay`
+ * says, as the round trip to a real evaluator does, so that tests can
+ * have requests in flight at the same time interleave the way they would
+ * in production.
  */
 export class FakeProvider implements Provider {
   private readonly utxosByAddress = new Map<string, UTxO[]>();
   private evaluationFailure: string | undefined;
   private resolutionFailure: string | undefined;
+  private evaluationDelayMs = 0;
 
   /** Makes a UTxO visible at its own address. */
   addUtxo(utxo: UTxO): void {
@@ -118,6 +123,11 @@ export class FakeProvider implements Provider {
   /** Makes the next evaluation reject with `message`, or clears a prior failure when called with no argument. */
   setEvaluationFailure(message?: string): void {
     this.evaluationFailure = message;
+  }
+
+  /** Makes every evaluation take `ms` milliseconds, as a round trip to a real evaluator would. */
+  setEvaluationDelay(ms: number): void {
+    this.evaluationDelayMs = ms;
   }
 
   /** Makes every lookup of unspent outputs reject with `message`, as a provider refusing a batch with an input it does not know, or clears it. */
@@ -178,6 +188,7 @@ export class FakeProvider implements Provider {
   }
 
   async evaluateTransaction(tx: string, additionalUtxos: UTxO[] = []): Promise<Redeemer[]> {
+    await new Promise((resolve) => setTimeout(resolve, this.evaluationDelayMs));
     if (this.evaluationFailure !== undefined) {
       throw new Error(this.evaluationFailure);
     }

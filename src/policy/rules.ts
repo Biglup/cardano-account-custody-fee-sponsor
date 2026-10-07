@@ -2,6 +2,7 @@ import type { AssetAmounts, Credential, Provider } from '@biglup/cometa';
 import { Cometa } from '../cometa.js';
 import type { PoolUtxo } from '../pool/utxo.js';
 import { utxoRef } from '../pool/utxo.js';
+import { type SlotSettings, slotAt, slotToTime } from '../slots.js';
 import { evaluates } from './evaluate.js';
 import type { ParsedCertificate, ParsedOutput, ParsedTransaction, ResolvedInput } from './parse.js';
 
@@ -10,6 +11,7 @@ export type RuleName =
   | 'well_formed'
   | 'uses_leased_fee_input'
   | 'uses_leased_collateral'
+  | 'bounded_validity'
   | 'account_transaction'
   | 'sponsor_outflow_bounded'
   | 'no_sponsor_value_elsewhere'
@@ -26,12 +28,14 @@ export interface Violation {
 /** A leased UTxO as the policy needs it: where it is and what it holds. */
 export type LeasedUtxo = Pick<PoolUtxo, 'txHash' | 'index' | 'lovelace'>;
 
-/** What the policy knows about the sponsor, the account contract, the lease under check and its limits. */
+/** What the policy knows about the sponsor, the account contract, the lease under check, its limits, the network's clock and the time of the check. */
 export interface PolicyContext {
   sponsor: { address: string; paymentKeyHash: string; stakeKeyHash: string };
   accountScriptHash: string;
-  lease: { fee: LeasedUtxo; collateral: LeasedUtxo };
-  limits: { maxSponsoredLovelace: number; maxFeeLovelace: number };
+  lease: { fee: LeasedUtxo; collateral: LeasedUtxo; expiresAt: string };
+  limits: { maxSponsoredLovelace: number; maxFeeLovelace: number; validityMarginSeconds: number };
+  slots: SlotSettings;
+  now: Date;
   /** Whether the pool knows a `txHash#index` reference as one of the sponsor's own UTxOs, whatever its status. */
   isSponsorUtxo: (ref: string) => boolean;
 }
@@ -39,12 +43,25 @@ export interface PolicyContext {
 /** What kind of account transaction a transaction is: creating an account, or operating an existing one. */
 export type TransactionKind = 'creation' | 'operation';
 
-/** The verdict of the policy: the first violation when there is one, and what the transaction was read as. */
-export interface PolicyVerdict {
-  violation: Violation | undefined;
+/** What the transaction was read as, which every verdict carries. */
+interface Reading {
   kind: TransactionKind | undefined;
   sponsoredLovelace: bigint;
 }
+
+/** The verdict on a transaction that broke a rule: the first violation found. */
+export interface PolicyRefusal extends Reading {
+  violation: Violation;
+}
+
+/** The verdict on a transaction that passed every rule, with the validity upper bound the bounded validity rule verified. */
+export interface PolicyApproval extends Reading {
+  violation: undefined;
+  invalidHereafter: bigint;
+}
+
+/** The verdict of the policy: a refusal naming the first violation, or an approval carrying the verified validity upper bound. */
+export type PolicyVerdict = PolicyRefusal | PolicyApproval;
 
 /** The parts of an account creation the outflow rule accounts for: the registration deposit and the control output. */
 interface Creation {
@@ -268,6 +285,37 @@ const usesLeasedCollateral: Rule = ({ transaction }, { lease, sponsor }) => {
   return undefined;
 };
 
+/**
+ * The transaction stops being valid no later than the lease expiry plus
+ * the configured margin, so that a witnessed transaction the client never
+ * submits cannot hold the fee UTxO out of the pool for longer than that,
+ * and later than now, so that the bound stored with the witness is one
+ * the pool sync can wait out. Slots are compared as the integers they
+ * are, never as times: a bound far enough out has no time at all, and
+ * must still be refused. Returns the bound once it is verified.
+ */
+const boundedValidity = ({ transaction }: Analysis, { lease, limits, slots, now }: PolicyContext): bigint | Violation => {
+  const bound = transaction.invalidHereafter;
+  if (bound === undefined) {
+    return violation('bounded_validity', 'The transaction carries no validity upper bound');
+  }
+  const latestSlot = slotAt(slots, new Date(new Date(lease.expiresAt).getTime() + limits.validityMarginSeconds * 1000));
+  if (bound > latestSlot) {
+    return violation(
+      'bounded_validity',
+      `The validity upper bound at slot ${bound} is later than slot ${latestSlot} (${slotToTime(slots, latestSlot).toISOString()}), the lease expiry plus ${limits.validityMarginSeconds} seconds`,
+    );
+  }
+  const currentSlot = slotAt(slots, now);
+  if (bound <= currentSlot) {
+    return violation(
+      'bounded_validity',
+      `The validity upper bound at slot ${bound} (${slotToTime(slots, bound).toISOString()}) is not later than the current slot ${currentSlot}`,
+    );
+  }
+  return bound;
+};
+
 /** The transaction operates an existing account through its control UTxO, or creates one. */
 const accountTransaction: Rule = ({ notAccountTransaction }) =>
   notAccountTransaction === undefined ? undefined : violation('account_transaction', notAccountTransaction);
@@ -401,22 +449,20 @@ const signers: Rule = ({ transaction }, { sponsor }) => {
   return undefined;
 };
 
-/** The rules checked before evaluation, in order. */
-const BEFORE_EVALUATION: Rule[] = [
-  usesLeasedFeeInput,
-  usesLeasedCollateral,
-  accountTransaction,
-  sponsorOutflowBounded,
-  noSponsorValueElsewhere,
-  noForeignScripts,
-];
+/** The rules checked before the validity bound, in order. */
+const BEFORE_VALIDITY: Rule[] = [usesLeasedFeeInput, usesLeasedCollateral];
+
+/** The rules checked after the validity bound and before evaluation, in order. */
+const BEFORE_EVALUATION: Rule[] = [accountTransaction, sponsorOutflowBounded, noSponsorValueElsewhere, noForeignScripts];
 
 /**
  * Applies the policy to a transaction that already parsed, in rule
  * order: the structural rules first, then evaluation through the
  * provider, then the signer rules, stopping at the first violation. The
  * verdict also says what the transaction was read as and how much
- * sponsor lovelace it draws, which is what the audit trail records.
+ * sponsor lovelace it draws, which is what the audit trail records, and
+ * an approval carries the validity upper bound as verified, which is
+ * what the witness is recorded with.
  */
 export const applyPolicy = async (
   transaction: ParsedTransaction,
@@ -425,20 +471,31 @@ export const applyPolicy = async (
   provider: Provider,
 ): Promise<PolicyVerdict> => {
   const analysis = analyse(transaction, inputs, context);
-  const verdict = (found: Violation | undefined): PolicyVerdict => ({
-    violation: found,
-    kind: analysis.kind,
-    sponsoredLovelace: analysis.sponsoredLovelace,
-  });
+  const reading: Reading = { kind: analysis.kind, sponsoredLovelace: analysis.sponsoredLovelace };
+  const refuse = (found: Violation): PolicyRefusal => ({ ...reading, violation: found });
+  for (const rule of BEFORE_VALIDITY) {
+    const found = rule(analysis, context);
+    if (found !== undefined) {
+      return refuse(found);
+    }
+  }
+  const bound = boundedValidity(analysis, context);
+  if (typeof bound !== 'bigint') {
+    return refuse(bound);
+  }
   for (const rule of BEFORE_EVALUATION) {
     const found = rule(analysis, context);
     if (found !== undefined) {
-      return verdict(found);
+      return refuse(found);
     }
   }
   const evaluation = await evaluates(transaction, inputs, context, provider);
   if (evaluation !== undefined) {
-    return verdict(evaluation);
+    return refuse(evaluation);
   }
-  return verdict(signers(analysis, context));
+  const named = signers(analysis, context);
+  if (named !== undefined) {
+    return refuse(named);
+  }
+  return { ...reading, violation: undefined, invalidHereafter: bound };
 };
