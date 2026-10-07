@@ -1,0 +1,43 @@
+{
+  "name": "cardano-account-custody-fee-sponsor",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Fee sponsor service for the Cardano account custody contract: leases sponsor UTxOs to clients and witnesses their account transactions.",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "start": "tsx src/main.ts",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "replenish": "tsx src/pool/replenish.ts"
+  },
+  "dependencies": {
+    "@biglup/cometa": "^1.2.0",
+    "better-sqlite3": "^13.0.3",
+    "dotenv": "^18.0.6",
+    "express": "^4.22.3",
+    "express-rate-limit": "^8.7.1",
+    "helmet": "^8.3.0",
+    "pino": "^10.4.0",
+    "pino-http": "^11.0.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/express": "^4.17.25",
+    "@types/node": "^22.20.5",
+    "@types/supertest": "^7.2.1",
+    "eslint": "^9.39.5",
+    "supertest": "^7.3.1",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.71.1",
+    "vitest": "^5.0.3"
+  }
+}
