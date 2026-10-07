@@ -1,0 +1,34 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  service:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cardano-account-custody-fee-sponsor
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: cardano-account-custody-fee-sponsor
+      - uses: actions/checkout@v4
+        with:
+          repository: Biglup/cardano-account-custody-contract
+          path: cardano-account-custody-contract
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: cardano-account-custody-contract/offchain
+      - run: npm run build
+        working-directory: cardano-account-custody-contract/offchain
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run typecheck:scripts
+      - run: npm test
+      - run: npm run build
