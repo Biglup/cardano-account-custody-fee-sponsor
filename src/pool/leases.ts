@@ -6,6 +6,7 @@ import type { Config } from '../config.js';
 import {
   LeaseConsumedError,
   LeaseExpiredError,
+  LeaseReleasedError,
   NoUtxoAvailableError,
   OutOfFundsError,
   QuotaExceededError,
@@ -33,12 +34,26 @@ export interface Lease {
   createdAt: string;
 }
 
-/** The lease service: hands out, releases and expires leases. */
+/** The witness issued for a lease: the hash of the transaction it signs, what it sponsors, and the witness set itself. */
+export interface Witness {
+  txHash: string;
+  sponsoredLovelace: number;
+  witnessSet: string;
+  issuedAt: string;
+}
+
+/** The lease service: hands out, releases, consumes and expires leases. */
 export interface LeaseService {
   /** Reserves one fee UTxO and one collateral UTxO for the key. */
   create(apiKey: ApiKey): Promise<Lease>;
+  /** The lease the key holds under the id, whatever its status. */
+  find(apiKey: ApiKey, leaseId: string): Lease;
   /** Releases an open lease the key holds, so its UTxOs can be leased again at once. */
   release(apiKey: ApiKey, leaseId: string): Lease;
+  /** Records the witness issued for an open lease and closes it as consumed; a lease no longer open is refused by its status. */
+  consume(lease: Lease, witness: Omit<Witness, 'issuedAt'>): void;
+  /** The witness issued for the lease, if one was. */
+  witnessOf(leaseId: string): Witness | undefined;
   /** Closes every open lease past its expiry and returns how many it closed. */
   expireStale(): number;
   /** Starts the periodic sweep of expired leases. */
@@ -69,6 +84,8 @@ type LeaseRow = {
   created_at: string;
 };
 
+type WitnessRow = { tx_hash: string; sponsored_lovelace: number; witness_set: string; issued_at: string };
+
 /** Why a lease attempt found nothing to reserve. */
 type Shortage = 'no_fee_utxo' | 'no_collateral_utxo';
 
@@ -86,6 +103,12 @@ const isUniqueViolation = (err: unknown): boolean =>
  * recorded as leased and the attempt is retried once from the next
  * candidate. When no fee UTxO is free the pool is resynced with the chain
  * before giving up, in case a split or a return of funds has landed.
+ *
+ * Consuming a lease records its witness and marks the fee UTxO consumed
+ * rather than free: the signature is out there and the spend can land at
+ * any moment, so the UTxO must never be leased again. Collateral is only
+ * spent on a phase two failure the policy refuses to witness, so it stays
+ * leasable and merely sheds the closed lease.
  */
 export const createLeaseService = ({ db, sync, settings, now = () => new Date(), logger }: LeaseServiceDependencies): LeaseService => {
   let timer: NodeJS.Timeout | undefined;
@@ -111,6 +134,12 @@ export const createLeaseService = ({ db, sync, settings, now = () => new Date(),
   const selectLease = db.prepare('SELECT * FROM leases WHERE id = ? AND api_key_id = ?');
   const setLeaseStatus = db.prepare("UPDATE leases SET status = ? WHERE id = ? AND status = 'open'");
   const selectExpired = db.prepare("SELECT * FROM leases WHERE status = 'open' AND expires_at <= ?");
+  const selectLeaseById = db.prepare('SELECT * FROM leases WHERE id = ?');
+  const insertWitness = db.prepare(
+    'INSERT INTO witnesses (lease_id, tx_hash, sponsored_lovelace, witness_set, issued_at) VALUES (?, ?, ?, ?, ?)',
+  );
+  const selectWitness = db.prepare('SELECT tx_hash, sponsored_lovelace, witness_set, issued_at FROM witnesses WHERE lease_id = ?');
+  const markConsumed = db.prepare("UPDATE pool_utxos SET status = 'consumed' WHERE tx_hash = ? AND tx_index = ?");
   const countLeasedFee = db.prepare("SELECT COUNT(*) AS count FROM pool_utxos WHERE kind = 'fee' AND status = 'leased'");
   const selectSoonestExpiry = db.prepare("SELECT MIN(expires_at) AS soonest FROM leases WHERE status = 'open'");
 
@@ -232,6 +261,38 @@ export const createLeaseService = ({ db, sync, settings, now = () => new Date(),
     return toLease(outcome);
   };
 
+  const find = (apiKey: ApiKey, leaseId: string): Lease => {
+    const row = selectLease.get(leaseId, apiKey.id) as LeaseRow | undefined;
+    if (!row) {
+      throw new UnknownLeaseError(leaseId);
+    }
+    return toLease(row);
+  };
+
+  const consume = db.transaction((lease: Lease, witness: Omit<Witness, 'issuedAt'>): void => {
+    const changed = setLeaseStatus.run('consumed', lease.id).changes;
+    if (changed === 0) {
+      const row = selectLeaseById.get(lease.id) as LeaseRow | undefined;
+      if (row?.status === 'expired') {
+        throw new LeaseExpiredError(lease.id);
+      }
+      if (row?.status === 'released') {
+        throw new LeaseReleasedError(lease.id);
+      }
+      throw new LeaseConsumedError(lease.id);
+    }
+    insertWitness.run(lease.id, witness.txHash, witness.sponsoredLovelace, witness.witnessSet, now().toISOString());
+    markConsumed.run(lease.fee.txHash, lease.fee.index);
+    refreshUtxoStatus(db, utxoRef(lease.collateral.txHash, lease.collateral.index));
+  });
+
+  const witnessOf = (leaseId: string): Witness | undefined => {
+    const row = selectWitness.get(leaseId) as WitnessRow | undefined;
+    return row
+      ? { txHash: row.tx_hash, sponsoredLovelace: row.sponsored_lovelace, witnessSet: row.witness_set, issuedAt: row.issued_at }
+      : undefined;
+  };
+
   const release = (apiKey: ApiKey, leaseId: string): Lease => {
     expireStale();
     const row = selectLease.get(leaseId, apiKey.id) as LeaseRow | undefined;
@@ -253,7 +314,10 @@ export const createLeaseService = ({ db, sync, settings, now = () => new Date(),
 
   return {
     create,
+    find,
     release,
+    consume,
+    witnessOf,
     expireStale,
     start: () => {
       if (timer !== undefined) {

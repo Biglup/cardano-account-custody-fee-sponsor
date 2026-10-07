@@ -11,6 +11,11 @@ interface Migration {
  * leases clients hold against that pool, the witnesses issued for leases,
  * and an audit trail of every decision the service makes.
  *
+ * A witness keeps the witness set it issued so that the same transaction
+ * presented again receives the same one. A witness set holds public keys
+ * and signatures only; the transaction itself is never stored, only its
+ * hash.
+ *
  * A pool UTxO is identified by its transaction hash and output index.
  * A lease records which fee and collateral UTxO it holds as
  * `tx_hash#index` references into `pool_utxos`. The partial unique index
@@ -56,6 +61,7 @@ CREATE TABLE witnesses (
   lease_id TEXT PRIMARY KEY REFERENCES leases (id),
   tx_hash TEXT NOT NULL,
   sponsored_lovelace INTEGER NOT NULL,
+  witness_set TEXT NOT NULL,
   issued_at TEXT NOT NULL
 );
 

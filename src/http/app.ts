@@ -6,6 +6,7 @@ import { pinoHttp } from 'pino-http';
 import type { LeaseService } from '../pool/leases.js';
 import type { ReplenishFn } from '../pool/replenish.js';
 import type { PoolSync } from '../pool/sync.js';
+import type { WitnessService } from '../witness.js';
 import { createAdminRouter } from './admin.js';
 import { errorHandler, notFoundHandler } from './errors.js';
 import { createHealthRouter } from './health.js';
@@ -22,6 +23,7 @@ export interface AppDependencies {
   adminApiKey: string;
   lease: LeaseRouteSettings;
   leases: LeaseService;
+  witness: WitnessService;
   sync: PoolSync;
   replenish: ReplenishFn;
 }
@@ -34,7 +36,7 @@ export interface AppDependencies {
  * The logger passed in must already redact the authorization header; see
  * `src/main.ts` for how the production logger is configured.
  */
-export const createApp = ({ db, logger, network, adminApiKey, lease, leases, sync, replenish }: AppDependencies): Express => {
+export const createApp = ({ db, logger, network, adminApiKey, lease, leases, witness, sync, replenish }: AppDependencies): Express => {
   const app = express();
   app.disable('x-powered-by');
   app.use(helmet());
@@ -42,7 +44,7 @@ export const createApp = ({ db, logger, network, adminApiKey, lease, leases, syn
   app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
   app.use('/health', createHealthRouter(db, network));
-  app.use('/v1/leases', createLeaseRouter(db, leases, lease));
+  app.use('/v1/leases', createLeaseRouter(db, leases, witness, lease));
   app.use('/admin', createAdminRouter({ db, adminApiKey, sync, leases, replenish }));
 
   app.use(notFoundHandler);

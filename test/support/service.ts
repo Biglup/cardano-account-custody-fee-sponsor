@@ -11,6 +11,7 @@ import { type LeaseService, createLeaseService } from '../../src/pool/leases.js'
 import { type ReplenishFn, createReplenish } from '../../src/pool/replenish.js';
 import { type PoolSync, createPoolSync } from '../../src/pool/sync.js';
 import { type ServiceWallet, loadServiceWallet } from '../../src/wallet.js';
+import { type WitnessService, createWitnessService } from '../../src/witness.js';
 import { FakeProvider } from './fake.js';
 import { fakeTransactionId, transactionParts } from './transaction.js';
 
@@ -60,6 +61,7 @@ export interface TestService {
   serviceWallet: ServiceWallet;
   sync: PoolSync;
   leases: LeaseService;
+  witness: WitnessService;
   replenish: ReplenishFn;
   app: Express;
   /** The clock the lease service reads; move it to expire leases. */
@@ -82,6 +84,7 @@ export const createTestService = async (overrides: Record<string, string> = {}):
   const sync = createPoolSync({ db, provider, sponsorAddress: serviceWallet.address, sizes: config });
   const leases = createLeaseService({ db, sync, settings: config, now: () => clock.now });
   const replenish = createReplenish({ db, provider, serviceWallet, sync, settings: config });
+  const witness = createWitnessService({ db, provider, serviceWallet, leases, settings: config, now: () => clock.now });
   const app = createApp({
     db,
     logger: silentLogger,
@@ -89,6 +92,7 @@ export const createTestService = async (overrides: Record<string, string> = {}):
     adminApiKey: config.adminApiKey,
     lease: { sponsorAddress: serviceWallet.address, maxSponsoredLovelace: config.maxSponsoredLovelace },
     leases,
+    witness,
     sync,
     replenish,
   });
@@ -99,6 +103,7 @@ export const createTestService = async (overrides: Record<string, string> = {}):
     serviceWallet,
     sync,
     leases,
+    witness,
     replenish,
     app,
     clock,

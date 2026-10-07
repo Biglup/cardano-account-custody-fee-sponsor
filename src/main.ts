@@ -9,6 +9,7 @@ import { createLeaseService } from './pool/leases.js';
 import { createReplenish } from './pool/replenish.js';
 import { createPoolSync } from './pool/sync.js';
 import { loadServiceWallet } from './wallet.js';
+import { createWitnessService } from './witness.js';
 
 loadEnvFile({ quiet: true });
 
@@ -45,6 +46,7 @@ const main = async (): Promise<void> => {
   const sync = createPoolSync({ db, provider, sponsorAddress: serviceWallet.address, sizes: config, logger });
   const leases = createLeaseService({ db, sync, settings: config, logger });
   const replenish = createReplenish({ db, provider, serviceWallet, sync, settings: config, logger });
+  const witness = createWitnessService({ db, provider, serviceWallet, leases, settings: config, logger });
 
   await sync.run();
   sync.start();
@@ -57,6 +59,7 @@ const main = async (): Promise<void> => {
     adminApiKey: config.adminApiKey,
     lease: { sponsorAddress: serviceWallet.address, maxSponsoredLovelace: config.maxSponsoredLovelace },
     leases,
+    witness,
     sync,
     replenish,
   });

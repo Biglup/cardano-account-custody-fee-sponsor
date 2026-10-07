@@ -1,9 +1,15 @@
 import type Database from 'better-sqlite3';
 import { Router } from 'express';
+import { z } from 'zod';
 import type { Lease, LeaseService } from '../pool/leases.js';
 import type { PoolUtxo } from '../pool/utxo.js';
+import type { WitnessService } from '../witness.js';
 import { asyncHandler } from './async.js';
 import { apiKeyOf, requireApiKey } from './auth.js';
+import { parseBody } from './body.js';
+
+/** The body of a witness request: the unsigned transaction as CBOR hex; whether it decodes is the policy's first rule. */
+const witnessSchema = z.object({ transaction: z.string().min(1) }).strict();
 
 /** A leased UTxO as the API presents it, with the address the client must resolve it at. */
 export interface LeasedUtxoBody {
@@ -49,9 +55,16 @@ export const toLeaseBody = (lease: Lease, settings: LeaseRouteSettings): LeaseBo
 /**
  * The lease routes under `/v1/leases`: every one requires an API key.
  * Creating a lease reserves a fee and a collateral UTxO for the key;
- * deleting one releases it early so its UTxOs return to the pool.
+ * deleting one releases it early so its UTxOs return to the pool; posting
+ * a transaction to a lease's witness route has it checked against the
+ * policy and, when it passes, signed by the sponsor.
  */
-export const createLeaseRouter = (db: Database.Database, leases: LeaseService, settings: LeaseRouteSettings): Router => {
+export const createLeaseRouter = (
+  db: Database.Database,
+  leases: LeaseService,
+  witness: WitnessService,
+  settings: LeaseRouteSettings,
+): Router => {
   const router = Router();
   router.use(requireApiKey(db));
 
@@ -67,6 +80,15 @@ export const createLeaseRouter = (db: Database.Database, leases: LeaseService, s
     const lease = leases.release(apiKeyOf(res), req.params.id ?? '');
     res.json({ leaseId: lease.id, status: lease.status });
   });
+
+  router.post(
+    '/:id/witness',
+    asyncHandler(async (req, res) => {
+      const { transaction } = parseBody(witnessSchema, req.body);
+      const issued = await witness.issue(apiKeyOf(res), req.params.id ?? '', transaction);
+      res.json({ witnessSet: issued.witnessSet, leaseId: issued.leaseId });
+    }),
+  );
 
   return router;
 };

@@ -75,6 +75,14 @@ describe('applyMigrations', () => {
     ).not.toThrow();
   });
 
+  it('keeps the witness set with the witness so it can be issued again', () => {
+    applyMigrations(db);
+
+    const columns = (db.prepare('PRAGMA table_info(witnesses)').all() as { name: string }[]).map((column) => column.name);
+
+    expect(columns).toContain('witness_set');
+  });
+
   it('is idempotent', () => {
     applyMigrations(db);
     expect(() => applyMigrations(db)).not.toThrow();

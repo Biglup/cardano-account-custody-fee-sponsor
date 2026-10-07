@@ -25,8 +25,8 @@ const leaseStatus = (id: string): string =>
 /** Records a witness for the lease, as issuing one for a transaction built on it would. */
 const issueWitness = (leaseId: string): void => {
   service.db
-    .prepare('INSERT INTO witnesses (lease_id, tx_hash, sponsored_lovelace, issued_at) VALUES (?, ?, ?, ?)')
-    .run(leaseId, txHash(9), 500_000, '2024-01-01T00:01:00.000Z');
+    .prepare('INSERT INTO witnesses (lease_id, tx_hash, sponsored_lovelace, witness_set, issued_at) VALUES (?, ?, ?, ?, ?)')
+    .run(leaseId, txHash(9), 500_000, 'a10080', '2024-01-01T00:01:00.000Z');
 };
 
 describe('classifyUtxo', () => {

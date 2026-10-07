@@ -8,7 +8,7 @@ import type { PoolSync } from '../pool/sync.js';
 import { type PoolUtxoRow, toPoolUtxo } from '../pool/utxo.js';
 import { asyncHandler } from './async.js';
 import { requireAdminKey } from './auth.js';
-import { ValidationError } from './errors.js';
+import { parseBody } from './body.js';
 import { poolCounts } from './health.js';
 
 /** The body of a key issuance request: a label to recognise the key by, and optional quota overrides. */
@@ -32,16 +32,6 @@ export interface AdminDependencies {
   leases: LeaseService;
   replenish: ReplenishFn;
 }
-
-/** Parses a request body against `schema`, reporting the first issue as a validation error. */
-const parseBody = <T>(schema: z.ZodType<T>, body: unknown): T => {
-  const result = schema.safeParse(body ?? {});
-  if (!result.success) {
-    const issue = result.error.issues[0];
-    throw new ValidationError(`${issue?.path.join('.') || 'body'}: ${issue?.message ?? 'invalid'}`);
-  }
-  return result.data;
-};
 
 /**
  * The admin routes under `/admin`: every one requires the admin key.

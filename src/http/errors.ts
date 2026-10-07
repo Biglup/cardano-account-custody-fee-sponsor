@@ -61,10 +61,17 @@ export class UnknownLeaseError extends ServiceError {
   }
 }
 
-/** The lease's TTL has passed. */
+/** The lease's TTL has passed, or the client gave it up early; nothing can be built on it any more. */
 export class LeaseExpiredError extends ServiceError {
+  constructor(leaseId: string, detail = `Lease ${leaseId} has expired`) {
+    super(410, 'lease_expired', detail);
+  }
+}
+
+/** The client gave the lease up early; it answers as expired, since nothing can be built on it either. */
+export class LeaseReleasedError extends LeaseExpiredError {
   constructor(leaseId: string) {
-    super(410, 'lease_expired', `Lease ${leaseId} has expired`);
+    super(leaseId, `Lease ${leaseId} was released`);
   }
 }
 

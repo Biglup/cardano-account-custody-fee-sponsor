@@ -1,5 +1,7 @@
-import type { Address, NetworkMagic, Provider, ProtocolParameters, Redeemer, RewardAddress, TxIn, UTxO } from '@biglup/cometa';
+import type { Address, ExUnits, NetworkMagic, Provider, ProtocolParameters, Redeemer, RewardAddress, TxIn, UTxO } from '@biglup/cometa';
 import { Cometa } from '../../src/cometa.js';
+import { paymentCredentialOf } from '../../src/policy/parse.js';
+import { transactionParts } from './transaction.js';
 
 /** A one half threshold, used wherever a governance threshold is needed. */
 const half = { numerator: 1, denominator: 2 };
@@ -61,22 +63,40 @@ export const PROTOCOL_PARAMETERS: ProtocolParameters = {
   refScriptCostPerByte: { numerator: 15, denominator: 1 },
 };
 
-/** The execution units the fake provider reports for every redeemer. */
-export const FAKE_EXECUTION_UNITS = { memory: 1_500_000, steps: 700_000_000 };
+/** The execution units the fake provider reports by redeemer purpose: fixed, non trivial numbers of the order a real evaluation returns. */
+const EXECUTION_UNITS_BY_PURPOSE: Record<string, ExUnits> = {
+  spend: { memory: 1_500_000, steps: 700_000_000 },
+  mint: { memory: 1_200_000, steps: 480_000_000 },
+  certificate: { memory: 900_000, steps: 350_000_000 },
+};
+
+/** The execution units the fake provider reports for a redeemer of a purpose the table does not name. */
+const DEFAULT_EXECUTION_UNITS: ExUnits = { memory: 600_000, steps: 250_000_000 };
+
+/** The execution units the fake provider reports for a redeemer, whatever the redeemer declares. */
+export const fakeExecutionUnits = (redeemer: Redeemer): ExUnits => EXECUTION_UNITS_BY_PURPOSE[redeemer.purpose] ?? DEFAULT_EXECUTION_UNITS;
 
 /** The bech32 form of an address, used to key the canned UTxOs. */
 const addressKey = (address: Address | string): string => (typeof address === 'string' ? address : address.toString());
 
+/** Whether an address pays to a script, so that spending it needs a redeemer. */
+const isScriptAddress = (address: string): boolean => paymentCredentialOf(address)?.type === Cometa.CredentialType.ScriptHash;
+
 /**
- * A provider serving canned UTxOs per address and fixed execution units.
- * It does not model script failures; the transaction policy tests that
- * need a failing evaluation call `setEvaluationFailure` to make the next
- * call to `evaluateTransaction` reject the way a real node would for a
- * transaction that fails phase two.
+ * A provider serving canned UTxOs per address and fixed execution units
+ * per redeemer purpose, reported whatever the transaction declares, as a
+ * real evaluator does. Evaluation models what a node checks before it
+ * can run any script: every input must be known, and every input locked
+ * by a script must come with a spend redeemer. It does not run the scripts themselves;
+ * the policy tests that need a failing evaluation call
+ * `setEvaluationFailure` to make the next call to `evaluateTransaction`
+ * reject the way a real node would for a transaction that fails phase two,
+ * and those that need a failing lookup call `setResolutionFailure`.
  */
 export class FakeProvider implements Provider {
   private readonly utxosByAddress = new Map<string, UTxO[]>();
   private evaluationFailure: string | undefined;
+  private resolutionFailure: string | undefined;
 
   /** Makes a UTxO visible at its own address. */
   addUtxo(utxo: UTxO): void {
@@ -98,6 +118,11 @@ export class FakeProvider implements Provider {
   /** Makes the next evaluation reject with `message`, or clears a prior failure when called with no argument. */
   setEvaluationFailure(message?: string): void {
     this.evaluationFailure = message;
+  }
+
+  /** Makes every lookup of unspent outputs reject with `message`, as a provider refusing a batch with an input it does not know, or clears it. */
+  setResolutionFailure(message?: string): void {
+    this.resolutionFailure = message;
   }
 
   getName(): string {
@@ -131,6 +156,9 @@ export class FakeProvider implements Provider {
   }
 
   resolveUnspentOutputs(txIns: TxIn[]): Promise<UTxO[]> {
+    if (this.resolutionFailure !== undefined) {
+      return Promise.reject(new Error(this.resolutionFailure));
+    }
     const all = [...this.utxosByAddress.values()].flat();
     return Promise.resolve(
       txIns.flatMap((txIn) => all.filter((utxo) => utxo.input.txId === txIn.txId && utxo.input.index === txIn.index)),
@@ -149,11 +177,23 @@ export class FakeProvider implements Provider {
     return Promise.reject(new Error('The fake provider does not submit transactions'));
   }
 
-  evaluateTransaction(tx: string): Promise<Redeemer[]> {
+  async evaluateTransaction(tx: string, additionalUtxos: UTxO[] = []): Promise<Redeemer[]> {
     if (this.evaluationFailure !== undefined) {
-      return Promise.reject(new Error(this.evaluationFailure));
+      throw new Error(this.evaluationFailure);
     }
     const redeemers = Cometa.readRedeemersFromTx(tx);
-    return Promise.resolve(redeemers.map((redeemer) => ({ ...redeemer, executionUnits: FAKE_EXECUTION_UNITS })));
+    const inputs = transactionParts(tx).inputs;
+    const known = [...(await this.resolveUnspentOutputs(inputs)), ...additionalUtxos];
+    inputs.forEach((input, index) => {
+      const utxo = known.find((candidate) => candidate.input.txId === input.txId && candidate.input.index === input.index);
+      if (!utxo) {
+        throw new Error(`Input ${input.txId}#${input.index} is unknown`);
+      }
+      const hasRedeemer = redeemers.some((redeemer) => redeemer.purpose === Cometa.RedeemerPurpose.spend && redeemer.index === index);
+      if (isScriptAddress(utxo.output.address) && !hasRedeemer) {
+        throw new Error(`Input ${input.txId}#${input.index} is locked by a script but has no redeemer`);
+      }
+    });
+    return redeemers.map((redeemer) => ({ ...redeemer, executionUnits: fakeExecutionUnits(redeemer) }));
   }
 }
