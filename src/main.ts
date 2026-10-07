@@ -5,6 +5,9 @@ import { loadConfig } from './config.js';
 import { openDatabase } from './db/connection.js';
 import { applyMigrations } from './db/migrations.js';
 import { createApp } from './http/app.js';
+import { createLeaseService } from './pool/leases.js';
+import { createReplenish } from './pool/replenish.js';
+import { createPoolSync } from './pool/sync.js';
 import { loadServiceWallet } from './wallet.js';
 
 loadEnvFile({ quiet: true });
@@ -39,7 +42,24 @@ const main = async (): Promise<void> => {
   const db = openDatabase(config.databasePath);
   applyMigrations(db);
 
-  const app = createApp({ db, logger, network: config.network });
+  const sync = createPoolSync({ db, provider, sponsorAddress: serviceWallet.address, sizes: config, logger });
+  const leases = createLeaseService({ db, sync, settings: config, logger });
+  const replenish = createReplenish({ db, provider, serviceWallet, sync, settings: config, logger });
+
+  await sync.run();
+  sync.start();
+  leases.start();
+
+  const app = createApp({
+    db,
+    logger,
+    network: config.network,
+    adminApiKey: config.adminApiKey,
+    lease: { sponsorAddress: serviceWallet.address, maxSponsoredLovelace: config.maxSponsoredLovelace },
+    leases,
+    sync,
+    replenish,
+  });
 
   app.listen(config.port, () => {
     logger.info({ port: config.port, address: serviceWallet.address }, 'Fee sponsor service listening');

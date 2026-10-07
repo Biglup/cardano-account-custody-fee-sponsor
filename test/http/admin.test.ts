@@ -1,0 +1,105 @@
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import request from 'supertest';
+import { hashApiKey } from '../../src/keys.js';
+import { TEST_ADMIN_KEY, type TestService, createTestService, txHash } from '../support/service.js';
+
+let service: TestService;
+
+beforeEach(async () => {
+  service = await createTestService();
+});
+
+afterEach(() => {
+  service.close();
+});
+
+const admin = { Authorization: `Bearer ${TEST_ADMIN_KEY}` };
+
+describe('POST /admin/keys', () => {
+  it('issues a key once, stores its hash with the label and quotas, and the key then works', async () => {
+    const response = await request(service.app).post('/admin/keys').set(admin).send({ label: 'wallet-a', quotas: { openLeases: 7 } });
+
+    expect(response.status).toBe(201);
+    expect(response.body).toEqual({
+      apiKey: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+      id: 1,
+      label: 'wallet-a',
+      quotas: { openLeases: 7, witnessesPerHour: 60, sponsoredLovelacePerDay: 600_000_000 },
+    });
+    const stored = service.db.prepare('SELECT label, key_hash, quotas FROM api_keys WHERE id = 1').get() as Record<string, string>;
+    expect(stored).toEqual({ label: 'wallet-a', key_hash: hashApiKey(response.body.apiKey), quotas: '{"openLeases":7}' });
+
+    service.fund(txHash(1), 0, 100_000_000n);
+    service.fund(txHash(2), 0, 5_000_000n);
+    const lease = await request(service.app).post('/v1/leases').set('Authorization', `Bearer ${response.body.apiKey}`);
+    expect(lease.status).toBe(201);
+  });
+
+  it('refuses a body without a label or with an unknown quota', async () => {
+    const noLabel = await request(service.app).post('/admin/keys').set(admin).send({});
+    expect(noLabel.status).toBe(400);
+    expect(noLabel.body.error).toBe('invalid_request');
+    expect(noLabel.body.detail).toContain('label');
+
+    const unknownQuota = await request(service.app).post('/admin/keys').set(admin).send({ label: 'x', quotas: { witnesses: 1 } });
+    expect(unknownQuota.status).toBe(400);
+  });
+});
+
+describe('GET /admin/pool', () => {
+  it('reports the counts, the reserve, the open leases and every live UTxO', async () => {
+    service.fund(txHash(1), 0, 100_000_000n);
+    service.fund(txHash(2), 0, 5_000_000n);
+    service.fund(txHash(3), 0, 700_000_000n);
+    await service.sync.run();
+    await request(service.app).post('/v1/leases').set('Authorization', `Bearer ${service.issueKey().apiKey}`);
+
+    const response = await request(service.app).get('/admin/pool').set(admin);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      pool: { fee: { free: 0, leased: 1 }, collateral: { free: 0, leased: 1 } },
+      reserve: { utxos: 1, lovelace: '700000000', syncedAt: expect.any(String) },
+      leases: { open: 1 },
+      utxos: [
+        { txHash: txHash(2), index: 0, lovelace: 5_000_000, kind: 'collateral', status: 'leased', discoveredAt: expect.any(String) },
+        { txHash: txHash(1), index: 0, lovelace: 100_000_000, kind: 'fee', status: 'leased', discoveredAt: expect.any(String) },
+      ],
+    });
+  });
+});
+
+describe('POST /admin/pool/replenish', () => {
+  it('splits the reserve and reports the transaction and counts', async () => {
+    service.fund(txHash(3), 0, 400_000_000n);
+
+    const response = await request(service.app).post('/admin/pool/replenish').set(admin).send({ feeUtxoCount: 2, collateralCount: 1 });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      txId: expect.stringMatching(/^[0-9a-f]{64}$/),
+      feeOutputs: 2,
+      collateralOutputs: 1,
+      reserveLovelace: expect.stringMatching(/^\d+$/),
+    });
+    const health = await request(service.app).get('/health');
+    expect(health.body.pool).toEqual({ fee: { free: 2, leased: 0 }, collateral: { free: 1, leased: 0 } });
+  });
+
+  it('answers 503 out_of_funds when the reserve cannot fund the split', async () => {
+    service.fund(txHash(3), 0, 10_000_000n);
+
+    const response = await request(service.app).post('/admin/pool/replenish').set(admin).send({ feeUtxoCount: 1, collateralCount: 0 });
+
+    expect(response.status).toBe(503);
+    expect(response.body.error).toBe('out_of_funds');
+    expect(response.body.detail).toContain('10000000 lovelace');
+  });
+
+  it('refuses an unknown field', async () => {
+    const response = await request(service.app).post('/admin/pool/replenish').set(admin).send({ count: 1 });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe('invalid_request');
+  });
+});

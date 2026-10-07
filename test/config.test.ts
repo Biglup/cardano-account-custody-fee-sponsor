@@ -27,6 +27,8 @@ describe('loadConfig', () => {
     expect(config.collateralSharing).toBe(20);
     expect(config.feeUtxoLovelace).toBe(100_000_000);
     expect(config.collateralUtxoLovelace).toBe(5_000_000);
+    expect(config.feeUtxoCount).toBe(10);
+    expect(config.collateralUtxoCount).toBe(2);
   });
 
   it('honours overrides for the operational tunables', () => {

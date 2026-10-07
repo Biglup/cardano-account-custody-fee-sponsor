@@ -37,6 +37,8 @@ const envSchema = z.object({
   COLLATERAL_SHARING: z.coerce.number().int().positive().default(20),
   FEE_UTXO_LOVELACE: z.coerce.number().int().positive().default(100_000_000),
   COLLATERAL_UTXO_LOVELACE: z.coerce.number().int().positive().default(5_000_000),
+  FEE_UTXO_COUNT: z.coerce.number().int().positive().default(10),
+  COLLATERAL_UTXO_COUNT: z.coerce.number().int().positive().default(2),
 });
 
 /** The service configuration, derived once from the environment at startup. */
@@ -54,6 +56,8 @@ export interface Config {
   collateralSharing: number;
   feeUtxoLovelace: number;
   collateralUtxoLovelace: number;
+  feeUtxoCount: number;
+  collateralUtxoCount: number;
 }
 
 /**
@@ -94,5 +98,7 @@ export const loadConfig = (env: Record<string, string | undefined> = process.env
     collateralSharing: data.COLLATERAL_SHARING,
     feeUtxoLovelace: data.FEE_UTXO_LOVELACE,
     collateralUtxoLovelace: data.COLLATERAL_UTXO_LOVELACE,
+    feeUtxoCount: data.FEE_UTXO_COUNT,
+    collateralUtxoCount: data.COLLATERAL_UTXO_COUNT,
   };
 };

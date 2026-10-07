@@ -85,6 +85,16 @@ export class FakeProvider implements Provider {
     this.utxosByAddress.set(utxo.output.address, list);
   }
 
+  /** Removes a UTxO, as spending it would. */
+  removeUtxo(txIn: TxIn): void {
+    for (const [address, list] of this.utxosByAddress) {
+      this.utxosByAddress.set(
+        address,
+        list.filter((utxo) => !(utxo.input.txId === txIn.txId && utxo.input.index === txIn.index)),
+      );
+    }
+  }
+
   /** Makes the next evaluation reject with `message`, or clears a prior failure when called with no argument. */
   setEvaluationFailure(message?: string): void {
     this.evaluationFailure = message;
@@ -135,7 +145,7 @@ export class FakeProvider implements Provider {
     return Promise.resolve(true);
   }
 
-  submitTransaction(): Promise<string> {
+  submitTransaction(_tx: string): Promise<string> {
     return Promise.reject(new Error('The fake provider does not submit transactions'));
   }
 

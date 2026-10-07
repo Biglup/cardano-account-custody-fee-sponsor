@@ -103,10 +103,17 @@ export class ValidationError extends ServiceError {
   }
 }
 
-/** The caller exceeded a rate limit or quota. */
+/** The caller exceeded a rate limit. */
 export class RateLimitedError extends ServiceError {
   constructor(detail = 'Too many requests') {
     super(429, 'rate_limited', detail);
+  }
+}
+
+/** The caller's API key reached one of its quotas; the detail names the quota first. */
+export class QuotaExceededError extends ServiceError {
+  constructor(quota: string, detail: string) {
+    super(429, 'quota_exceeded', `${quota}: ${detail}`);
   }
 }
 
