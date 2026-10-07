@@ -46,6 +46,24 @@ const envSchema = z.object({
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).default(0),
 });
 
+/**
+ * How far apart the fee and the collateral sizes must be, as a fraction
+ * of the larger: the pool sync classifies a UTxO by which size it lies
+ * within a tenth of, so two sizes that close would make every UTxO of
+ * either size a fee UTxO and never yield a collateral one.
+ */
+const MINIMUM_SIZE_SEPARATION = 0.1;
+
+/** Whether the fee and the collateral sizes are far enough apart for a UTxO of either to be told from the other. */
+const sizesAreDistinct = ({ FEE_UTXO_LOVELACE: fee, COLLATERAL_UTXO_LOVELACE: collateral }: { FEE_UTXO_LOVELACE: number; COLLATERAL_UTXO_LOVELACE: number }): boolean =>
+  Math.abs(fee - collateral) > Math.max(fee, collateral) * MINIMUM_SIZE_SEPARATION;
+
+/** The environment schema with the checks that span more than one variable. */
+const configSchema = envSchema.refine(sizesAreDistinct, {
+  message: 'FEE_UTXO_LOVELACE and COLLATERAL_UTXO_LOVELACE must differ by more than 10 percent, or a UTxO of either size could not be told from the other',
+  path: ['COLLATERAL_UTXO_LOVELACE'],
+});
+
 /** The service configuration, derived once from the environment at startup. */
 export interface Config {
   network: Network;
@@ -94,7 +112,7 @@ export class ConfigError extends Error {
  * environment, while tests can pass a plain object of fake values instead.
  */
 export const loadConfig = (env: Record<string, string | undefined> = process.env): Config => {
-  const result = envSchema.safeParse(env);
+  const result = configSchema.safeParse(env);
   if (!result.success) {
     const issues = result.error.issues.map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`);
     throw new ConfigError(issues);

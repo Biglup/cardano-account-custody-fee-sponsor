@@ -42,8 +42,11 @@ export interface SponsorWalletOptions {
 /** The error codes after which the lease the wallet holds can no longer be built on, so the next use takes a new one. */
 const LEASE_GONE = new Set(['unknown_lease', 'lease_expired', 'lease_consumed']);
 
-/** The policy rule whose refusal says the shared collateral the wallet holds was replaced, so the next use reads it again. */
-const COLLATERAL_REPLACED = 'uses_shared_collateral';
+/** The collateral rule of collateral mode; a refusal under it drops the shared collateral held, since the service no longer accepts it as declared, so the next use reads the current one. */
+const SHARED_COLLATERAL_RULE = 'uses_shared_collateral';
+
+/** The collateral rule of fee mode; a refusal under it gives the lease back, since it names a collateral the service no longer accepts, so the next use takes a lease naming the current one. */
+const LEASE_COLLATERAL_RULE = 'uses_leased_collateral';
 
 /**
  * How much of the collateral validity window a builder leaves unused when
@@ -127,8 +130,9 @@ const slotConfigOf = (networkMagic: number): SlotConfig => {
 };
 
 /**
- * A cometa wallet over the sponsor service, to pass as the `sponsor` of
- * the account contract's builders. In fee mode it holds one lease at a
+ * A cometa wallet over the sponsor service, to pass to the account
+ * contract's builders: as their `sponsor` in fee mode and as their
+ * `collateral` in collateral mode. In fee mode it holds one lease at a
  * time, taken on first use and kept until a witness consumes it,
  * `release` gives it up or it expires, after which the next use takes a
  * new one; what it reports as its own is what the lease grants: the
@@ -245,14 +249,18 @@ export class SponsorWallet implements Wallet {
    * `partialSign` makes no difference; the client adds the other
    * signatures itself. In fee mode the lease is consumed by a witness; a
    * refusal under the policy leaves it open for a corrected transaction,
-   * while a lease the service reports as gone is dropped so the next use
-   * takes a new one, and the transaction the last witness was issued for
-   * is asked again on the lease it consumed rather than on a new one, so
-   * that a client that lost the answer gets the same witness set back and
-   * takes no second lease for it. In collateral mode the service answers
-   * the same transaction with the same witness set by itself; a refusal
-   * saying the shared collateral is no longer the one held drops it, so
-   * the next builder reads the current one.
+   * except a refusal under the collateral rule, after which the lease is
+   * given back so the next use takes one naming the current collateral,
+   * whether the one the lease named was replaced or the collateral
+   * section was malformed; a lease the service reports as gone is
+   * dropped so the next use takes a new one, and the transaction the
+   * last witness was issued for is asked again on the lease it consumed
+   * rather than on a new one, so that a client that lost the answer gets
+   * the same witness set back and takes no second lease for it. In
+   * collateral mode the service answers the same transaction with the
+   * same witness set by itself; a refusal under the collateral rule drops
+   * the shared collateral held, so the next builder reads the current
+   * one.
    */
   async signTransaction(txCbor: string, _partialSign: boolean): Promise<VkeyWitnessSet> {
     const body = this.mode === 'fee' ? await this.witnessOnLease(txCbor) : await this.witnessOnCollateral(txCbor);
@@ -396,6 +404,9 @@ export class SponsorWallet implements Wallet {
         } else {
           this.consumed = undefined;
         }
+      } else if (error.rule === LEASE_COLLATERAL_RULE && repeat === undefined) {
+        this.held = undefined;
+        await this.giveBack(leaseId);
       }
       throw error;
     }
@@ -406,12 +417,21 @@ export class SponsorWallet implements Wallet {
     return (await response.json()) as WitnessBody;
   }
 
+  /**
+   * Gives a lease back to the pool without surfacing a failure to do so:
+   * the refusal that led here is what the caller learns of, and a lease
+   * the service would not release expires by itself.
+   */
+  private async giveBack(leaseId: string): Promise<void> {
+    await this.call('DELETE', `/v1/leases/${leaseId}`).catch(() => undefined);
+  }
+
   /** The witness set the collateral route answers for the transaction. */
   private async witnessOnCollateral(txCbor: string): Promise<CollateralWitnessBody> {
     const response = await this.call('POST', '/v1/collateral/witness', { transaction: txCbor });
     if (!response.ok) {
       const error = await this.errorOf(response);
-      if (error.rule === COLLATERAL_REPLACED) {
+      if (error.rule === SHARED_COLLATERAL_RULE) {
         this.held = undefined;
       }
       throw error;

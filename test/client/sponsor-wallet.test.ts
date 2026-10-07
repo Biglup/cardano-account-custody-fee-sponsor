@@ -258,6 +258,26 @@ describe('SponsorWallet', () => {
     expect(leaseStatuses()).toEqual(['released']);
   });
 
+  it('gives the lease back when the service says the collateral it named was replaced, and builds on the current one next', async () => {
+    await fundPool(2, 2);
+    const stale = await shapeCreation(await sponsor.createTransactionBuilder()).build();
+    const first = sponsor.lease?.leaseId;
+    expect(sponsor.lease?.collateral.txHash).toBe(txHash(200));
+    service.provider.removeUtxo({ txId: txHash(200), index: 0 });
+    await service.sync.run();
+
+    await expect(sponsor.signTransaction(stale, true)).rejects.toMatchObject({ status: 422, code: 'invalid_transaction', rule: 'uses_leased_collateral' });
+
+    expect(sponsor.lease).toBeUndefined();
+    expect(service.db.prepare('SELECT status FROM leases WHERE id = ?').get(first)).toEqual({ status: 'released' });
+    const fresh = await shapeCreation(await sponsor.createTransactionBuilder()).build();
+    expect(sponsor.lease?.leaseId).not.toBe(first);
+    expect(sponsor.lease?.collateral.txHash).toBe(txHash(201));
+    expect(parseTransaction(fresh).transaction?.collateralInputs).toEqual([{ txId: txHash(201), index: 0 }]);
+    expect(await sponsor.signTransaction(fresh, true)).toHaveLength(1);
+    expect(leaseStatuses()).toEqual(['released', 'consumed']);
+  });
+
   it('replaces an expired lease with a new one, and drops a lease the service reports as gone', async () => {
     await fundPool(3, 1);
     await sponsor.createTransactionBuilder();

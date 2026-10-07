@@ -39,7 +39,10 @@ export const toLeaseBody = (lease: Lease, collateral: PoolUtxo, settings: LeaseR
  * UTxO for the key and names the shared collateral UTxO alongside it;
  * deleting one releases it early so its fee UTxO returns to the pool;
  * posting a transaction to a lease's witness route has it checked against
- * the policy and, when it passes, signed by the sponsor.
+ * the policy and, when it passes, signed by the sponsor. A lease created
+ * while the shared collateral turns out to be gone is released at once,
+ * since the client never learns of it and it would otherwise hold its fee
+ * UTxO until it expires.
  */
 export const createLeaseRouter = (
   db: Database.Database,
@@ -56,8 +59,16 @@ export const createLeaseRouter = (
   router.post(
     '/',
     asyncHandler(async (_req, res) => {
-      const lease = await leases.create(apiKeyOf(res));
-      res.status(201).json(toLeaseBody(lease, await collateral.require(), settings));
+      const apiKey = apiKeyOf(res);
+      const lease = await leases.create(apiKey);
+      let shared: PoolUtxo;
+      try {
+        shared = await collateral.require();
+      } catch (err) {
+        leases.release(apiKey, lease.id);
+        throw err;
+      }
+      res.status(201).json(toLeaseBody(lease, shared, settings));
     }),
   );
 

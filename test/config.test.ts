@@ -95,6 +95,15 @@ describe('loadConfig', () => {
     );
   });
 
+  it('rejects fee and collateral sizes within 10 percent of each other, which the pool could never tell apart', () => {
+    expect(() => loadConfig({ ...validEnv(), FEE_UTXO_LOVELACE: '10000000', COLLATERAL_UTXO_LOVELACE: '9500000' })).toThrow(
+      /COLLATERAL_UTXO_LOVELACE: FEE_UTXO_LOVELACE and COLLATERAL_UTXO_LOVELACE must differ by more than 10 percent/,
+    );
+    expect(() => loadConfig({ ...validEnv(), FEE_UTXO_LOVELACE: '5000000', COLLATERAL_UTXO_LOVELACE: '5000000' })).toThrow(/differ by more than 10 percent/);
+    expect(() => loadConfig({ ...validEnv(), FEE_UTXO_LOVELACE: '5000000', COLLATERAL_UTXO_LOVELACE: '5500000' })).toThrow(/differ by more than 10 percent/);
+    expect(loadConfig({ ...validEnv(), FEE_UTXO_LOVELACE: '10000000', COLLATERAL_UTXO_LOVELACE: '8000000' }).collateralUtxoLovelace).toBe(8_000_000);
+  });
+
   it('rejects a malformed ACCOUNT_SCRIPT_HASH', () => {
     expect(() => loadConfig({ ...validEnv(), ACCOUNT_SCRIPT_HASH: 'not-a-hash' })).toThrow(/ACCOUNT_SCRIPT_HASH/);
   });

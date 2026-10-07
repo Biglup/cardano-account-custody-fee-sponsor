@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import { REPLENISH_FEE_MARGIN } from '../../src/pool/sizes.js';
 import { type TestService, createTestService, txHash } from '../support/service.js';
@@ -108,6 +108,25 @@ describe('POST /v1/leases', () => {
 
     expect(response.status).toBe(429);
     expect(response.body).toEqual({ error: 'quota_exceeded', detail: 'open_leases: at most 5 open leases per key' });
+  });
+
+  it('releases the lease it took when the shared collateral turns out to be gone, so its fee UTxO returns to the pool', async () => {
+    await fundPool(1, 1);
+    const { apiKey } = service.issueKey();
+    const require = service.collateral.require;
+    vi.spyOn(service.collateral, 'require').mockImplementationOnce(async () => {
+      service.provider.removeUtxo({ txId: txHash(200), index: 0 });
+      await service.sync.run();
+      return require();
+    });
+
+    const response = await request(service.app).post('/v1/leases').set(bearer(apiKey));
+
+    expect(response.status).toBe(503);
+    expect(response.body).toEqual({ error: 'out_of_funds', detail: expect.stringMatching(/^The pool has no collateral UTxO and the reserve holds 0 lovelace/) });
+    expect(service.db.prepare('SELECT status FROM leases').all()).toEqual([{ status: 'released' }]);
+    const health = await request(service.app).get('/health');
+    expect(health.body.pool).toEqual({ fee: { free: 1, leased: 0 }, collateral: { shared: false, spare: 0, consumed: 1 } });
   });
 
   it('answers 503 out_of_funds when the pool is empty and the reserve cannot fund a split', async () => {

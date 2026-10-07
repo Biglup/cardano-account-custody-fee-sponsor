@@ -112,7 +112,14 @@ its own address and the warning is harmless.
   once and stored as its SHA-256 hash. Quotas: `openLeases`,
   `witnessesPerHour`, `sponsoredLovelacePerDay`.
 - `GET /admin/pool` shows the pool counts, the reserve, the shared
-  collateral UTxO with the time it was chosen, and every live UTxO.
+  collateral UTxO with the time it was chosen, and every live UTxO. A
+  shared collateral UTxO marked consumed stays consumed even when the
+  chain lists it again after a rollback, since the pool never designates
+  it a second time and never spends it; an operator reclaims it by
+  spending it from the sponsor wallet by hand. Spent alone, its change
+  lands within a tenth of the collateral size and the next sync takes it
+  up as a fresh free collateral UTxO; merged with other value, the next
+  sync sees the change as reserve. Either way it is back in use.
 - `GET /admin/audit?since=<ISO 8601>&limit=<n>` lists the audit trail from
   `since` (the beginning without it), oldest first, at most `limit`
   entries (100 without it, 1000 at most), each with its id, time, key id,
@@ -305,14 +312,19 @@ const txId = await sponsor.submitTransaction(Cometa.applyVkeyWitnessSet(tx, witn
   spendable UTxO and a coin selector that adds none, the shared UTxO as
   the collateral with its return to the sponsor, the provider as the
   evaluator, and the validity upper bound at now plus `validitySeconds`
-  less a minute; the client adds the account's control and fund UTxOs as
-  inputs and sets the change address to the account, since an output to
-  the sponsor is refused in this mode. `signTransaction` posts to the
-  collateral witness route; the same transaction signed again receives
-  the same witness set, and a refusal saying the shared collateral was
-  replaced drops the one held so the next builder reads the current one.
-  `release()` forgets what the wallet holds in either mode, waiting for a
-  lease still being taken and giving that one back.
+  less a minute; the contract's builders, given the wallet as their
+  `collateral`, add the account's control and fund UTxOs as inputs and
+  set the change address to the account, since an output to the sponsor
+  is refused in this mode. `signTransaction` posts to the collateral
+  witness route; the same transaction signed again receives the same
+  witness set, and a refusal under the collateral rule drops the
+  collateral held so the next builder reads the current one. In fee
+  mode a refusal under the collateral rule, `uses_leased_collateral`,
+  gives the lease back, whether the shared UTxO the lease named was
+  replaced or the collateral section was malformed, and the next use
+  takes a new lease naming the current one. `release()` forgets what the
+  wallet holds in either mode, waiting for a lease still being taken and
+  giving that one back.
 - Any cometa object passed into the adapter's builder, such as a script
   or a reward address, must come from the same copy of cometa the adapter
   runs on. cometa keeps its WebAssembly state per loaded copy, and an
@@ -333,24 +345,48 @@ anything, since the withdrawal lands in the sponsor's change, and `addDevice`,
 `issueGrant` and `rewriteState` with a sponsor are refused once the
 larger state raises the control output's minimum lovelace above what it
 holds; the other owner operations with a sponsor pass while the control
-output keeps its lovelace. Owner operations the service will not pay for
-are built paid from the account's own funds, with the sponsor contributing
-the collateral through the adapter in collateral mode and the device
-wallet only signing.
+output keeps its lovelace. Owner operations paid from the account take the
+adapter in collateral mode as their `collateral` wallet instead:
+
+```ts
+const collateral = new SponsorWallet({ baseUrl, apiKey, provider, mode: 'collateral' });
+const tx = await spendWithDevice({ owner, wallet: ownerWallet, collateral, provider, outputs });
+const witnesses = [...(await collateral.signTransaction(tx, true)), ...(await ownerWallet.signTransaction(tx, true))];
+```
+
+The contract's builder then pays the outputs, the fee and the control
+output's growth from the account's fund UTxOs, returns the change to the
+account, declares the shared collateral with its return to the sponsor
+and spends no sponsor UTxO, which is exactly what the policy accepts in
+collateral mode; the device wallet only signs. Every owner operation,
+stake operation and grant spend on an existing account takes the option,
+so an owner or agent wallet that holds no ADA of its own can operate the
+account with the service standing behind the collateral alone.
 
 ## Preprod proof
 
 `npm run preprod-e2e` runs the whole loop against preprod and spends
 test ADA from the sponsor wallet: it starts the service in this process
 from `.env` on a free local port, issues a client key, replenishes the
-pool when fewer than three fee UTxOs are free, creates a custody account
-for a fresh owner wallet that holds no ADA (an account index of the
-sponsor mnemonic from 10 upwards whose stake credential is not
-registered) through the contract's `createAccount` with `SponsorWallet`
-as the sponsor, checks the control UTxO, the registration and the
-amounts on chain, has the service refuse a creation that also pays
-sponsor value to a third party and the reuse of the consumed lease, and
-writes [docs/preprod-evidence.md](docs/preprod-evidence.md).
+pool when fewer than three fee UTxOs are free, and takes a custody
+account through its life with the service as the only source of sponsor
+funds and collateral. The owner, the agent and the recipient wallets are
+account indexes of the sponsor mnemonic from 10 upwards whose stake
+credential is not registered, and the owner and the agent hold no ADA at
+any point. In order: a sponsored creation through the contract's
+`createAccount` with `SponsorWallet` in fee mode as the sponsor, checked
+on chain; a deposit of 50 tADA from the sponsor wallet's reserve, built
+outside the service as any funding wallet would; an owner spend of 5
+tADA, a grant to the agent key, an agent spend within its cap and the
+grant's revocation, each paid from the account with the adapter in
+collateral mode as the builder's `collateral` wallet and signed by the
+device or agent key and the service; an agent spend over the cap, built
+without the builder's checks, which the service refuses under
+`evaluates` once the provider's phase two evaluation fails; and the two
+refused creations, one paying sponsor value to a third party and the
+reuse of the consumed creation lease. Every confirmation is waited for
+with a bounded poll, and [docs/preprod-evidence.md](docs/preprod-evidence.md)
+records every transaction, what each party paid and every refusal body.
 
 The script builds through the contract's off-chain library, linked from
 the sibling checkout described under Running, which must be built there

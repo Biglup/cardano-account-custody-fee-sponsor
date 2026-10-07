@@ -85,7 +85,7 @@ pool sync marks the vanished UTxO consumed, records it on the audit trail,
 designates the next free collateral UTxO, and the health endpoint reports
 the count of consumed ones, so a failure of the reasoning is visible
 rather than repeated. A transaction already signed against the old UTxO
-cannot land, since its collateral no longer exists, and the fee UTxO it
+cannot land once the chain has spent it, and the fee UTxO it
 leased returns to the pool once its bound lapses, as any unsubmitted
 witness does.
 
