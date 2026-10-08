@@ -5,7 +5,6 @@ import {
   type AccountState,
   type Blueprint,
   type Grant,
-  LOGIC_V2_TITLE,
   applyParameters,
   bytes,
   currentLogicScript,
@@ -18,7 +17,6 @@ import {
   encodeStakeRedeemer,
   logicScriptHash,
   logicValidator,
-  logicVersionScript,
   stakeScript as contractStakeScript,
 } from 'cardano-account-custody-offchain';
 import { Cometa } from '../../src/cometa.js';
@@ -118,14 +116,11 @@ export const logicScript: PlutusScript = currentLogicScript(accountScriptHash, b
 export const logicHash = logicScriptHash(logicScript);
 
 /**
- * The second logic version the blueprint carries, applied to the proxy
- * hash: a real script an upgrade can move an account to, which the
- * service serves only once an operator names its hash.
+ * A logic the contract ships no build of: the shipped validator under
+ * another parameter, which is a real script that runs and hashes to a
+ * credential of its own, and so stands both for rules nobody has read
+ * and for a second logic an operator names alongside the shipped one.
  */
-export const logicV2Script: PlutusScript = logicVersionScript(LOGIC_V2_TITLE, accountScriptHash, blueprint);
-export const logicV2Hash = logicScriptHash(logicV2Script);
-
-/** A logic the blueprint carries no version of: the current validator under another parameter, which stands for rules nobody has read. */
 export const otherLogicScript: PlutusScript = plutusScript(applyParameters(logicValidator(blueprint).compiledCode, [bytes(OTHER_LOGIC_PARAMETER)]));
 export const otherLogicHash = logicScriptHash(otherLogicScript);
 
@@ -207,8 +202,8 @@ export const initialState: PlutusData = initialStateOf(DEVICE_KEY);
 /** The inline datum of a freshly created account naming `logic` in place of the one the fixtures run. */
 export const stateUnderLogic = (logic: string): PlutusData => encodeAccountState(initialStateUnder(logic));
 
-/** The control datum of an account that has upgraded to the contract's second logic version. */
-export const stateUnderLogicV2: PlutusData = stateUnderLogic(logicV2Hash);
+/** The control datum of an account that has upgraded to the other logic. */
+export const stateUnderOtherLogic: PlutusData = stateUnderLogic(otherLogicHash);
 
 /**
  * A control datum whose first field is not a script hash, as a client
@@ -355,11 +350,8 @@ export const parkedProxyUtxo: UTxO = parkedScriptUtxo(PARKED_SCRIPTS_TX, 0, acco
 /** The parked UTxO a transaction references the logic the fixture accounts run from. */
 export const parkedLogicUtxo: UTxO = parkedScriptUtxo(PARKED_SCRIPTS_TX, 1, logicScript);
 
-/** The parked UTxO an upgrade references the contract's second logic version from. */
-export const parkedLogicV2Utxo: UTxO = parkedScriptUtxo(PARKED_SCRIPTS_TX, 2, logicV2Script);
-
-/** The parked UTxO the unknown logic sits at, which a transaction may reference without any account naming it. */
-export const parkedOtherLogicUtxo: UTxO = parkedScriptUtxo(PARKED_SCRIPTS_TX, 3, otherLogicScript);
+/** The parked UTxO the other logic sits at, which an upgrade references and a transaction may reference without any account naming it. */
+export const parkedOtherLogicUtxo: UTxO = parkedScriptUtxo(PARKED_SCRIPTS_TX, 2, otherLogicScript);
 
 /** A UTxO at an address paying to a script, which only a transaction running that script can spend. */
 export const scriptUtxo = (txId: string, address: string, lovelace: bigint): UTxO => ({

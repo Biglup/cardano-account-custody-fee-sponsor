@@ -20,12 +20,10 @@ import {
   grantUtxo,
   grantedState,
   logicHash,
-  logicV2Hash,
   operateRedeemer,
   otherLogicHash,
   otherStakeScriptHash,
   parkedLogicUtxo,
-  parkedLogicV2Utxo,
   parkedOtherLogicUtxo,
   parkedProxyUtxo,
   reserveUtxo,
@@ -36,7 +34,7 @@ import {
   stakeScriptHash,
   stateNftAssetId,
   stateUnderLogic,
-  stateUnderLogicV2,
+  stateUnderOtherLogic,
   stateWithoutLogic,
   strangerAddress,
   sweepGrantRedeemer,
@@ -102,7 +100,7 @@ const placeAccount = (): { control: UTxO; fund: UTxO } => {
 
 /** Puts the UTxOs the proxy and the logics are parked at on the fake chain, as the setup of a network leaves them. */
 const placeParkedScripts = (): void => {
-  for (const parked of [parkedProxyUtxo, parkedLogicUtxo, parkedLogicV2Utxo, parkedOtherLogicUtxo]) {
+  for (const parked of [parkedProxyUtxo, parkedLogicUtxo, parkedOtherLogicUtxo]) {
     service.provider.addUtxo(parked);
   }
 };
@@ -119,13 +117,13 @@ const placeGrantedAccount = (): { control: UTxO; grant: UTxO; fund: UTxO } => {
 };
 
 /**
- * Rebuilds the service naming both of the blueprint's logic versions, as
- * an operator opening an upgrade window configures it; the default names
- * the current version alone.
+ * Rebuilds the service naming a second logic alongside the shipped one,
+ * as an operator opening an upgrade window configures it; the default
+ * names the shipped logic alone.
  */
 const serveBothLogics = async (): Promise<void> => {
   service.close();
-  service = await createTestService({ KNOWN_LOGIC_HASHES: `${logicHash},${logicV2Hash}` });
+  service = await createTestService({ KNOWN_LOGIC_HASHES: `${logicHash},${otherLogicHash}` });
   apiKey = service.issueKey().apiKey;
 };
 
@@ -602,15 +600,15 @@ describe('collateral mode policy', () => {
   it('known_logic: witnesses an operation on an account that has upgraded to a second logic the operator names', async () => {
     await serveBothLogics();
     await fundPool();
-    const control = controlUtxo(txHash(300), undefined, stateUnderLogicV2);
+    const control = controlUtxo(txHash(300), undefined, stateUnderOtherLogic);
     const fund = fundUtxo(txHash(301), 20_000_000n);
     service.provider.addUtxo(control);
     service.provider.addUtxo(fund);
     const shared = await collateral();
 
-    const transaction = await buildAccountPaidOperation(service, shared, control, fund, { logic: logicV2Hash });
+    const transaction = await buildAccountPaidOperation(service, shared, control, fund, { logic: otherLogicHash });
     const parsed = parseTransaction(transaction).transaction;
-    expect(parsed?.withdrawals.map((withdrawal) => withdrawal.credential?.hash)).toEqual([logicV2Hash]);
+    expect(parsed?.withdrawals.map((withdrawal) => withdrawal.credential?.hash)).toEqual([otherLogicHash]);
 
     const response = await witness(transaction);
 
@@ -626,10 +624,10 @@ describe('collateral mode policy', () => {
     const { control, fund } = placeAccount();
     const shared = await collateral();
 
-    const transaction = await buildUpgrade(service, shared, control, fund, logicV2Hash, { referenced: true });
+    const transaction = await buildUpgrade(service, shared, control, fund, otherLogicHash, { referenced: true });
     const parsed = parseTransaction(transaction).transaction;
-    expect(parsed?.withdrawals.map((withdrawal) => withdrawal.credential?.hash).sort()).toEqual([logicHash, logicV2Hash].sort());
-    expect(parsed?.outputs.find((output) => output.assets[stateNftAssetId] === 1n)?.logicHash).toBe(logicV2Hash);
+    expect(parsed?.withdrawals.map((withdrawal) => withdrawal.credential?.hash).sort()).toEqual([logicHash, otherLogicHash].sort());
+    expect(parsed?.outputs.find((output) => output.assets[stateNftAssetId] === 1n)?.logicHash).toBe(otherLogicHash);
 
     const response = await witness(transaction);
 

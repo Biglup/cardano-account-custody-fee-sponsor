@@ -19,12 +19,9 @@ import {
   initialStateUnder,
   logicHash,
   logicScript,
-  logicV2Hash,
-  logicV2Script,
   otherLogicHash,
   otherLogicScript,
   parkedLogicUtxo,
-  parkedLogicV2Utxo,
   parkedOtherLogicUtxo,
   parkedProxyUtxo,
   operateRedeemer,
@@ -188,17 +185,15 @@ export const collateralClientBuilder = (service: TestService, collateral: Collat
 /** A Plutus data value as an inline datum. */
 const inlineDatum = (data: PlutusData): { type: typeof Cometa.DatumType.InlineData; inlineDatum: PlutusData } => ({ type: Cometa.DatumType.InlineData, inlineDatum: data });
 
-/** The logic scripts the fixtures hold, by hash: the blueprint's two versions and the one standing for rules the service has not read. */
+/** The logic scripts the fixtures hold, by hash: the shipped logic and the other one, which stands for a logic outside the blueprint. */
 const logicScripts: ReadonlyMap<string, PlutusScript> = new Map([
   [logicHash, logicScript],
-  [logicV2Hash, logicV2Script],
   [otherLogicHash, otherLogicScript],
 ]);
 
 /** The UTxO each of those logics is parked at. */
 const parkedLogicUtxos: ReadonlyMap<string, UTxO> = new Map([
   [logicHash, parkedLogicUtxo],
-  [logicV2Hash, parkedLogicV2Utxo],
   [otherLogicHash, parkedOtherLogicUtxo],
 ]);
 

@@ -669,19 +669,21 @@ Requires Node 22.
    anything else, since the stake validator of another build would
    admit creations the configured proxy does not govern. The `file:`
    dependency and the continuous integration workflow are pinned to
-   contract commit `cf3e20ddbe5f51ef40411b37d045e581c89dc1b2`, the one
+   contract commit `155b32b720ed3e34c183c323faea48f12ddaf510`, the one
    whose builders the preprod proof builds on and whose blueprint
    `contract/plutus.json` is a copy of, which the workflow compares byte
    for byte against the pinned checkout; `package-lock.json` must be
    regenerated whenever the contract's off-chain package changes its
-   dependencies. The pinned commit is revision 3 of the validators, with
-   a permanent account proxy at hash
+   dependencies. The pinned commit is revision 3 of the validators, and
+   its blueprint holds the three a network deploys and nothing else: a
+   permanent account proxy at hash
    `ed61963ac94d12c0b320be5a336c36af66bc02c380e0aa3001899253`, which is
    what `ACCOUNT_SCRIPT_HASH` must name, the account's rules in a
-   replaceable logic script, whose current version applied to that proxy
-   hashes to `2cd68e398bdf9fbc8d257614b54403451ee722520ec785fe14f8df5a`,
-   which is what `KNOWN_LOGIC_HASHES` defaults to, and the stake
-   validator applied to the same proxy hash.
+   replaceable logic script, which applied to that proxy hashes to
+   `2cd68e398bdf9fbc8d257614b54403451ee722520ec785fe14f8df5a`, which is
+   what `KNOWN_LOGIC_HASHES` defaults to, and the stake validator, which
+   an account's stake credential is an application of to a device key and
+   the same proxy hash.
 3. Start the service with `npm run dev`, or `npm run start` without the
    file watcher.
 
