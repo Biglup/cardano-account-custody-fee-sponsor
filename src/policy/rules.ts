@@ -648,6 +648,8 @@ const noSponsorValueElsewhere: Rule = ({ transaction, otherInputs, foreignOutput
  * appears on a certificate, so it is allowed only where the account
  * needs it: as the credential of a withdrawal, and as an attached script
  * for a transaction that embeds it rather than referencing a parked one.
+ * A logic runs on a withdrawal of zero, so one that draws lovelace is
+ * refused here as well.
  */
 const noForeignScripts: Rule = ({ transaction, inputs, stakeScriptHashes, logicHashes }, { accountScriptHash }) => {
   const allowed = new Set([accountScriptHash, ...stakeScriptHashes]);
@@ -675,6 +677,12 @@ const noForeignScripts: Rule = ({ transaction, inputs, stakeScriptHashes, logicH
   for (const withdrawal of transaction.withdrawals) {
     if (isScript(withdrawal.credential) && !runnable.has(withdrawal.credential.hash)) {
       return violation('no_foreign_scripts', `A withdrawal draws from script ${unrunnable(withdrawal.credential.hash)}`);
+    }
+    if (isScript(withdrawal.credential) && logicHashes.has(withdrawal.credential.hash) && withdrawal.lovelace !== 0n) {
+      return violation(
+        'no_foreign_scripts',
+        `The withdrawal that runs logic ${withdrawal.credential.hash} draws ${withdrawal.lovelace} lovelace, and a logic runs on a withdrawal of zero`,
+      );
     }
   }
   for (const voter of transaction.voters) {

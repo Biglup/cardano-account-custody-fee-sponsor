@@ -495,6 +495,20 @@ describe('collateral mode policy', () => {
     expect(witnessCount()).toBe(1);
   });
 
+  it('no_foreign_scripts: refuses a withdrawal that runs the logic but draws lovelace, since a logic runs on zero', async () => {
+    await fundPool();
+    const { control, grant, fund } = placeGrantedAccount();
+    const shared = await collateral();
+
+    const paid = await buildAgentSpend(service, shared, { control, grant, fund }, { logicAmount: 1_000_000n });
+    expectViolation(
+      await witness(paid),
+      'no_foreign_scripts',
+      new RegExp(`The withdrawal that runs logic ${logicHash} draws 1000000 lovelace, and a logic runs on a withdrawal of zero`),
+    );
+    expect(witnessCount()).toBe(0);
+  });
+
   it('known_logic: refuses an operation whose control UTxO names a logic the service does not know, spent or referenced', async () => {
     await fundPool();
     const control = controlUtxo(txHash(300), undefined, stateUnderLogic(otherLogicHash));

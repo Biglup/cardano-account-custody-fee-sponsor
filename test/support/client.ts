@@ -58,6 +58,11 @@ export interface ClientOptions {
    * said otherwise.
    */
   logic?: string;
+  /**
+   * The lovelace the logic withdrawal draws, zero unless said otherwise,
+   * for a transaction built to be refused for drawing anything.
+   */
+  logicAmount?: bigint;
   customise?: Customise;
 }
 
@@ -204,14 +209,19 @@ const attachProxy = (builder: TransactionBuilder, options: ClientOptions): Trans
 /**
  * Runs a logic over the transaction, as the proxy requires of every
  * account transaction but a plain deposit: a withdrawal of zero from the
- * logic's reward account under the Run redeemer, with the logic script
+ * logic's reward account under the Run redeemer, or of whatever
+ * `logicAmount` says, with the logic script
  * attached or referenced from the UTxO it is parked at. The logic the
  * fixture accounts run is the one withdrawn from unless another is named.
  */
-export const runLogic = (builder: TransactionBuilder, options: ClientOptions = {}, logic: string = options.logic ?? logicHash): TransactionBuilder => {
+export const runLogic = (
+  builder: TransactionBuilder,
+  options: ClientOptions = {},
+  logic: string = options.logic ?? logicHash,
+): TransactionBuilder => {
   const parked = options.referenced === true ? parkedLogicUtxoOf(logic) : undefined;
   const attached = parked === undefined ? builder.addScript(logicScriptOf(logic)) : builder.addReferenceInput(parked);
-  return attached.withdrawRewards({ rewardAddress: rewardAddressOf(logic), amount: 0n, redeemer: runRedeemer });
+  return attached.withdrawRewards({ rewardAddress: rewardAddressOf(logic), amount: options.logicAmount ?? 0n, redeemer: runRedeemer });
 };
 
 /**
