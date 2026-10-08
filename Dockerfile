@@ -20,7 +20,7 @@
 
 # The base image is pinned by digest in both stages so that a build is
 # reproducible; dependabot proposes the bumps.
-FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS builder
+FROM node:25-bookworm-slim@sha256:81db02c4b671288a03915da9534dbd54f96d0e7c24d80ccc54f5b36b2e684370 AS builder
 
 # better-sqlite3, the only native addon, ships its prebuilt binaries for
 # linux amd64 and arm64 inside the package and compiles nothing. npm ci
@@ -51,7 +51,7 @@ RUN npm run build \
     && npm prune --omit=dev
 
 # ---
-FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
+FROM node:25-bookworm-slim@sha256:81db02c4b671288a03915da9534dbd54f96d0e7c24d80ccc54f5b36b2e684370
 
 LABEL org.opencontainers.image.source=https://github.com/Biglup/cardano-account-custody-fee-sponsor
 LABEL org.opencontainers.image.description="Fee sponsor service for the Cardano account custody contract"
