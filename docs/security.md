@@ -38,7 +38,9 @@ sponsor's value from going anywhere but the fee and the account:
 
 - `uses_leased_fee_input` stops the transaction from spending any sponsor
   UTxO but the one leased, including the shared collateral used as a plain
-  input, the reserve, and anything at the sponsor payment key elsewhere.
+  input, the sponsor's reserve, which is the wallet's UTxOs outside the
+  pool and not an account's reserve under the contract, and anything at
+  the sponsor payment key elsewhere.
   In collateral mode `no_sponsor_inputs` refuses every sponsor input,
   the shared collateral included, so the only sponsor UTxO a transaction
   on that route touches is the collateral it declares.
@@ -57,8 +59,11 @@ sponsor's value from going anywhere but the fee and the account:
   the account policy held at the sponsor address, which the sponsor
   input rules refuse first, and a grant shaped token under any other
   policy are all refused.
-- `sponsor_outflow_bounded` ties what the fee UTxO is drawn down by to the
-  fee, plus the registration deposit and the control output at creation,
+- `sponsor_outflow_bounded` lets a leased fee UTxO pay for an account
+  creation and for nothing else: an operation on an existing account is
+  refused on the fee route whatever it draws, so the sponsor's exposure
+  in fee mode is to creations alone. It ties what the fee UTxO is drawn
+  down by to the fee, the registration deposit and the control output,
   capped by `MAX_FEE_LOVELACE` and `MAX_SPONSORED_LOVELACE`; nothing is
   paid out to a third party and what comes back to the sponsor is one
   change output in a shape the pool can spend, never change fragmented
@@ -132,11 +137,10 @@ witnessed fee UTxO is held for the lease TTL plus the margin plus the
 restore slots, fourteen minutes with the defaults, and a key may take a
 fresh witness on it as soon as it returns. With the defaults, one key at
 60 witnesses per hour can hold the ten default fee UTxOs out of the pool
-by never submitting, for about two hours when it presents creations,
-which sponsor up to `MAX_SPONSORED_LOVELACE` each until the daily
-sponsored lovelace quota ends it, and for as long as the hourly quota
-lasts when it operates an account of its own, which sponsors the fee
-alone. Size `witnessesPerHour` against `FEE_UTXO_COUNT` for each key:
+by never submitting, for about two hours: every fee mode witness is a
+creation, which sponsors up to `MAX_SPONSORED_LOVELACE`, until the daily
+sponsored lovelace quota ends it. Size `witnessesPerHour` against
+`FEE_UTXO_COUNT` for each key:
 holding one fee UTxO continuously takes about four witnesses per hour at
 the default TTL and margin, so a key allowed fewer than four times
 `FEE_UTXO_COUNT` witnesses per hour cannot freeze the pool by itself,
@@ -204,10 +208,11 @@ valid for as long as its bound allows.
 
 ## What the sponsor can lose
 
-- Per witnessed transaction: at most `MAX_SPONSORED_LOVELACE`, of which at
-  most `MAX_FEE_LOVELACE` is the fee and the rest, at creation only, the
-  registration deposit and the control output's lovelace, both of which
-  end up in the account.
+- Per witnessed transaction in fee mode, which is always an account
+  creation: at most `MAX_SPONSORED_LOVELACE`, of which at most
+  `MAX_FEE_LOVELACE` is the fee and the rest the registration deposit and
+  the control output's lovelace, both of which end up in the account. A
+  witness in collateral mode sponsors nothing.
 - Per key and day: at most `sponsoredLovelacePerDay`, enforced whatever
   the number of requests in flight.
 - Per phase two failure the policy failed to foresee: at most

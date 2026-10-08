@@ -193,7 +193,7 @@ export const shapeOwnerOperation = (builder: TransactionBuilder, control: UTxO, 
   return builder.addSigner(device).addScript(accountScript);
 };
 
-/** Builds an owner operation on the lease, with the sponsor paying the fee. */
+/** Builds an owner operation on the lease, with the sponsor paying the fee, which the fee route refuses. */
 export const buildOwnerOperation = async (
   service: TestService,
   lease: LeaseBody,
@@ -261,23 +261,16 @@ export const buildReservePaidOperation = async (
 };
 
 /**
- * Builds an agent spend paid from the account, as the contract's builder
- * does with a collateral wallet: the grant UTxO is spent with the grant
- * redeemer and recreated with the same value and the grant's remaining
- * cap reduced by the payout and the fee bound, a fund UTxO is spent with
- * the fund redeemer and pays the fee and the payout with the change back
- * to the account, the control UTxO is referenced and never spent, the
- * grantee signs, and the sponsor contributes the shared collateral only.
+ * Shapes a builder into an agent spend: the grant UTxO is spent with the
+ * grant redeemer and recreated with the same value and the grant's
+ * remaining cap reduced by the payout and the fee bound, a fund UTxO is
+ * spent with the fund redeemer and pays the payout, the control UTxO is
+ * referenced and never spent, and the grantee signs; whatever the
+ * builder spends pays the fee.
  */
-export const buildAgentSpend = async (
-  service: TestService,
-  collateral: CollateralBody,
-  { control, grant, fund }: AgentSpendUtxos,
-  options: AgentSpendOptions = {},
-): Promise<string> => {
+const shapeAgentSpend = (builder: TransactionBuilder, { control, grant, fund }: AgentSpendUtxos, options: AgentSpendOptions): TransactionBuilder => {
   const lovelace = options.lovelace ?? AGENT_SPEND_LOVELACE;
   const spent = options.grant ?? fixtureGrant;
-  const builder = collateralClientBuilder(service, collateral, options);
   if (control !== undefined) {
     builder.addReferenceInput(control);
   }
@@ -287,5 +280,18 @@ export const buildAgentSpend = async (
   builder.sendLovelace({ address: options.recipient ?? strangerAddress, amount: lovelace });
   builder.addSigner(options.grantee ?? AGENT_KEY).addScript(accountScript);
   options.customise?.(builder);
-  return builder.build();
+  return builder;
 };
+
+/**
+ * Builds an agent spend paid from the account, as the contract's builder
+ * does with a collateral wallet: the fund UTxO pays the fee and the
+ * payout with the change back to the account, and the sponsor
+ * contributes the shared collateral only.
+ */
+export const buildAgentSpend = (service: TestService, collateral: CollateralBody, utxos: AgentSpendUtxos, options: AgentSpendOptions = {}): Promise<string> =>
+  shapeAgentSpend(collateralClientBuilder(service, collateral, options), utxos, options).build();
+
+/** Builds an agent spend on the lease, with the leased fee UTxO spent and the sponsor paying the fee, which the fee route refuses. */
+export const buildAgentSpendOnLease = (service: TestService, lease: LeaseBody, utxos: AgentSpendUtxos, options: AgentSpendOptions = {}): Promise<string> =>
+  shapeAgentSpend(clientBuilder(service, lease, options).addInput({ utxo: sponsorUtxo(lease.fee) }), utxos, options).build();

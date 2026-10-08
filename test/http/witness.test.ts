@@ -23,6 +23,8 @@ import {
   foreignScriptHash,
   fundUtxo,
   grantAssetId,
+  grantUtxo,
+  grantedState,
   initialState,
   operateRedeemer,
   pointerAddress,
@@ -33,7 +35,7 @@ import {
   stateNftAssetId,
   strangerAddress,
 } from '../support/account.js';
-import { buildCreation, buildOwnerOperation, clientBuilder, sponsorUtxo, lenientEvaluator, underDeclaringEvaluator } from '../support/client.js';
+import { buildAgentSpendOnLease, buildCreation, buildOwnerOperation, clientBuilder, sponsorUtxo, lenientEvaluator, underDeclaringEvaluator } from '../support/client.js';
 import { type TestService, createTestService, txHash } from '../support/service.js';
 import {
   authCommitteeHotCertificate,
@@ -42,8 +44,8 @@ import {
   outputWithReferenceScript,
   poolRegistrationCertificate,
   updateDRepCertificate,
-  withCertificates,
   withCollateralReturn,
+  withExtraCertificates,
   withExtraOutput,
   withInfoProposal,
   withTotalCollateral,
@@ -151,20 +153,6 @@ describe('POST /v1/leases/:id/witness', () => {
     const audit = service.db.prepare("SELECT outcome, detail FROM audit WHERE action = 'witness'").all() as { outcome: string; detail: string }[];
     expect(audit).toHaveLength(1);
     expect(JSON.parse(audit[0]?.detail ?? '{}')).toMatchObject({ leaseId: taken.leaseId, txHash: parsed?.hash, kind: 'creation' });
-  });
-
-  it('witnesses a valid owner operation', async () => {
-    await fundPool();
-    const control = placeControl();
-    const taken = await lease();
-    const transaction = await buildOwnerOperation(service, taken, control);
-
-    const response = await witness(taken.leaseId, transaction);
-
-    expect(response.status).toBe(200);
-    expectSponsorWitness(response.body.witnessSet, transaction, [sponsorUtxo(taken.fee), sponsorUtxo(taken.collateral), control]);
-    const row = service.db.prepare('SELECT sponsored_lovelace FROM witnesses WHERE lease_id = ?').get(taken.leaseId) as { sponsored_lovelace: number };
-    expect(BigInt(row.sponsored_lovelace)).toBe(parseTransaction(transaction).transaction?.fee);
   });
 
   it('answers the same witness set again for the same transaction on a consumed lease', async () => {
@@ -604,15 +592,24 @@ describe('transaction policy', () => {
     expectViolation(await witness(taken.leaseId, transaction), 'account_transaction', /staked to the registered stake credential/);
   });
 
-  it('sponsor_outflow_bounded: refuses a payout to a third party drawn from the sponsor input', async () => {
+  it('sponsor_outflow_bounded: refuses an owner operation and an agent spend, since a leased fee UTxO pays for account creation only', async () => {
     await fundPool();
-    const control = placeControl();
+    const control = controlUtxo(txHash(300), undefined, grantedState);
+    const grant = grantUtxo(txHash(302));
+    const fund = fundUtxo(txHash(301), 20_000_000n);
+    for (const utxo of [control, grant, fund]) {
+      service.provider.addUtxo(utxo);
+    }
     const taken = await lease();
-    const transaction = await buildOwnerOperation(service, taken, control, {
-      customise: (builder) => builder.sendLovelace({ address: strangerAddress, amount: 1_000_000n }),
-    });
+    const creationOnly = /The leased fee UTxO pays for an account creation only; an operation on an existing account pays its own fee and takes the collateral route/;
 
-    expectViolation(await witness(taken.leaseId, transaction), 'sponsor_outflow_bounded', /drawn down by \d+ lovelace but the fee accounts for \d+/);
+    expectViolation(await witness(taken.leaseId, await buildOwnerOperation(service, taken, control)), 'sponsor_outflow_bounded', creationOnly);
+    expectViolation(await witness(taken.leaseId, await buildAgentSpendOnLease(service, taken, { control, grant, fund })), 'sponsor_outflow_bounded', creationOnly);
+    expect((service.db.prepare('SELECT COUNT(*) AS count FROM witnesses').get() as { count: number }).count).toBe(0);
+
+    const creation = await witness(taken.leaseId, await buildCreation(service, taken));
+    expect(creation.status).toBe(200);
+    expect(lastWitnessAudit()).toMatchObject({ outcome: 'issued', detail: { leaseId: taken.leaseId, kind: 'creation' } });
   });
 
   it('sponsor_outflow_bounded: refuses a fee above the fee limit', async () => {
@@ -647,11 +644,10 @@ describe('transaction policy', () => {
     );
   });
 
-  it('sponsor_outflow_bounded: refuses change fragmented over two outputs to the sponsor, even when the sponsor is drawn down by the fee alone', async () => {
+  it('sponsor_outflow_bounded: refuses change fragmented over two outputs to the sponsor, even when the sponsor is drawn down by what the creation costs alone', async () => {
     await fundPool();
-    const control = placeControl();
     const taken = await lease();
-    const transaction = await buildOwnerOperation(service, taken, control, {
+    const transaction = await buildCreation(service, taken, {
       customise: (builder) => builder.sendLovelace({ address: taken.sponsorAddress, amount: 2_000_000n }),
     });
     const parsed = parseTransaction(transaction).transaction;
@@ -662,10 +658,9 @@ describe('transaction policy', () => {
 
   it('sponsor_outflow_bounded: refuses an output to the sponsor carrying a datum or a reference script', async () => {
     await fundPool();
-    const control = placeControl();
     const taken = await lease();
 
-    const withDatum = await buildOwnerOperation(service, taken, control, {
+    const withDatum = await buildCreation(service, taken, {
       customise: (builder) =>
         builder.lockValue({
           scriptAddress: taken.sponsorAddress,
@@ -675,34 +670,29 @@ describe('transaction policy', () => {
     });
     expectViolation(await witness(taken.leaseId, withDatum), 'sponsor_outflow_bounded', /output to the sponsor carries a datum/);
 
-    const withScript = withExtraOutput(
-      await buildOwnerOperation(service, taken, control),
-      outputWithReferenceScript(taken.sponsorAddress, 3_000_000n, foreignScript),
-    );
+    const withScript = withExtraOutput(await buildCreation(service, taken), outputWithReferenceScript(taken.sponsorAddress, 3_000_000n, foreignScript));
     expectViolation(await witness(taken.leaseId, withScript), 'sponsor_outflow_bounded', /output to the sponsor carries a reference script/);
   });
 
   it('no_sponsor_value_elsewhere: refuses value to a foreign address that the non sponsor inputs do not cover', async () => {
     await fundPool();
-    const control = placeControl();
     const taken = await lease();
-    const transaction = await buildOwnerOperation(service, taken, control, {
+    const transaction = await buildCreation(service, taken, {
       customise: (builder) => {
         builder.withdrawRewards({ rewardAddress: sponsorRewardAddress(), amount: 3_000_000n });
         builder.sendLovelace({ address: strangerAddress, amount: 3_000_000n });
       },
     });
 
-    expectViolation(await witness(taken.leaseId, transaction), 'no_sponsor_value_elsewhere', /need 3000000 lovelace but the non sponsor inputs supply 2000000/);
+    expectViolation(await witness(taken.leaseId, transaction), 'no_sponsor_value_elsewhere', /need 3000000 lovelace but the non sponsor inputs supply 0/);
   });
 
   it('no_foreign_scripts: refuses an input locked by a script other than the account scripts', async () => {
     await fundPool();
-    const control = placeControl();
     const locked = scriptUtxo(txHash(400), foreignScriptAddress, 10_000_000n);
     service.provider.addUtxo(locked);
     const taken = await lease();
-    const transaction = await buildOwnerOperation(service, taken, control, {
+    const transaction = await buildCreation(service, taken, {
       customise: (builder) => {
         builder.addInput({ utxo: locked, redeemer: deviceRedeemer }).addScript(foreignScript);
         builder.sendLovelace({ address: strangerAddress, amount: 10_000_000n });
@@ -714,11 +704,10 @@ describe('transaction policy', () => {
 
   it('no_foreign_scripts: never takes the stake part of an account output for an account stake script', async () => {
     await fundPool();
-    const control = placeControl();
     const locked = scriptUtxo(txHash(400), foreignScriptAddress, 10_000_000n);
     service.provider.addUtxo(locked);
     const taken = await lease();
-    const transaction = await buildOwnerOperation(service, taken, control, {
+    const transaction = await buildCreation(service, taken, {
       customise: (builder) => {
         builder.addInput({ utxo: locked, redeemer: deviceRedeemer }).addScript(foreignScript);
         builder.sendLovelace({ address: disguisedAccountAddress, amount: 1_500_000n });
@@ -749,11 +738,10 @@ describe('transaction policy', () => {
 
   it('evaluates: refuses a script input spent without a redeemer', async () => {
     await fundPool();
-    const control = placeControl();
     const fund = fundUtxo(txHash(301), 5_000_000n);
     service.provider.addUtxo(fund);
     const taken = await lease();
-    const transaction = await buildOwnerOperation(service, taken, control, {
+    const transaction = await buildCreation(service, taken, {
       evaluator: lenientEvaluator,
       customise: (builder) => {
         builder.addInput({ utxo: fund });
@@ -766,28 +754,26 @@ describe('transaction policy', () => {
 
   it('evaluates: refuses a redeemer declaring a budget below what evaluation finds it needs', async () => {
     await fundPool();
-    const control = placeControl();
     const taken = await lease();
-    const transaction = await buildOwnerOperation(service, taken, control, { evaluator: underDeclaringEvaluator });
+    const transaction = await buildCreation(service, taken, { evaluator: underDeclaringEvaluator });
 
     expectViolation(
       await witness(taken.leaseId, transaction),
       'evaluates',
-      /The spend redeemer at index \d+ declares 1 memory and 1 steps but needs 1500000 and 700000000/,
+      /The (certificate|mint) redeemer at index \d+ declares 1 memory and 1 steps but needs \d+ and \d+/,
     );
   });
 
   it('signers: refuses the sponsor payment key or stake key among the required signers', async () => {
     await fundPool();
-    const control = placeControl();
     const taken = await lease();
 
-    const payment = await buildOwnerOperation(service, taken, control, {
+    const payment = await buildCreation(service, taken, {
       customise: (builder) => builder.addSigner(service.serviceWallet.paymentKeyHash),
     });
     expectViolation(await witness(taken.leaseId, payment), 'signers', /sponsor payment key is among the required signers/);
 
-    const stake = await buildOwnerOperation(service, taken, control, {
+    const stake = await buildCreation(service, taken, {
       customise: (builder) => builder.addSigner(service.serviceWallet.stakeKeyHash),
     });
     expectViolation(await witness(taken.leaseId, stake), 'signers', /sponsor stake key is among the required signers/);
@@ -795,9 +781,8 @@ describe('transaction policy', () => {
 
   it('signers: refuses a withdrawal from the sponsor reward account', async () => {
     await fundPool();
-    const control = placeControl();
     const taken = await lease();
-    const transaction = await buildOwnerOperation(service, taken, control, {
+    const transaction = await buildCreation(service, taken, {
       customise: (builder) => {
         builder.withdrawRewards({ rewardAddress: sponsorRewardAddress(), amount: 3_000_000n });
         builder.sendLovelace({ address: accountAddress, amount: 3_000_000n });
@@ -809,9 +794,8 @@ describe('transaction policy', () => {
 
   it('signers: refuses a deregistration of the sponsor stake credential', async () => {
     await fundPool();
-    const control = placeControl();
     const taken = await lease();
-    const transaction = await buildOwnerOperation(service, taken, control, {
+    const transaction = await buildCreation(service, taken, {
       customise: (builder) => {
         builder.deregisterStakeAddress({ rewardAddress: sponsorRewardAddress() });
         builder.sendLovelace({ address: accountAddress, amount: 2_000_000n });
@@ -823,9 +807,8 @@ describe('transaction policy', () => {
 
   it('signers: refuses a vote by the sponsor stake credential', async () => {
     await fundPool();
-    const control = placeControl();
     const taken = await lease();
-    const transaction = await buildOwnerOperation(service, taken, control, {
+    const transaction = await buildCreation(service, taken, {
       customise: (builder) =>
         builder.vote({
           voter: { type: Cometa.VoterType.DRepKeyHash, credential: { hash: service.serviceWallet.stakeKeyHash, type: Cometa.CredentialType.KeyHash } },
@@ -839,38 +822,36 @@ describe('transaction policy', () => {
 
   it('signers: refuses DRep, committee and pool certificates naming a sponsor key', async () => {
     await fundPool();
-    const control = placeControl();
     const taken = await lease();
-    const plain = await buildOwnerOperation(service, taken, control);
+    const plain = await buildCreation(service, taken);
     const { paymentKeyHash, stakeKeyHash } = service.serviceWallet;
 
-    const drep = withCertificates(plain, [updateDRepCertificate(stakeKeyHash)]);
+    const drep = withExtraCertificates(plain, [updateDRepCertificate(stakeKeyHash)]);
     expectViolation(await witness(taken.leaseId, drep), 'signers', /The update_drep certificate names the sponsor's own credential/);
 
-    const committee = withCertificates(plain, [authCommitteeHotCertificate(stakeKeyHash, STRANGER_KEY)]);
+    const committee = withExtraCertificates(plain, [authCommitteeHotCertificate(stakeKeyHash, STRANGER_KEY)]);
     expectViolation(await witness(taken.leaseId, committee), 'signers', /The auth_committee_hot certificate names the sponsor's own credential/);
 
     const pool = /The pool_registration certificate names the sponsor's own credential/;
-    const owner = withCertificates(plain, [poolRegistrationCertificate(STRANGER_KEY, STRANGER_KEY, [stakeKeyHash])]);
+    const owner = withExtraCertificates(plain, [poolRegistrationCertificate(STRANGER_KEY, STRANGER_KEY, [stakeKeyHash])]);
     expectViolation(await witness(taken.leaseId, owner), 'signers', pool);
 
-    const operator = withCertificates(plain, [poolRegistrationCertificate(paymentKeyHash, STRANGER_KEY, [STRANGER_KEY])]);
+    const operator = withExtraCertificates(plain, [poolRegistrationCertificate(paymentKeyHash, STRANGER_KEY, [STRANGER_KEY])]);
     expectViolation(await witness(taken.leaseId, operator), 'signers', pool);
 
-    const rewards = withCertificates(plain, [poolRegistrationCertificate(STRANGER_KEY, stakeKeyHash, [STRANGER_KEY])]);
+    const rewards = withExtraCertificates(plain, [poolRegistrationCertificate(STRANGER_KEY, stakeKeyHash, [STRANGER_KEY])]);
     expectViolation(await witness(taken.leaseId, rewards), 'signers', pool);
   });
 
   it('leaves the lease open after a refusal so the client can try again', async () => {
     await fundPool();
-    const control = placeControl();
     const taken = await lease();
-    const refused = await buildOwnerOperation(service, taken, control, {
+    const refused = await buildCreation(service, taken, {
       customise: (builder) => builder.addSigner(service.serviceWallet.paymentKeyHash),
     });
     expectViolation(await witness(taken.leaseId, refused), 'signers');
 
-    const response = await witness(taken.leaseId, await buildOwnerOperation(service, taken, control));
+    const response = await witness(taken.leaseId, await buildCreation(service, taken));
 
     expect(response.status).toBe(200);
   });

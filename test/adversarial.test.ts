@@ -10,11 +10,11 @@ import {
   GRANT_LOVELACE,
   GRANT_SLOT,
   accountAddress,
+  accountRewardAddress,
   accountScript,
   accountScriptHash,
   controlUtxo,
   createAccountRedeemer,
-  deviceRedeemer,
   encodeGrant,
   fixtureGrant,
   foreignScript,
@@ -29,6 +29,7 @@ import {
   otherControlUtxo,
   otherStakeScriptHash,
   scriptCredential,
+  stakeScript,
   stakeScriptHash,
   stateNftAssetId,
   strangerAddress,
@@ -36,6 +37,7 @@ import {
 import {
   buildAccountPaidOperation,
   buildAgentSpend,
+  buildAgentSpendOnLease,
   buildCreation,
   buildOwnerOperation,
   clientBuilder,
@@ -154,15 +156,38 @@ const buildForeignStakeCreation = async (taken: LeaseBody, policy: string): Prom
 describe('a client trying to drain the sponsor', () => {
   it('cannot pay the leased fee UTxO out to itself', async () => {
     await fundPool();
-    const control = controlUtxo(txHash(300));
-    service.provider.addUtxo(control);
     const taken = await lease();
-    const transaction = await buildOwnerOperation(service, taken, control, {
-      customise: (builder) => builder.sendLovelace({ address: strangerAddress, amount: 97_000_000n }),
+    const transaction = await buildCreation(service, taken, {
+      customise: (builder) => builder.sendLovelace({ address: strangerAddress, amount: 90_000_000n }),
     });
 
-    expectViolation(await witness(taken.leaseId, transaction), 'sponsor_outflow_bounded', /drawn down by 97\d+ lovelace but the fee accounts for \d+/);
+    expectViolation(
+      await witness(taken.leaseId, transaction),
+      'sponsor_outflow_bounded',
+      /drawn down by 9\d+ lovelace but the fee, the registration deposit and the control output account for \d+/,
+    );
     expect(witnessCount()).toBe(0);
+  });
+
+  it('cannot have a leased fee UTxO pay for an operation on an existing account, which the collateral route serves without sponsor outflow', async () => {
+    await fundPool();
+    const control = controlUtxo(txHash(300), undefined, grantedState);
+    const grant = grantUtxo(txHash(302));
+    const fund = fundUtxo(txHash(301), 20_000_000n);
+    for (const utxo of [control, grant, fund]) {
+      service.provider.addUtxo(utxo);
+    }
+    const taken = await lease();
+    const creationOnly = /The leased fee UTxO pays for an account creation only; an operation on an existing account pays its own fee and takes the collateral route/;
+
+    expectViolation(await witness(taken.leaseId, await buildOwnerOperation(service, taken, control)), 'sponsor_outflow_bounded', creationOnly);
+    expectViolation(await witness(taken.leaseId, await buildAgentSpendOnLease(service, taken, { control, grant, fund })), 'sponsor_outflow_bounded', creationOnly);
+    expect(witnessCount()).toBe(0);
+    expect(await feeCounts()).toEqual({ free: 0, leased: 1 });
+
+    const shared = await collateral();
+    expect((await collateralWitness(await buildAgentSpend(service, shared, { control, grant, fund }))).status).toBe(200);
+    expect(lastAudit('witness')).toMatchObject({ outcome: 'issued', detail: { mode: 'collateral', kind: 'operation', sponsoredLovelace: 0 } });
   });
 
   it('cannot spend the shared collateral UTxO as a regular input, in either mode', async () => {
@@ -230,15 +255,14 @@ describe('a client trying to drain the sponsor', () => {
 
   it('cannot mint under a policy that merely resembles the account policy', async () => {
     await fundPool();
-    const control = controlUtxo(txHash(300));
-    service.provider.addUtxo(control);
     const taken = await lease();
     const lookalike = `${foreignScriptHash}${stakeScriptHash}`;
     const builder = clientBuilder(service, taken);
-    builder.addInput({ utxo: control, redeemer: deviceRedeemer });
+    builder.registerStakeAddress({ rewardAddress: accountRewardAddress, redeemer: operateRedeemer });
+    builder.mintToken({ assetIdHex: stateNftAssetId, amount: 1n, redeemer: createAccountRedeemer });
     builder.mintToken({ assetIdHex: lookalike, amount: 1n, redeemer: createAccountRedeemer });
     builder.lockValue({ scriptAddress: accountAddress, value: { coins: CONTROL_LOVELACE, assets: { [stateNftAssetId]: 1n, [lookalike]: 1n } }, datum: stateDatum });
-    builder.addSigner(DEVICE_KEY).addScript(accountScript).addScript(foreignScript);
+    builder.addSigner(DEVICE_KEY).addScript(accountScript).addScript(stakeScript).addScript(foreignScript);
 
     expectViolation(await witness(taken.leaseId, await builder.build()), 'no_foreign_scripts', new RegExp(`mints under policy ${foreignScriptHash}`));
   });

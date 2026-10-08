@@ -468,13 +468,22 @@ const carries = (output: ParsedOutput): 'datum' | 'reference script' | undefined
   output.hasDatum ? 'datum' : output.hasReferenceScript ? 'reference script' : undefined;
 
 /**
- * What the sponsor's input is drawn down by is exactly the fee, plus the
- * deposit and the control output at creation, within the limits, and
+ * A leased fee UTxO pays for an account creation and for nothing else:
+ * an operation on an existing account is paid by the account and takes
+ * the collateral route, so it is refused here whatever it draws. What
+ * the sponsor's input is drawn down by is then exactly the fee, the
+ * registration deposit and the control output, within the limits, and
  * what comes back to the sponsor is one plain change output the pool can
  * spend: change split over several outputs would litter the sponsor
  * address with small UTxOs the pool classifies as reserve.
  */
 const sponsorOutflowBounded: Rule = ({ transaction, creation, sponsorOutputs, sponsoredLovelace }, { limits }) => {
+  if (creation === undefined) {
+    return violation(
+      'sponsor_outflow_bounded',
+      'The leased fee UTxO pays for an account creation only; an operation on an existing account pays its own fee and takes the collateral route',
+    );
+  }
   if (transaction.fee > BigInt(limits.maxFeeLovelace)) {
     return violation('sponsor_outflow_bounded', `The fee ${transaction.fee} exceeds the ${limits.maxFeeLovelace} lovelace limit`);
   }
@@ -487,12 +496,11 @@ const sponsorOutflowBounded: Rule = ({ transaction, creation, sponsorOutputs, sp
   if (sponsorOutputs.length !== 1) {
     return violation('sponsor_outflow_bounded', `The transaction pays the sponsor ${sponsorOutputs.length} outputs where exactly one change output is expected`);
   }
-  const expected = transaction.fee + (creation === undefined ? 0n : creation.deposit + creation.controlOutput.lovelace);
+  const expected = transaction.fee + creation.deposit + creation.controlOutput.lovelace;
   if (sponsoredLovelace !== expected) {
-    const accounted = creation === undefined ? 'the fee accounts' : 'the fee, the registration deposit and the control output account';
     return violation(
       'sponsor_outflow_bounded',
-      `The sponsor input is drawn down by ${sponsoredLovelace} lovelace but ${accounted} for ${expected}`,
+      `The sponsor input is drawn down by ${sponsoredLovelace} lovelace but the fee, the registration deposit and the control output account for ${expected}`,
     );
   }
   if (sponsoredLovelace > BigInt(limits.maxSponsoredLovelace)) {
@@ -523,7 +531,7 @@ const sponsorOutflowZero: Rule = ({ transaction }, { sponsor }) => {
   return undefined;
 };
 
-/** The sponsor outflow rule of the mode: bounded to the fee and the creation amounts in fee mode, nothing at all in collateral mode. */
+/** The sponsor outflow rule of the mode: a creation drawing exactly what it costs in fee mode, nothing at all in collateral mode. */
 const sponsorOutflow: Rule = (analysis, context) =>
   context.mode.kind === 'fee' ? sponsorOutflowBounded(analysis, context) : sponsorOutflowZero(analysis, context);
 

@@ -186,6 +186,24 @@ export const withCertificates = (txCbor: string, certificates: string[]): string
   return withBodyField(txCbor, BODY_CERTIFICATES, writer.encodeHex());
 };
 
+/** The same transaction with the given encoded certificates appended to the ones it carries, which may be tagged as a set; nothing rebalances it. */
+export const withExtraCertificates = (txCbor: string, certificates: string[]): string => {
+  const entry = readBodyEntries(readTransaction(txCbor).body).find((candidate) => candidate.key === BODY_CERTIFICATES);
+  const reader = Cometa.CborReader.fromHex(Cometa.uint8ArrayToHex(entry?.value ?? new Uint8Array()));
+  if (entry !== undefined && reader.peekState() === Cometa.CborReaderState.Tag) {
+    reader.readTag();
+  }
+  const carried = entry === undefined ? [] : readItems(reader, () => reader.readEncodedValue());
+  const writer = new Cometa.CborWriter().startArray(carried.length + certificates.length);
+  for (const certificate of carried) {
+    writer.writeEncoded(certificate);
+  }
+  for (const certificate of certificates) {
+    writer.writeEncoded(bytes(certificate));
+  }
+  return withBodyField(txCbor, BODY_CERTIFICATES, writer.encodeHex());
+};
+
 /**
  * The same transaction proposing an informational governance action
  * with no deposit, refunded to the testnet reward account of `keyHash`,

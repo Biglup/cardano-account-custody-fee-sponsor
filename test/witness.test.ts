@@ -8,8 +8,8 @@ import { parseTransaction } from '../src/policy/parse.js';
 import type { Lease, LeaseService } from '../src/pool/leases.js';
 import type { WitnessStore } from '../src/pool/witnesses.js';
 import { type WitnessService, createWitnessService } from '../src/witness.js';
-import { controlUtxo } from './support/account.js';
-import { buildCreation, buildOwnerOperation } from './support/client.js';
+import { CONTROL_LOVELACE } from './support/account.js';
+import { buildCreation } from './support/client.js';
 import { type TestService, createTestService, txHash } from './support/service.js';
 
 let service: TestService;
@@ -79,6 +79,12 @@ const witnessCount = (): number => (service.db.prepare('SELECT COUNT(*) AS count
 const lastOutcome = (): string =>
   (service.db.prepare("SELECT outcome FROM audit WHERE action = 'witness' ORDER BY id DESC LIMIT 1").get() as { outcome: string }).outcome;
 
+/** The stake registration deposit of the fake chain's parameters. */
+const STAKE_DEPOSIT = 2_000_000n;
+
+/** What a creation draws from the sponsor: its fee, the registration deposit and the control output. */
+const sponsoredBy = (creation: string): bigint => (parseTransaction(creation).transaction?.fee ?? 0n) + STAKE_DEPOSIT + CONTROL_LOVELACE;
+
 /** The key with its daily sponsored lovelace quota set to `lovelace`. */
 const withDailyQuota = (lovelace: bigint): ApiKey => ({ ...apiKey, quotas: { ...apiKey.quotas, sponsoredLovelacePerDay: Number(lovelace) } });
 
@@ -86,14 +92,12 @@ describe('witness service', () => {
   it('refuses with the daily quota once what the key sponsored today plus this transaction would pass it, and signs just under it', async () => {
     service.fund(txHash(101), 0, 100_000_000n);
     await service.sync.run();
-    const control = controlUtxo(txHash(300));
-    service.provider.addUtxo(control);
     await service.witness.issue(apiKey, lease.id, await buildCreation(service, leaseBody));
     const today = BigInt((service.db.prepare('SELECT sponsored_lovelace FROM witnesses').get() as { sponsored_lovelace: number }).sponsored_lovelace);
     const next = await service.leases.create(apiKey);
     const nextBody = bodyOf(next);
-    const transaction = await buildOwnerOperation(service, nextBody, control);
-    const sponsored = parseTransaction(transaction).transaction?.fee ?? 0n;
+    const transaction = await buildCreation(service, nextBody);
+    const sponsored = sponsoredBy(transaction);
 
     const failure = await service.witness.issue(withDailyQuota(today + sponsored - 1n), next.id, transaction).catch((err: unknown) => err);
 
@@ -171,12 +175,11 @@ describe('witness service', () => {
   });
 
   it('refuses with lease_consumed when another transaction consumed the lease after it was found open', async () => {
-    const control = controlUtxo(txHash(300));
-    service.provider.addUtxo(control);
     await service.witness.issue(apiKey, lease.id, await buildCreation(service, leaseBody));
     const stale = witnessWith({ leases: staleLeases(service.leases) });
+    const other = await buildCreation(service, leaseBody, { controlLovelace: CONTROL_LOVELACE + 500_000n });
 
-    const failure = await stale.issue(apiKey, lease.id, await buildOwnerOperation(service, leaseBody, control)).catch((err: unknown) => err);
+    const failure = await stale.issue(apiKey, lease.id, other).catch((err: unknown) => err);
 
     expect(failure).toBeInstanceOf(LeaseConsumedError);
     expect(witnessCount()).toBe(1);

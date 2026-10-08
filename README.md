@@ -20,21 +20,26 @@ signs once the transaction draws nothing from the sponsor beyond the fee,
 the deposit and the control UTxO.
 
 Every later operation is paid by the account from its own UTxOs: an
-owner operation from a reserve, a deposit under a datum that the owner
-alone can spend, or from the plain funds, and an agent spend, which
-spends its grant UTxO and plain funds and references the control UTxO
-without spending it, from the plain funds. What the owner or an agent
-still lacks is collateral, which only a wallet with ADA can declare. For
-those transactions the service contributes its shared collateral UTxO
-alone, signs the collateral declaration, and no sponsor lovelace is
-spent.
+owner operation from an account reserve, a deposit under a datum that
+the owner alone can spend, or from the plain funds, and an agent spend,
+which spends its grant UTxO and plain funds and references the control
+UTxO without spending it, from the plain funds. An account reserve is
+the contract's; the sponsor's reserve, the wallet's UTxOs outside the
+pool, is another thing and is described under Pool. What the owner or an
+agent still lacks is collateral, which only a wallet with ADA can
+declare. For those transactions the service contributes its shared
+collateral UTxO alone, signs the collateral declaration, and no sponsor
+lovelace is spent.
 
 Two modes follow from this, both served by the same policy:
 
-- Fee mode: a leased fee UTxO pays, bounded by the fee, the deposit and
-  the control UTxO at creation and by the fee alone otherwise.
+- Fee mode: a leased fee UTxO pays for an account creation, drawn down
+  by exactly the fee, the deposit and the control UTxO, and for nothing
+  else: an operation on an existing account presented on this route is
+  refused, since the account pays for it.
 - Collateral mode: no sponsor UTxO is spent and no output pays the
-  sponsor; the sponsor declares collateral and nothing else.
+  sponsor; the sponsor declares collateral and nothing else, for any
+  operation on an existing account.
 
 ## Flows
 
@@ -140,8 +145,8 @@ reserved for the lease. A fee UTxO backs one open lease at a time.
 - 429 `quota_exceeded`, detail `open_leases: at most N open leases per key`.
 - 409 `no_utxo_available` when every fee UTxO is leased (the detail says
   how many and when the soonest lease expires), or when the pool holds
-  no fee UTxO or no collateral UTxO yet and the reserve could fund one
-  by replenishing. The pool is resynced with the chain once before this
+  no fee UTxO or no collateral UTxO yet and the sponsor's reserve could
+  fund one by replenishing. The pool is resynced with the chain once before this
   answer.
 - 503 `out_of_funds` when the pool holds no fee UTxO or no collateral
   UTxO and the reserve cannot fund a split of that size.
@@ -159,7 +164,8 @@ released.
 ### `POST /v1/leases/:id/witness`
 
 Body `{ "transaction": "<unsigned transaction as CBOR hex>" }`. Checks
-the transaction in fee mode and answers 200:
+the transaction in fee mode, which serves an account creation only, and
+answers 200:
 
 ```json
 { "witnessSet": "a10081825820...", "leaseId": "b26ee940-dd6d-4456-b6c4-8336af3364ff" }
@@ -174,7 +180,9 @@ set.
 - 404 `unknown_lease`.
 - 410 `lease_expired`, detail `Lease ... has expired` or `Lease ... was released`.
 - 422 `invalid_transaction` with `rule` naming the first policy rule that
-  failed and `detail` saying how. The lease stays open.
+  failed and `detail` saying how; an operation on an existing account,
+  which the fee route does not pay for, is refused here under
+  `sponsor_outflow_bounded`. The lease stays open.
 - 409 `lease_consumed` for a different transaction on a consumed lease.
 - 429 `quota_exceeded`, detail `witnesses_per_hour: ...` or
   `sponsored_lovelace_per_day: ...`. The lease stays open.
@@ -359,12 +367,14 @@ name.
    it in exactly one output at an account address staked to that
    credential. A token under another policy, whatever its name, and a
    token held at any other address count for nothing.
-6. `sponsor_outflow_bounded` in fee mode: the fee is at most
-   `MAX_FEE_LOVELACE`, exactly one output pays the sponsor address, the
-   change, as plain lovelace with neither a datum nor a reference
-   script, and the fee UTxO is drawn down, after that change, by exactly
-   the fee plus, at creation only, the registration deposit and the
-   control output's lovelace, at most `MAX_SPONSORED_LOVELACE`. `sponsor_outflow_zero`
+6. `sponsor_outflow_bounded` in fee mode: the transaction is an account
+   creation, since a leased fee UTxO pays for nothing else and an
+   operation on an existing account is refused whatever it draws; the
+   fee is at most `MAX_FEE_LOVELACE`, exactly one output pays the sponsor
+   address, the change, as plain lovelace with neither a datum nor a
+   reference script, and the fee UTxO is drawn down, after that change,
+   by exactly the fee, the registration deposit and the control output's
+   lovelace, at most `MAX_SPONSORED_LOVELACE`. `sponsor_outflow_zero`
    in collateral mode: no output pays the sponsor payment key at any
    base, enterprise or pointer address, and no withdrawal draws from
    the sponsor's reward account; the fee is the account's and not
@@ -395,7 +405,7 @@ name.
 | ---- | -------- | --------------- |
 | Sponsor inputs | `uses_leased_fee_input`: the leased fee UTxO and no other | `no_sponsor_inputs`: none |
 | Collateral | `uses_shared_collateral`: the shared UTxO the lease named | `uses_shared_collateral`: the shared UTxO `GET /v1/collateral` names |
-| Sponsor outflow | `sponsor_outflow_bounded`: exactly the fee, plus deposit and control UTxO at creation | `sponsor_outflow_zero`: nothing in, nothing out |
+| Sponsor outflow | `sponsor_outflow_bounded`: a creation only, drawing exactly the fee, the deposit and the control UTxO | `sponsor_outflow_zero`: nothing in, nothing out |
 | Validity bound | at most the lease expiry plus `VALIDITY_MARGIN_SECONDS` | at most now plus `COLLATERAL_VALIDITY_SECONDS` |
 
 A witness in fee mode sponsors what the fee UTxO is drawn down by; a
@@ -641,15 +651,16 @@ const txId = await sponsor.submitTransaction(Cometa.applyVkeyWitnessSet(tx, witn
   service reports as `unknown_lease`, `lease_expired` or
   `lease_consumed` is dropped so the next use takes a new one.
 
-The contract's `createAccount` with a sponsor builds exactly what the
-policy accepts at creation. Its owner operations with a sponsor have the
-sponsor pay the control output's growth and receive withdrawn rewards as
-change, both of which `sponsor_outflow_bounded` refuses, since an
-operation must draw exactly the fee: `withdrawRewards` with a sponsor is
-refused whenever it withdraws anything, and `addDevice`, `revokeGrant`
-and `rewriteState` with a sponsor are refused once the larger state
-raises the control output's minimum lovelace. Operations on an existing
-account take the adapter in collateral mode instead.
+The fee mode adapter is for `createAccount` only: the contract's
+`createAccount` with a sponsor builds exactly what the policy accepts.
+The contract library's owner builders take the same `sponsor` option,
+and every one of them operates an existing account, which this service
+always refuses under `sponsor_outflow_bounded`, whatever the transaction
+draws: `spendWithDevice`, `rewriteState`, `addDevice`, `removeDevice`,
+`revokeGrant`, `revokeAllGrants`, `withdrawRewards`, `delegateStake` and
+`sweepGrant` with a sponsor are refused, and `issueGrant` with a sponsor
+is always refused as well. Operations on an existing account take the
+adapter in collateral mode instead.
 
 ### Collateral mode, as the `collateral` wallet of account operations
 

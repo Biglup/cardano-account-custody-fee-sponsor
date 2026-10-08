@@ -17,9 +17,10 @@ import { transactionHash } from '../transaction-hash.js';
 
 /**
  * How the sponsor takes part in the transactions a wallet builds: `fee`
- * leases a fee UTxO the sponsor pays from, `collateral` contributes the
- * shared collateral alone to a transaction that pays its own fee, as an
- * owner operation paid from the account does.
+ * leases a fee UTxO the sponsor pays an account creation from, and
+ * nothing else, `collateral` contributes the shared collateral alone to
+ * a transaction that pays its own fee, as every operation on an existing
+ * account does.
  */
 export type SponsorWalletMode = 'fee' | 'collateral';
 
@@ -145,8 +146,9 @@ const slotConfigOf = (networkMagic: number): SlotConfig => {
 
 /**
  * A cometa wallet over the sponsor service, to pass to the account
- * contract's builders: as their `sponsor` in fee mode and as their
- * `collateral` in collateral mode. In fee mode it holds one lease at a
+ * contract's builders: as the `sponsor` of `createAccount` in fee mode,
+ * the only transaction the service pays for, and as the `collateral` of
+ * every operation in collateral mode. In fee mode it holds one lease at a
  * time, taken on first use and kept until a witness consumes it,
  * `release` gives it up or it expires, after which the next use takes a
  * new one; what it reports as its own is what the lease grants: the

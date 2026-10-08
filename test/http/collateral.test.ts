@@ -33,7 +33,7 @@ import {
   AGENT_SPEND_LOVELACE,
   buildAccountPaidOperation,
   buildAgentSpend,
-  buildOwnerOperation,
+  buildCreation,
   buildReservePaidOperation,
   collateralClientBuilder,
   sponsorUtxo,
@@ -323,7 +323,7 @@ describe('POST /v1/collateral/witness', () => {
     });
 
     const lease = (await request(service.app).post('/v1/leases').set(bearer(key))).body as LeaseBody;
-    const onLease = await request(service.app).post(`/v1/leases/${lease.leaseId}/witness`).set(bearer(key)).send({ transaction: await buildOwnerOperation(service, lease, control) });
+    const onLease = await request(service.app).post(`/v1/leases/${lease.leaseId}/witness`).set(bearer(key)).send({ transaction: await buildCreation(service, lease) });
     expect(onLease.status).toBe(429);
     expect(witnessCount()).toBe(1);
   });
@@ -504,9 +504,8 @@ describe('collateral mode policy', () => {
 
   it('refuses a transaction a fee lease already witnessed, since it spends a sponsor input', async () => {
     await fundPool(1, 1);
-    const { control } = placeAccount();
     const lease = (await request(service.app).post('/v1/leases').set(bearer())).body as LeaseBody;
-    const transaction = await buildOwnerOperation(service, lease, control);
+    const transaction = await buildCreation(service, lease);
     expect((await request(service.app).post(`/v1/leases/${lease.leaseId}/witness`).set(bearer()).send({ transaction })).status).toBe(200);
 
     expectViolation(await witness(transaction), 'no_sponsor_inputs', new RegExp(`Input ${txHash(100)}#0 belongs to the sponsor`));
