@@ -1,0 +1,44 @@
+#!/bin/sh
+#
+# Copyright 2026 IOG.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Prints the image name and the version a build is tagged with, as
+# workflow outputs. The image is the package, under the repository owner
+# on GitHub's registry; a build from any branch but main goes to the
+# image with the -dev suffix, so that it never shadows a release, while a
+# version tag is a release and goes to the image proper.
+
+set -e
+
+# Prefer the GitHub Actions variables, which also cover a tag checkout
+CURRENT_BRANCH=${GITHUB_REF_NAME:-$(git branch --show-current)}
+REF_TYPE=${GITHUB_REF_TYPE:-branch}
+
+if [ "${REF_TYPE}" = branch ] && [ "${CURRENT_BRANCH}" != main ]; then
+    SUFFIX="-dev"
+fi
+
+# Registry image names are lowercase, whatever case the owner's name has
+OWNER=$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+NAME=$(node -p "require('./package.json').name")
+
+# Computed on its own line so that a version that cannot be named, as on
+# a dirty tree, stops the job instead of printing an empty version
+VERSION=$("$(dirname "$0")"/version)
+
+cat << END > "${GITHUB_OUTPUT:-/dev/stdout}"
+image=ghcr.io/${OWNER}/${NAME}${SUFFIX}
+version=${VERSION}
+END

@@ -1,0 +1,46 @@
+#!/bin/sh
+#
+# Copyright 2026 IOG.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Prints the version of the checked out commit, which names the image
+# built from it. On main it is a calendar version, the UTC day of the
+# commit and its rank among that day's commits, with the short hash;
+# anywhere else it is the ref name and the short hash.
+
+set -e
+
+# The day of a calendar version is the UTC one wherever the script runs,
+# so that a local run names the same version CI does
+export TZ=UTC
+
+# A version names one commit; a dirty tree would name something else
+[ -z "$(git status --porcelain)" ] || ( echo >&2 "Git tree not clean!" && exit 1 )
+
+# Prefer the GitHub Actions variables, which also cover a tag checkout
+CURRENT_BRANCH=${GITHUB_REF_NAME:-$(git branch --show-current)}
+
+SHA=${GITHUB_SHA:-$(git rev-parse HEAD)}
+SHORT_SHA="$(echo "${SHA}" | cut -c1-8)"
+
+if [ "${CURRENT_BRANCH}" = main ]; then
+    # <YYYYMMDD>.<rank>_<hash>, which is a valid image tag: lowercase
+    # letters, digits, underscores, periods and dashes, not starting with
+    # a period or a dash
+    git log --pretty="format:%cd %h" --date="format-local:%Y%m%d" | \
+        awk 'NR==1{d=$1;h=$2}{if(d==$1)c++;else exit}END{print d"."c"_"h}'
+else
+    # A slash in a branch name is not allowed in an image tag
+    printf "%s_%s" "$(printf "%s" "${CURRENT_BRANCH}" | tr / -)" "${SHORT_SHA}"
+fi

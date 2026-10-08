@@ -1,0 +1,44 @@
+# Copyright 2026 IOG.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Runs the service locally from this checkout: the image built from the
+# Dockerfile, configured by the .env file next to this file, with the
+# database on a named volume. A deployment runs the published image
+# instead; see the Deployment section of the README.
+
+services:
+  sponsor:
+    build:
+      context: .
+    env_file: .env
+    # A .env written for a run from the working tree names a database path
+    # and a port of the host; inside the container the database lives on
+    # the volume and the port is the one published below.
+    environment:
+      DATABASE_PATH: /data/sponsor.sqlite
+      PORT: "8787"
+    # Published on the loopback address only, so that a local run keeps
+    # the admin routes off the LAN.
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - sponsor-data:/data
+    logging:
+      options:
+        max-size: "30m"
+        max-file: "2"
+    restart: unless-stopped
+
+volumes:
+  sponsor-data:

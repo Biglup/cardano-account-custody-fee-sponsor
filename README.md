@@ -715,6 +715,134 @@ a `creation` or an `operation`, the sponsored lovelace and the fee.
   is not stored.
 - Run one process against one database.
 
+## Deployment
+
+The service is published as a container image at
+`ghcr.io/biglup/cardano-account-custody-fee-sponsor`, built for
+`linux/amd64` and `linux/arm64`. Every commit on `main` is published
+under a calendar version, `<YYYYMMDD>.<n>_<hash>`: the UTC day of the
+commit, its rank among that day's commits and its short hash; the newest
+is also `latest`. A version tag `vX.Y.Z` of the repository is published
+as `vX.Y.Z`, `vX.Y` and `vX`. Pin a deployment to a version, never to
+`latest`. A build that is neither a `main` commit nor a version tag is
+named `ghcr.io/biglup/cardano-account-custody-fee-sponsor-dev`, so it
+can never overwrite the production image name; nothing under that name
+is for deployment.
+
+The image is about 340 MB on disk and holds Node 22, the compiled
+service, its production dependencies and the blueprint of the contract
+build it serves at `/app/contract/plutus.json`, which `BLUEPRINT_PATH`
+defaults to. Its base image, Node 22 on Debian bookworm slim, is pinned
+by digest and updated through dependabot, so a bump is a reviewed
+change. It runs `node dist/main.js` under `tini` as the
+unprivileged user `nonroot` (uid and gid 60000), listens on port 8787,
+and logs JSON lines to stdout. It carries no configuration beyond two
+defaults, `DATABASE_PATH=/data/sponsor.sqlite` and `PORT=8787`, and no
+`.env` file: everything else is read from the container's environment,
+as the [Configuration](#configuration) section describes, and the
+service refuses to start without a required variable, naming it and
+never its value.
+
+### Variables
+
+Secrets, to be supplied from a secret store or the supervisor's
+environment and kept out of shell histories, logs and images:
+
+| Variable | What it is |
+| -------- | ---------- |
+| `SPONSOR_MNEMONIC` | the sponsor wallet; whoever holds it holds the sponsor's funds |
+| `BLOCKFROST_PREPROD_PROJECT_ID` | the credential of the hosted provider |
+| `ADMIN_API_KEY` | the bearer token of the admin routes, which issue and disable client keys |
+
+Plain values:
+
+| Variable | What it is |
+| -------- | ---------- |
+| `ACCOUNT_SCRIPT_HASH` | required; the hash of the account proxy in the shipped blueprint, `ed61963ac94d12c0b320be5a336c36af66bc02c380e0aa3001899253`, which the service checks the blueprint against at startup |
+| `KNOWN_LOGIC_HASHES` | the logic versions served, defaulting to the current one; name a hash only after reading the version it stands for |
+| `PROVIDER_BASE_URL` | a Blockfrost compatible endpoint other than the hosted preprod one |
+| `TRUST_PROXY_HOPS` | the number of reverse proxies in front of the service, and never more |
+| `LEASE_TTL_SECONDS`, `MAX_SPONSORED_LOVELACE`, `MAX_FEE_LOVELACE`, `FEE_UTXO_LOVELACE`, `COLLATERAL_UTXO_LOVELACE`, `FEE_UTXO_COUNT`, `COLLATERAL_UTXO_COUNT`, `VALIDITY_MARGIN_SECONDS`, `COLLATERAL_VALIDITY_SECONDS`, `IP_RATE_LIMIT_PER_MINUTE`, `KEY_RATE_LIMIT_PER_MINUTE` | the quotas and limits, with the defaults of the configuration table |
+
+Leave `DATABASE_PATH` as the image sets it, or name another file under
+`/data`, the volume the service user can write. Leave `BLUEPRINT_PATH`
+unset: the image sets no value for it, and the code's default is the
+blueprint the image ships.
+
+### State
+
+The sqlite database at `/data/sponsor.sqlite` is the service's only
+state: the API keys with their quotas and what each has used, the pool
+bookkeeping, the leases, the witnesses and the audit trail. `/data` is a
+volume; mount a named volume there, or a host directory writable by uid
+60000. The database is bound to the sponsor address the mnemonic
+derives, so it serves one sponsor wallet only.
+
+What the chain holds survives the database: after a crash, or a volume
+lost between a stop and a start, the first pool sync discovers the
+sponsor's fee and collateral UTxOs again from the chain. What only the
+database holds does not: every API key and its allowances, the open
+leases, the witnesses and the audit trail are gone, so every client has
+to be issued a new key before it can call again, and a client holding a
+lease has its witness refused and takes a new one. Back up the database
+file, and the write ahead log beside it, with the service stopped, or
+take the backup through sqlite's own `.backup` command while it runs;
+a plain copy of a database under write may miss the write ahead log.
+Restore it only for the same sponsor wallet.
+
+### Health
+
+`GET /health` answers 200 once the service has derived the sponsor
+wallet, synced the pool through the provider once and started listening.
+A 200 means the process is up and reached the provider at startup; it
+does not check the provider again on each call, since the pool counts it
+reports come from the database. A service that cannot reach its provider
+at startup does not listen at all: it exits with
+`Fee sponsor service failed to start: <reason>` on stderr, and the
+restart policy of the supervisor retries it. A provider that becomes
+unreachable later shows in the logs as `Pool sync failed` every thirty
+seconds while the health route keeps answering 200. The image's own
+health check calls the route every thirty seconds after a thirty second
+start period, so `docker ps` reports the container healthy once it
+answers.
+
+### Running the image
+
+Put the variables in an environment file readable by the service's
+supervisor only, one unquoted `VARIABLE=value` per line, and pass it to
+the container:
+
+```sh
+docker run --detach --name sponsor \
+  --env-file /etc/sponsor/env \
+  --volume sponsor-data:/data \
+  --publish 8787:8787 \
+  --restart unless-stopped \
+  ghcr.io/biglup/cardano-account-custody-fee-sponsor:vX.Y.Z
+```
+
+The service logs the sponsor address when it starts listening; fund it,
+then replenish the pool through `POST /admin/pool/replenish`, or with
+the service stopped through the same image:
+
+```sh
+docker run --rm --env-file /etc/sponsor/env --volume sponsor-data:/data \
+  --entrypoint node ghcr.io/biglup/cardano-account-custody-fee-sponsor:vX.Y.Z dist/pool/replenish.js
+```
+
+Terminate TLS in front of the service and set `TRUST_PROXY_HOPS` to the
+number of proxies; the [Operator notes](#operator-notes) and
+[docs/security.md](docs/security.md) cover the rest of running it.
+
+### Running locally with compose
+
+`docker-compose.yml` is for running the service from a checkout: it
+builds the image from the `Dockerfile`, reads the checkout's `.env`,
+keeps the database on a named volume and publishes port 8787 on the
+loopback address only, so the admin routes stay off the LAN.
+`docker compose up --build` starts it. A deployment runs the published
+image as above, not the compose file.
+
 ## Client adapter
 
 `SponsorWallet`, exported from the package root along with
@@ -865,6 +993,7 @@ surroundings.
 - `npm run dev` runs the service with a file watcher; `npm run start` without.
 - `npm run replenish` splits the sponsor wallet into pool UTxOs up to the configured targets.
 - `npm run preprod-e2e` runs the preprod proof.
+- `docker build -t <image> .` builds the container image, and `scripts/smoke-image.sh <image>` proves it runs.
 
 ## Limitations
 
