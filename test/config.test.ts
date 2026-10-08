@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CURRENT_LOGIC_HASH, ConfigError, LOGIC_V2_HASH, loadConfig } from '../src/config.js';
+import { CURRENT_LOGIC_HASH, ConfigError, loadConfig } from '../src/config.js';
 import { SLOT_SETTINGS_BY_NETWORK } from '../src/slots.js';
 
 const VALID_MNEMONIC = 'alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima';
@@ -82,7 +82,7 @@ describe('loadConfig', () => {
     expect(config.blockfrostBaseUrl).toBeUndefined();
     expect(config.sponsorMnemonic).toEqual(VALID_MNEMONIC.split(' '));
     expect(config.accountScriptHash).toBe('ed61963ac94d12c0b320be5a336c36af66bc02c380e0aa3001899253');
-    expect(config.knownLogicHashes).toEqual([CURRENT_LOGIC_HASH, LOGIC_V2_HASH]);
+    expect(config.knownLogicHashes).toEqual([CURRENT_LOGIC_HASH]);
     expect(config.adminApiKey).toBe('test-admin-key');
     expect(config.port).toBe(8787);
     expect(config.databasePath).toBe('./data/sponsor.sqlite');
@@ -188,10 +188,10 @@ describe('loadConfig', () => {
     );
   });
 
-  it('is offered the same two logic hashes by the example environment file, the version new accounts run first', () => {
+  it('is offered the current logic hash alone by the example environment file, the version every account is created under', () => {
     const example = exampleValueOf('KNOWN_LOGIC_HASHES');
 
-    expect(example).toBe(`${CURRENT_LOGIC_HASH},${LOGIC_V2_HASH}`);
-    expect(loadConfig({ ...validEnv(), KNOWN_LOGIC_HASHES: example }).knownLogicHashes).toEqual([CURRENT_LOGIC_HASH, LOGIC_V2_HASH]);
+    expect(example).toBe(CURRENT_LOGIC_HASH);
+    expect(loadConfig({ ...validEnv(), KNOWN_LOGIC_HASHES: example }).knownLogicHashes).toEqual([CURRENT_LOGIC_HASH]);
   });
 });

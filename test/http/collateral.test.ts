@@ -118,6 +118,17 @@ const placeGrantedAccount = (): { control: UTxO; grant: UTxO; fund: UTxO } => {
   return { control, grant, fund };
 };
 
+/**
+ * Rebuilds the service naming both of the blueprint's logic versions, as
+ * an operator opening an upgrade window configures it; the default names
+ * the current version alone.
+ */
+const serveBothLogics = async (): Promise<void> => {
+  service.close();
+  service = await createTestService({ KNOWN_LOGIC_HASHES: `${logicHash},${logicV2Hash}` });
+  apiKey = service.issueKey().apiKey;
+};
+
 /** The number of witnesses issued so far. */
 const witnessCount = (): number => (service.db.prepare('SELECT COUNT(*) AS count FROM witnesses').get() as { count: number }).count;
 
@@ -588,7 +599,8 @@ describe('collateral mode policy', () => {
     expect(witnessCount()).toBe(0);
   });
 
-  it('known_logic: witnesses an operation on an account that has upgraded to the second logic version, which the default list names', async () => {
+  it('known_logic: witnesses an operation on an account that has upgraded to a second logic the operator names', async () => {
+    await serveBothLogics();
     await fundPool();
     const control = controlUtxo(txHash(300), undefined, stateUnderLogicV2);
     const fund = fundUtxo(txHash(301), 20_000_000n);
@@ -607,7 +619,8 @@ describe('collateral mode policy', () => {
     expect(witnessAudit().at(-1)).toMatchObject({ outcome: 'issued', detail: { kind: 'operation', sponsoredLovelace: 0 } });
   });
 
-  it('known_logic: witnesses an upgrade from the current logic to the second version, both named by default', async () => {
+  it('known_logic: witnesses an upgrade from the current logic to a second one the operator names alongside it', async () => {
+    await serveBothLogics();
     await fundPool();
     placeParkedScripts();
     const { control, fund } = placeAccount();

@@ -95,13 +95,9 @@ sponsor's value from going anywhere but the fee and the account:
   control datum with no script hash in that field is refused too. The
   sponsor neither pays the fee of nor lends collateral to such a
   transaction, so an unknown logic can neither spend sponsor lovelace
-  nor put the shared collateral at risk. The list defaults to the two
-  versions of the shipped contract, logic v1
-  `2cd68e398bdf9fbc8d257614b54403451ee722520ec785fe14f8df5a`, which a new
-  account is created under, and logic v2
-  `69baa8a8c877247028c56c8130449e186e3658d541536d168f92db3d`, which an
-  upgrade moves an account to; both have been read, and an upgrade runs
-  both.
+  nor put the shared collateral at risk. The list defaults to
+  `2cd68e398bdf9fbc8d257614b54403451ee722520ec785fe14f8df5a`, the one
+  version every account is created under and runs.
 - `no_foreign_scripts` lets only the proxy lock an input or mint, since
   the stake validator has only withdraw and publish handlers. It admits
   a logic the transaction names in two places and nowhere else: as a withdrawal credential, since the zero
@@ -373,12 +369,13 @@ valid for as long as its bound allows.
   the service serving the accounts under it: their transactions are
   refused under `known_logic` and those accounts pay their own way from
   then on, which is the intended answer to a logic found wanting.
-- Keep both versions on the list while an upgrade window is open. The
-  upgrade transaction runs the version an account leaves and the one it
-  arrives at, and every account that has not moved keeps running the old
-  one, so the version left is what the upgrade itself needs and the
-  version arrived at is what the moved accounts need. Drop the old hash
-  only once no account still names it.
+- Should the contract gain a version accounts move to, keep both
+  versions on the list while the upgrade window is open. The upgrade
+  transaction runs the version an account leaves and the one it arrives
+  at, and every account that has not moved keeps running the old one, so
+  the version left is what the upgrade itself needs and the version
+  arrived at is what the moved accounts need. Drop the old hash only once
+  no account still names it.
 - Keep the pool small: a few fee UTxOs and a couple of collateral UTxOs,
   one shared and one spare, sized for the traffic expected, with the
   reserve holding what a replenish needs. The pool, not the reserve, is

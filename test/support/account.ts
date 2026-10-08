@@ -118,9 +118,9 @@ export const logicScript: PlutusScript = currentLogicScript(accountScriptHash, b
 export const logicHash = logicScriptHash(logicScript);
 
 /**
- * The contract's second logic version applied to the proxy hash, which
- * an upgrade moves an account to and which the service serves alongside
- * the current one.
+ * The second logic version the blueprint carries, applied to the proxy
+ * hash: a real script an upgrade can move an account to, which the
+ * service serves only once an operator names its hash.
  */
 export const logicV2Script: PlutusScript = logicVersionScript(LOGIC_V2_TITLE, accountScriptHash, blueprint);
 export const logicV2Hash = logicScriptHash(logicV2Script);
