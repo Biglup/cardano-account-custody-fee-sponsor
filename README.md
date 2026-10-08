@@ -563,7 +563,7 @@ the working directory is loaded into the environment first. Required:
 
 | Variable | Shape |
 | -------- | ----- |
-| `BLOCKFROST_PREPROD_PROJECT_ID` | Blockfrost project id for preprod |
+| `BLOCKFROST_PREPROD_PROJECT_ID` | Blockfrost project id for preprod; required unless `PROVIDER_BASE_URL` names an endpoint that needs none |
 | `SPONSOR_MNEMONIC` | 12, 15, 18, 21 or 24 lowercase words; the sponsor wallet is account 0, payment index 0, stake index 0 |
 | `ACCOUNT_SCRIPT_HASH` | the account proxy's hash, 56 hex characters |
 | `ADMIN_API_KEY` | the bearer token of the admin routes |
@@ -590,14 +590,43 @@ Optional, with defaults:
 | `TRUST_PROXY_HOPS` | `0` | reverse proxies in front of the service |
 | `PROVIDER_BASE_URL` | the hosted preprod endpoint | the Blockfrost compatible endpoint the service reads and submits through |
 
-`PROVIDER_BASE_URL` points the service at a Blockfrost compatible
-endpoint other than the hosted preprod one, such as the local devnet of
-the contract repository, which serves one at `http://localhost:8080/api/v1`
-and ignores the project id, so any placeholder satisfies
-`BLOCKFROST_PREPROD_PROJECT_ID` there. Nothing else about the service
-changes with it: the slot settings and the network magic stay preprod's,
-so a devnet whose slots do not map to time as preprod's do would give a
-witnessed transaction the wrong validity bound.
+The chain is reached one of two ways. With `PROVIDER_BASE_URL` unset
+the service calls the hosted preprod endpoint, which needs
+`BLOCKFROST_PREPROD_PROJECT_ID`. With `PROVIDER_BASE_URL` set the
+service calls that Blockfrost compatible endpoint instead, with the
+project id when one is set and with no `project_id` header at all when
+none is, since an endpoint that supplies its own project id may refuse
+a header that is present but blank. The Lace Blockfrost proxy is such an
+endpoint: one proxy base URL serves every network, the proxy routes by
+the path `<base>/<surface>/<network>`, where the surface is a route
+prefix the proxy's operators allocate to each application, and injects
+the project key itself. The service serves preprod only, so the
+operators allocate it a surface and the deployment sets
+
+```
+PROVIDER_BASE_URL=https://<proxy host>/<surface>/preprod/api/v0
+```
+
+and no `BLOCKFROST_PREPROD_PROJECT_ID`. The local devnet of the
+contract repository is another such endpoint, at
+`http://localhost:8080/api/v1`, and ignores the project id. A blank
+value in the environment file counts as unset for both variables.
+
+The provider library joins most routes to its endpoint with a slash on
+both sides, so what it composes carries a doubled slash, such as
+`/api/v0//tx/submit`, which the hosted endpoint tolerates and a proxy
+that routes by path may not. The service folds the two into one before
+the request leaves the process, so an endpoint sees its path followed
+by a single slash and the route, `/<surface>/preprod/api/v0/tx/submit`
+at the proxy, and never a doubled slash. The library also sends the
+project id header on every request whatever the project id is; the
+service sends no such header at all when it has no project id, so an
+endpoint that supplies its own never sees one that is present but blank.
+
+Nothing else about the service changes with the endpoint: the slot
+settings and the network magic stay preprod's, so a devnet whose slots
+do not map to time as preprod's do would give a witnessed transaction
+the wrong validity bound.
 
 `FEE_UTXO_LOVELACE` and `COLLATERAL_UTXO_LOVELACE` must differ by more
 than ten percent of the larger, or a UTxO of either size could not be
@@ -751,7 +780,7 @@ environment and kept out of shell histories, logs and images:
 | Variable | What it is |
 | -------- | ---------- |
 | `SPONSOR_MNEMONIC` | the sponsor wallet; whoever holds it holds the sponsor's funds |
-| `BLOCKFROST_PREPROD_PROJECT_ID` | the credential of the hosted provider |
+| `BLOCKFROST_PREPROD_PROJECT_ID` | the credential of the hosted provider; left unset behind an endpoint that supplies its own, such as the Lace proxy |
 | `ADMIN_API_KEY` | the bearer token of the admin routes, which issue and disable client keys |
 
 Plain values:
@@ -760,7 +789,7 @@ Plain values:
 | -------- | ---------- |
 | `ACCOUNT_SCRIPT_HASH` | required; the hash of the account proxy in the shipped blueprint, `ed61963ac94d12c0b320be5a336c36af66bc02c380e0aa3001899253`, which the service checks the blueprint against at startup |
 | `KNOWN_LOGIC_HASHES` | the logic versions served, defaulting to the current one; name a hash only after reading the version it stands for |
-| `PROVIDER_BASE_URL` | a Blockfrost compatible endpoint other than the hosted preprod one |
+| `PROVIDER_BASE_URL` | a Blockfrost compatible endpoint other than the hosted preprod one; behind the Lace proxy, `https://<proxy host>/<surface>/preprod/api/v0` with the surface the proxy's operators allocated to the service, and no project id |
 | `TRUST_PROXY_HOPS` | the number of reverse proxies in front of the service, and never more |
 | `LEASE_TTL_SECONDS`, `MAX_SPONSORED_LOVELACE`, `MAX_FEE_LOVELACE`, `FEE_UTXO_LOVELACE`, `COLLATERAL_UTXO_LOVELACE`, `FEE_UTXO_COUNT`, `COLLATERAL_UTXO_COUNT`, `VALIDITY_MARGIN_SECONDS`, `COLLATERAL_VALIDITY_SECONDS`, `IP_RATE_LIMIT_PER_MINUTE`, `KEY_RATE_LIMIT_PER_MINUTE` | the quotas and limits, with the defaults of the configuration table |
 

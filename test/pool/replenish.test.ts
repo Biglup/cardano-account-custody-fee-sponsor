@@ -1,9 +1,15 @@
+import { execFile } from 'node:child_process';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { type IncomingHttpHeaders, createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { OutOfFundsError } from '../../src/http/errors.js';
 import { buildSplitTransaction, createReplenish, planSplit } from '../../src/pool/replenish.js';
 import { REPLENISH_FEE_MARGIN } from '../../src/pool/sizes.js';
 import { type PoolSync, createPoolSync } from '../../src/pool/sync.js';
-import { type TestService, createTestService, txHash } from '../support/service.js';
+import { type TestService, createTestService, testEnv, txHash } from '../support/service.js';
 import { transactionParts } from '../support/transaction.js';
 
 let service: TestService;
@@ -221,5 +227,59 @@ describe('replenish', () => {
       detail: `The reserve holds 50000000 lovelace; a split needs at least ${100_000_000n + REPLENISH_FEE_MARGIN} to create one fee UTxO`,
     });
     expect(service.provider.submitted).toHaveLength(0);
+  });
+});
+
+/** The repository root, whatever the working directory. */
+const REPO_ROOT = resolve(import.meta.dirname, '..', '..');
+
+/** What the endpoint saw of one request: the method, the path with its query, and the headers as sent. */
+interface RecordedRequest {
+  method: string | undefined;
+  url: string | undefined;
+  headers: IncomingHttpHeaders;
+}
+
+/** What the command left behind: its exit code and what it wrote to stderr. */
+interface CommandOutcome {
+  code: number | string | undefined;
+  stderr: string;
+}
+
+/** Runs the replenish entry point in its own process, from `cwd`, with exactly the given environment. */
+const runReplenishCommand = (cwd: string, env: Record<string, string | undefined>): Promise<CommandOutcome> =>
+  new Promise((resolveOutcome) => {
+    execFile(resolve(REPO_ROOT, 'node_modules', '.bin', 'tsx'), [resolve(REPO_ROOT, 'src', 'pool', 'replenish.ts')], { cwd, env }, (error, _stdout, stderr) =>
+      resolveOutcome({ code: error === null ? 0 : (error.code ?? undefined), stderr }),
+    );
+  });
+
+describe('the replenish command', () => {
+  it('reaches the configured endpoint, with no project id header when none is configured', async () => {
+    const requests: RecordedRequest[] = [];
+    const server = createServer((req, res) => {
+      requests.push({ method: req.method, url: req.url, headers: req.headers });
+      res.setHeader('content-type', 'application/json');
+      res.end('[]');
+    });
+    await new Promise<void>((resolveListening) => server.listen(0, '127.0.0.1', resolveListening));
+    const { port } = server.address() as AddressInfo;
+    const directory = await mkdtemp(join(tmpdir(), 'sponsor-replenish-'));
+    const env = testEnv({ DATABASE_PATH: join(directory, 'sponsor.sqlite'), PROVIDER_BASE_URL: `http://127.0.0.1:${port}/surface/preprod/api/v0` });
+    delete (env as Record<string, string | undefined>).BLOCKFROST_PREPROD_PROJECT_ID;
+
+    try {
+      const outcome = await runReplenishCommand(directory, { PATH: process.env.PATH, ...env });
+
+      expect(outcome.stderr).toContain('Replenish failed: The reserve holds 0 lovelace');
+      expect(outcome.code).toBe(1);
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.method).toBe('GET');
+      expect(requests[0]?.url).toMatch(/^\/surface\/preprod\/api\/v0\/addresses\/addr_test1[0-9a-z]+\/utxos\?count=100&page=1$/);
+      expect(Object.keys(requests[0]?.headers ?? {})).not.toContain('project_id');
+    } finally {
+      server.close();
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });

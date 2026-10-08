@@ -2,6 +2,7 @@ import { config as loadEnvFile } from 'dotenv';
 import { Cometa } from './cometa.js';
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
+import { createProvider } from './provider.js';
 import { createService } from './service.js';
 
 loadEnvFile({ quiet: true });
@@ -15,11 +16,7 @@ const main = async (): Promise<void> => {
 
   await Cometa.ready();
 
-  const provider = new Cometa.BlockfrostProvider({
-    network: Cometa.NetworkMagic.Preprod,
-    projectId: config.blockfrostProjectId,
-    ...(config.blockfrostBaseUrl === undefined ? {} : { baseUrl: config.blockfrostBaseUrl }),
-  });
+  const provider = createProvider(config);
 
   const service = await createService({ config, provider, logger });
   await service.start();

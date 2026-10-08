@@ -15,15 +15,52 @@ const validEnv = (): Record<string, string> => ({
   ADMIN_API_KEY: 'test-admin-key',
 });
 
+/** The environment without the project id, as a deployment behind a proxy that supplies its own has it. */
+const envWithoutProjectId = (): Record<string, string> => {
+  const env = validEnv();
+  delete (env as Record<string, string | undefined>).BLOCKFROST_PREPROD_PROJECT_ID;
+  return env;
+};
+
+/** A proxy endpoint for preprod: the proxy's base, the surface its operators allocated to the service, the network and the API version. */
+const PROXY_ENDPOINT = 'https://proxy.example/sponsor/preprod/api/v0';
+
 describe('loadConfig', () => {
-  it('takes the Blockfrost compatible endpoint of the environment, such as a local devnet', () => {
+  it('reaches the hosted preprod endpoint with the project id when no endpoint is configured', () => {
+    const config = loadConfig(validEnv());
+
+    expect(config.blockfrostProjectId).toBe('preprodTestProjectId');
+    expect(config.blockfrostBaseUrl).toBeUndefined();
+  });
+
+  it('reaches a configured endpoint with no project id, as a proxy that supplies its own needs none', () => {
+    const config = loadConfig({ ...envWithoutProjectId(), PROVIDER_BASE_URL: PROXY_ENDPOINT });
+
+    expect(config.blockfrostProjectId).toBeUndefined();
+    expect(config.blockfrostBaseUrl).toBe(PROXY_ENDPOINT);
+  });
+
+  it('reaches a configured endpoint with the project id when both are set', () => {
     const config = loadConfig({ ...validEnv(), PROVIDER_BASE_URL: 'http://localhost:8080/api/v1' });
 
+    expect(config.blockfrostProjectId).toBe('preprodTestProjectId');
     expect(config.blockfrostBaseUrl).toBe('http://localhost:8080/api/v1');
   });
 
+  it('refuses an environment with neither a project id nor an endpoint, naming both variables', () => {
+    expect(() => loadConfig(envWithoutProjectId())).toThrow(
+      /BLOCKFROST_PREPROD_PROJECT_ID: BLOCKFROST_PREPROD_PROJECT_ID is required unless PROVIDER_BASE_URL names a Blockfrost compatible endpoint that needs no project id/,
+    );
+  });
+
+  it('reads a blank project id or a blank endpoint as unset, as an environment file with an empty line for it gives', () => {
+    expect(loadConfig({ ...validEnv(), BLOCKFROST_PREPROD_PROJECT_ID: '', PROVIDER_BASE_URL: PROXY_ENDPOINT }).blockfrostProjectId).toBeUndefined();
+    expect(loadConfig({ ...validEnv(), PROVIDER_BASE_URL: '' }).blockfrostBaseUrl).toBeUndefined();
+    expect(() => loadConfig({ ...validEnv(), BLOCKFROST_PREPROD_PROJECT_ID: '', PROVIDER_BASE_URL: '' })).toThrow(/BLOCKFROST_PREPROD_PROJECT_ID is required unless PROVIDER_BASE_URL/);
+  });
+
   it('refuses an endpoint that is not a URL', () => {
-    expect(() => loadConfig({ ...validEnv(), PROVIDER_BASE_URL: 'not a url' })).toThrow(ConfigError);
+    expect(() => loadConfig({ ...validEnv(), PROVIDER_BASE_URL: 'not a url' })).toThrow(/PROVIDER_BASE_URL must be a URL/);
   });
 
   it('parses a complete environment and fills in the documented defaults', () => {

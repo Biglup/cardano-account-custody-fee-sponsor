@@ -8,6 +8,7 @@ import { type Config, loadConfig } from '../config.js';
 import { openDatabase } from '../db/connection.js';
 import { applyMigrations } from '../db/migrations.js';
 import { OutOfFundsError } from '../http/errors.js';
+import { createProvider } from '../provider.js';
 import { bindSponsorAddress } from '../sponsor.js';
 import { type ServiceWallet, loadServiceWallet } from '../wallet.js';
 import { REPLENISH_FEE_MARGIN, minimumSplitLovelace } from './sizes.js';
@@ -170,7 +171,7 @@ const main = async (): Promise<void> => {
   delete process.env.ADMIN_API_KEY;
 
   await Cometa.ready();
-  const provider = new Cometa.BlockfrostProvider({ network: Cometa.NetworkMagic.Preprod, projectId: config.blockfrostProjectId });
+  const provider = createProvider(config);
   const serviceWallet = await loadServiceWallet(config, provider);
   const db = openDatabase(config.databasePath);
   applyMigrations(db, new Date());

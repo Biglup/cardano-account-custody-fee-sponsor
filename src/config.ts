@@ -50,10 +50,13 @@ const mnemonicSchema = z
 /** The blueprint of the contract build the service ships with, read unless `BLUEPRINT_PATH` names another. */
 const DEFAULT_BLUEPRINT_PATH = fileURLToPath(new URL('../contract/plutus.json', import.meta.url));
 
+/** A variable left blank, as an environment file with an empty line for it gives, counts as unset. */
+const blankAsUnset = (value: unknown): unknown => (value === '' ? undefined : value);
+
 /** The environment variables the service reads, with defaults for every operational tunable. */
 const envSchema = z.object({
-  BLOCKFROST_PREPROD_PROJECT_ID: z.string().min(1, 'BLOCKFROST_PREPROD_PROJECT_ID is required'),
-  PROVIDER_BASE_URL: z.string().url('PROVIDER_BASE_URL must be a URL').optional(),
+  BLOCKFROST_PREPROD_PROJECT_ID: z.preprocess(blankAsUnset, z.string().optional()),
+  PROVIDER_BASE_URL: z.preprocess(blankAsUnset, z.string().url('PROVIDER_BASE_URL must be a URL').optional()),
   SPONSOR_MNEMONIC: mnemonicSchema,
   ACCOUNT_SCRIPT_HASH: z.string().regex(SCRIPT_HASH, 'ACCOUNT_SCRIPT_HASH must be a 56 character hex script hash'),
   KNOWN_LOGIC_HASHES: logicHashesSchema.default([CURRENT_LOGIC_HASH]),
@@ -87,16 +90,30 @@ const MINIMUM_SIZE_SEPARATION = 0.1;
 const sizesAreDistinct = ({ FEE_UTXO_LOVELACE: fee, COLLATERAL_UTXO_LOVELACE: collateral }: { FEE_UTXO_LOVELACE: number; COLLATERAL_UTXO_LOVELACE: number }): boolean =>
   Math.abs(fee - collateral) > Math.max(fee, collateral) * MINIMUM_SIZE_SEPARATION;
 
+/**
+ * Whether the chain can be reached: the hosted endpoint needs a project
+ * id, while a configured endpoint may supply its own, as a proxy does,
+ * and need none from the service.
+ */
+const chainIsReachable = ({ BLOCKFROST_PREPROD_PROJECT_ID: projectId, PROVIDER_BASE_URL: baseUrl }: { BLOCKFROST_PREPROD_PROJECT_ID?: string | undefined; PROVIDER_BASE_URL?: string | undefined }): boolean =>
+  projectId !== undefined || baseUrl !== undefined;
+
 /** The environment schema with the checks that span more than one variable. */
-const configSchema = envSchema.refine(sizesAreDistinct, {
-  message: 'FEE_UTXO_LOVELACE and COLLATERAL_UTXO_LOVELACE must differ by more than 10 percent, or a UTxO of either size could not be told from the other',
-  path: ['COLLATERAL_UTXO_LOVELACE'],
-});
+const configSchema = envSchema
+  .refine(chainIsReachable, {
+    message: 'BLOCKFROST_PREPROD_PROJECT_ID is required unless PROVIDER_BASE_URL names a Blockfrost compatible endpoint that needs no project id',
+    path: ['BLOCKFROST_PREPROD_PROJECT_ID'],
+  })
+  .refine(sizesAreDistinct, {
+    message: 'FEE_UTXO_LOVELACE and COLLATERAL_UTXO_LOVELACE must differ by more than 10 percent, or a UTxO of either size could not be told from the other',
+    path: ['COLLATERAL_UTXO_LOVELACE'],
+  });
 
 /** The service configuration, derived once from the environment at startup. */
 export interface Config {
   network: Network;
-  blockfrostProjectId: string;
+  /** The project id the endpoint is called with, or none when `blockfrostBaseUrl` names an endpoint that supplies its own, such as a proxy. */
+  blockfrostProjectId: string | undefined;
   /** The Blockfrost compatible endpoint the service reads and submits through, or none for the hosted preprod one. */
   blockfrostBaseUrl: string | undefined;
   sponsorMnemonic: string[];

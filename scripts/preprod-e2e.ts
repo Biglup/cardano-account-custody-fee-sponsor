@@ -38,6 +38,7 @@ import type { RecordedAuditEntry } from '../src/audit.js';
 import type { PoolCounts } from '../src/http/health.js';
 import { createLogger } from '../src/logger.js';
 import { type ParsedOutput, type ParsedTransaction, parseTransaction } from '../src/policy/parse.js';
+import { createProvider } from '../src/provider.js';
 import { createService } from '../src/service.js';
 import { type SlotSettings, slotAt } from '../src/slots.js';
 
@@ -148,6 +149,12 @@ const walletOf = (provider: Provider, mnemonics: string[], account: number): Pro
     getPassword,
     credentialsConfig: { account, paymentIndex: 0, stakingIndex: 0 },
   });
+
+/** The service configuration with the project id the proof's own queries of the hosted endpoint need. */
+type ProofConfig = Config & { blockfrostProjectId: string };
+
+/** Whether the configuration carries a project id; the proof queries the hosted endpoint directly and cannot run without one. */
+const hasProjectId = (config: Config): config is ProofConfig => config.blockfrostProjectId !== undefined;
 
 /** Blockfrost's answer to a query, or undefined when the resource does not exist. */
 const blockfrost = async <T>(projectId: string, path: string): Promise<T | undefined> => {
@@ -289,7 +296,7 @@ interface FreshWallet {
  * the creation and the account pays for the rest, so a wallet holding
  * ADA would leave the proof open to paying from it.
  */
-const freshWallets = async (provider: Provider, config: Config, mnemonics: string[], count: number): Promise<FreshWallet[]> => {
+const freshWallets = async (provider: Provider, config: ProofConfig, mnemonics: string[], count: number): Promise<FreshWallet[]> => {
   const wallets: FreshWallet[] = [];
   for (let index = FIRST_FRESH_ACCOUNT; index < FIRST_FRESH_ACCOUNT + FRESH_ACCOUNT_CANDIDATES && wallets.length < count; index += 1) {
     const wallet = await walletOf(provider, mnemonics, index);
@@ -744,8 +751,11 @@ const main = async (): Promise<void> => {
   delete process.env.SPONSOR_MNEMONIC;
   delete process.env.BLOCKFROST_PREPROD_PROJECT_ID;
   delete process.env.ADMIN_API_KEY;
+  if (!hasProjectId(config)) {
+    throw new Error('The proof queries the hosted endpoint directly and needs BLOCKFROST_PREPROD_PROJECT_ID');
+  }
   await Cometa.ready();
-  const provider = new Cometa.BlockfrostProvider({ network: Cometa.NetworkMagic.Preprod, projectId: config.blockfrostProjectId });
+  const provider = createProvider(config);
 
   const logic = currentLogicHash(config.accountScriptHash);
   if (!config.knownLogicHashes.includes(logic)) {
