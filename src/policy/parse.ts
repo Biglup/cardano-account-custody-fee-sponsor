@@ -17,6 +17,8 @@ export interface ParsedOutput {
   stakeCredential: Credential | undefined;
   hasDatum: boolean;
   hasReferenceScript: boolean;
+  /** The Plutus language of the reference script the output carries, or undefined when it carries none or a native one. */
+  referenceScriptLanguage: PlutusLanguageVersion | undefined;
   /**
    * The 28 byte script hash the first field of the output's inline datum
    * names, when it carries one shaped that way. An account's control
@@ -88,6 +90,8 @@ export interface ParsedTransaction {
   collateralReturn: ParsedOutput | undefined;
   totalCollateral: bigint | undefined;
   requiredSigners: string[];
+  /** The script data hash the body commits to, when the body carries one. */
+  scriptDataHash: string | undefined;
   scripts: ParsedScript[];
   nativeScriptCount: number;
   redeemers: ParsedRedeemer[];
@@ -120,6 +124,7 @@ const integer = z.string().regex(/^-?[0-9]+$/);
 /** The parts of the view the policy reads, each left loose so a field it does not read never fails the parse. */
 const inputSchema = z.object({ transaction_id: hex.length(64), index: z.coerce.number().int().min(0) });
 const amountSchema = z.object({ coin: integer, assets: z.record(hash28, z.record(hex, integer)).optional() });
+const scriptRefSchema = z.object({ value: z.object({ language: z.string() }).loose().optional() }).loose();
 const outputSchema = z
   .object({ address: z.string(), amount: amountSchema, plutus_data: z.unknown().optional(), script_ref: z.unknown().optional() })
   .loose();
@@ -162,6 +167,7 @@ const bodySchema = z
     mint: z.array(mintSchema).optional(),
     collateral: z.array(inputSchema).optional(),
     required_signers: z.array(hash28).optional(),
+    script_data_hash: hex.length(64).optional(),
     collateral_return: outputSchema.optional(),
     total_collateral: integer.optional(),
     reference_inputs: z.array(inputSchema).optional(),
@@ -195,6 +201,17 @@ const PLUTUS_LANGUAGES: Record<string, PlutusLanguageVersion> = {
   plutus_v1: Cometa.PlutusLanguageVersion.V1,
   plutus_v2: Cometa.PlutusLanguageVersion.V2,
   plutus_v3: Cometa.PlutusLanguageVersion.V3,
+};
+
+/**
+ * The Plutus language of the reference script an output carries, as the
+ * CIP-116 view presents it; an output carrying none, or carrying a
+ * native script, is written in no Plutus language.
+ */
+const inspectedScriptLanguage = (scriptRef: unknown): PlutusLanguageVersion | undefined => {
+  const parsed = scriptRefSchema.safeParse(scriptRef);
+  const language = parsed.success ? parsed.data.value?.language : undefined;
+  return language === undefined ? undefined : PLUTUS_LANGUAGES[language];
 };
 
 /** The purpose a redeemer serves, by the name the CIP-116 view gives it; a provider names the same purposes as cometa does. */
@@ -308,6 +325,7 @@ const toOutput = (output: InspectedOutput): ParsedOutput => ({
   stakeCredential: stakeCredentialOf(output.address),
   hasDatum: output.plutus_data !== undefined,
   hasReferenceScript: output.script_ref !== undefined,
+  referenceScriptLanguage: inspectedScriptLanguage(output.script_ref),
   logicHash: inlineLogicHash(output.plutus_data),
 });
 
@@ -363,6 +381,8 @@ const toParsedOutput = (output: TxOut): ParsedOutput => ({
   stakeCredential: stakeCredentialOf(output.address),
   hasDatum: output.datum !== undefined || output.datumHash !== undefined,
   hasReferenceScript: output.scriptReference !== undefined,
+  referenceScriptLanguage:
+    output.scriptReference !== undefined && Cometa.isPlutusScript(output.scriptReference) ? output.scriptReference.version : undefined,
   logicHash: datumLogicHash(output.datum),
 });
 
@@ -433,6 +453,7 @@ export const parseTransaction = (cbor: string): ParseResult => {
       collateralReturn: body.collateral_return === undefined ? undefined : toOutput(body.collateral_return),
       totalCollateral: body.total_collateral === undefined ? undefined : BigInt(body.total_collateral),
       requiredSigners: body.required_signers ?? [],
+      scriptDataHash: body.script_data_hash,
       scripts: (witnessSet.plutus_scripts ?? []).map((script) => ({
         language: script.language,
         hash: Cometa.computeScriptHash({

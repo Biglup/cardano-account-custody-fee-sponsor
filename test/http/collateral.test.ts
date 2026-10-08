@@ -49,7 +49,7 @@ import {
   underDeclaringEvaluator,
 } from '../support/client.js';
 import { type TestService, createTestService, txHash } from '../support/service.js';
-import { markInvalid, outputWithDatumHash, withCollateralReturn, withTotalCollateral } from '../support/transaction.js';
+import { markInvalid, outputWithDatumHash, withCollateralReturn, withScriptDataHash, withTotalCollateral } from '../support/transaction.js';
 
 let service: TestService;
 let apiKey: string;
@@ -581,6 +581,19 @@ describe('collateral mode policy', () => {
       customise: (builder) => builder.sendLovelace({ address: enterpriseAddress(service.serviceWallet.paymentKeyHash), amount: 2_000_000n }),
     });
     expectViolation(await witness(bare), 'sponsor_outflow_zero', /An output pays 2000000 lovelace to the sponsor/);
+    expect(witnessCount()).toBe(0);
+  });
+
+  it('script_data_hash: refuses a body committing to script data the witness set does not carry, which an evaluator accepts all the same', async () => {
+    await fundPool();
+    const { control, fund } = placeAccount();
+    const shared = await collateral();
+    const transaction = await buildAccountPaidOperation(service, shared, control, fund);
+    const rewritten = withScriptDataHash(transaction, 'ab'.repeat(32));
+
+    expect(await service.provider.evaluateTransaction(rewritten)).toHaveLength(parseTransaction(transaction).transaction?.redeemers.length ?? 0);
+
+    expectViolation(await witness(rewritten), 'script_data_hash', /commits to the script data hash abab.* while the witness set carries script data hashing to /);
     expect(witnessCount()).toBe(0);
   });
 

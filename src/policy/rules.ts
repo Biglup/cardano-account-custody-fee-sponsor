@@ -1,10 +1,11 @@
-import type { AssetAmounts, Credential, Provider } from '@biglup/cometa';
+import type { AssetAmounts, Credential, PlutusLanguageVersion, Provider } from '@biglup/cometa';
 import { Cometa } from '../cometa.js';
 import type { PoolUtxo } from '../pool/utxo.js';
 import { utxoRef } from '../pool/utxo.js';
 import { type SlotSettings, slotAt, slotToTime } from '../slots.js';
 import { evaluates } from './evaluate.js';
-import type { ParsedCertificate, ParsedOutput, ParsedTransaction, ResolvedInput } from './parse.js';
+import { type ParsedCertificate, type ParsedOutput, type ParsedTransaction, type ResolvedInput, plutusLanguageOf } from './parse.js';
+import { type WitnessScriptData, scriptIntegrityHash, witnessScriptData } from './script-data.js';
 
 /**
  * The machine name of a policy rule, listed in the order the rules are
@@ -24,6 +25,7 @@ export type RuleName =
   | 'sponsor_outflow_zero'
   | 'no_sponsor_value_elsewhere'
   | 'no_foreign_scripts'
+  | 'script_data_hash'
   | 'evaluates'
   | 'signers';
 
@@ -702,6 +704,71 @@ const noForeignScripts: Rule = ({ transaction, inputs, stakeScriptHashes, logicH
 };
 
 /**
+ * The Plutus languages the transaction's scripts are written in: those
+ * of the scripts it attaches and those of the reference scripts the
+ * outputs it spends and references carry. The ledger prices each
+ * language under its own cost model, and the language view those models
+ * form is part of what the script data hash commits to.
+ */
+const languagesOf = ({ transaction, inputs, referenceInputs }: Analysis): PlutusLanguageVersion[] => [
+  ...transaction.scripts.map((script) => plutusLanguageOf(script.language)),
+  ...[...inputs, ...referenceInputs].flatMap((input) => {
+    const language = input.output?.referenceScriptLanguage;
+    return language === undefined ? [] : [language];
+  }),
+];
+
+/**
+ * The script data hash in the body matches the redeemers and the datums
+ * the witness set carries. The body commits to the hash and the
+ * sponsor's signature covers the body, but the redeemers and the datums
+ * sit in the witness set, which no signature covers, so a client is free
+ * to present one set for evaluation and attach another afterwards. The
+ * hash is recomputed here from the witness set as it stands, under the
+ * cost models the provider reports, and anything but an exact match is
+ * refused: a body committing to other script data than it carries, a
+ * body committing to none while the witness set carries redeemers or
+ * datums, and a body committing to one while it carries neither. Every
+ * script an account transaction runs is Plutus V3, so a transaction
+ * whose scripts are not all written in it is refused rather than hashed
+ * under a language view that would be a guess.
+ */
+const scriptDataHash = async (analysis: Analysis, provider: Provider): Promise<Violation | undefined> => {
+  const { transaction } = analysis;
+  const declared = transaction.scriptDataHash;
+  let data: WitnessScriptData;
+  try {
+    data = witnessScriptData(transaction.cbor);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'unknown error';
+    return violation('script_data_hash', `The witness set cannot be read for the script data it carries: ${message}`);
+  }
+  if (data.redeemers === undefined && data.datums === undefined) {
+    return declared === undefined
+      ? undefined
+      : violation('script_data_hash', `The body commits to the script data hash ${declared} while the witness set carries neither redeemers nor datums`);
+  }
+  if (declared === undefined) {
+    return violation('script_data_hash', 'The witness set carries redeemers or datums while the body commits to no script data hash');
+  }
+  const languages = languagesOf(analysis);
+  const foreign = languages.find((language) => language !== Cometa.PlutusLanguageVersion.V3);
+  if (foreign !== undefined) {
+    return violation('script_data_hash', `The transaction carries a script of Plutus language ${foreign}, and every script an account runs is Plutus V3`);
+  }
+  let computed: string | undefined;
+  try {
+    computed = scriptIntegrityHash(data, languages, await provider.getParameters());
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'unknown error';
+    return violation('script_data_hash', `The script data hash cannot be computed: ${message}`);
+  }
+  return computed === declared
+    ? undefined
+    : violation('script_data_hash', `The body commits to the script data hash ${declared} while the witness set carries script data hashing to ${computed}`);
+};
+
+/**
  * The sponsor signs as a payer only: neither of its keys is a required
  * signer, and nothing in the transaction, be it a withdrawal, a
  * certificate of any kind or a vote, is authorised by a sponsor key.
@@ -739,8 +806,9 @@ const BEFORE_EVALUATION: Rule[] = [accountTransaction, knownLogic, sponsorOutflo
 
 /**
  * Applies the policy to a transaction that already parsed, in rule
- * order: the structural rules first, then evaluation through the
- * provider, then the signer rules, stopping at the first violation. The
+ * order: the structural rules first, then the script data hash the body
+ * commits to, then evaluation through the provider, then the signer
+ * rules, stopping at the first violation. The
  * same rules serve both modes; the mode in the context decides what the
  * sponsor inputs, the collateral, the validity bound and the sponsor
  * outflow rules ask, and the name each answers under. The verdict also
@@ -774,6 +842,10 @@ export const applyPolicy = async (
     if (found !== undefined) {
       return refuse(found);
     }
+  }
+  const committed = await scriptDataHash(analysis, provider);
+  if (committed !== undefined) {
+    return refuse(committed);
   }
   const evaluation = await evaluates(transaction, inputs, referenceInputs, context, provider);
   if (evaluation !== undefined) {

@@ -6,6 +6,17 @@ import { transactionParts } from './transaction.js';
 /** A one half threshold, used wherever a governance threshold is needed. */
 const half = { numerator: 1, denominator: 2 };
 
+/**
+ * A Plutus V3 cost model: not the network's own, but long enough and
+ * varied enough that the language view built from it is no degenerate
+ * encoding, with a negative entry as the network's own model carries.
+ */
+const PLUTUS_V3_COSTS = [
+  100788, 420, 1, 1, 1000, 173, 0, 1, 1000, 59957, 4, 1, 11183, 32, 201305, 8356, 4, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000,
+  100, 100, 100, 16000, 100, 94375, 32, 132994, 32, 61462, 4, 72010, 178, 0, 1, 22151, 32, 91189, 769, 4, 2, 85848, 123203, 7305, -900, 1716, 549, 57,
+  85848, 0, 1,
+];
+
 /** Protocol parameters close to preprod's, enough for fee and script data hash computation. */
 export const PROTOCOL_PARAMETERS: ProtocolParameters = {
   minFeeA: 44,
@@ -25,7 +36,7 @@ export const PROTOCOL_PARAMETERS: ProtocolParameters = {
   protocolVersion: { major: 10, minor: 0 },
   minPoolCost: 170_000_000,
   adaPerUtxoByte: 4310,
-  costModels: [{ language: 'PlutusV3', costs: [] }],
+  costModels: [{ language: 'PlutusV3', costs: PLUTUS_V3_COSTS }],
   executionCosts: {
     memory: { numerator: 577, denominator: 10_000 },
     steps: { numerator: 721, denominator: 10_000_000 },

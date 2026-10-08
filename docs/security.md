@@ -102,6 +102,10 @@ sponsor's value from going anywhere but the fee and the account:
   entering the transaction, so the sponsor neither pays nor receives.
 - `no_sponsor_value_elsewhere` checks that every output away from the
   sponsor and the account is covered by the non sponsor inputs.
+- `script_data_hash` ties what is evaluated to what the body commits to:
+  the redeemers and the datums the witness set carries must hash, under
+  the cost models the provider reports, to the script data hash in the
+  body, which is the field the sponsor's signature covers.
 - `signers` refuses anything the sponsor's signature would authorise
   beyond paying: required signers, withdrawals, certificates and votes
   naming a sponsor key. The witness set that leaves the service is checked
@@ -118,6 +122,41 @@ so a witnessed transaction can only fail in phase one, which spends no
 collateral. A transaction flagged as failing is refused outright. This is
 what lets one collateral UTxO back every transaction at once, without a
 lease: nothing the service signs can take it.
+
+Evaluation alone does not establish that, because the sponsor signs a
+body and the scripts run on a witness set. The redeemers and the datums
+live in the witness set, which no signature covers: anyone may strip
+them, replace them or add to them after the fact without touching the
+body or invalidating the sponsor's signature. What ties the two together
+is the script data hash, which sits in the body and so is covered by the
+signature, and which the ledger recomputes from the redeemers, the
+datums and the cost models of the languages the transaction's scripts
+are written in, refusing in phase one any transaction whose witness set
+does not hash to it.
+
+An evaluation endpoint, however, judges the witness set in front of it
+and ignores the hash the body carries, since a builder cannot know that
+hash until the budgets are final. So evaluating one set of redeemers
+says nothing about the set the body commits to. A client that builds a
+body committing to script data it never shows, attaches honest redeemers
+to be evaluated, obtains the signature and then swaps in the data the
+body always committed to hands the ledger a transaction that passes
+phase one, since the attached data now matches the hash, and runs
+scripts nobody evaluated; redeemers under declaring their budgets then
+fail phase two and forfeit the shared collateral.
+
+The `script_data_hash` rule closes this, immediately before evaluation.
+The hash is recomputed from the witness set as it stands, over the
+redeemers, the datums when the transaction carries any, and the language
+view built from the cost models the provider reports, and anything but
+an exact match with the body's field is refused: other script data than
+the body commits to, a body committing to none while the witness set
+carries redeemers or datums, and a body committing to one while it
+carries neither. Only Plutus V3 scripts run under the account contract,
+so a transaction whose scripts are not all written in it is refused here
+rather than hashed under a guessed language view. What is then evaluated
+is the only script data the signed body will accept, which is what makes
+the evaluation binding.
 
 In collateral mode the shared collateral UTxO is the only sponsor value a
 transaction touches at all, since every sponsor input and every output to

@@ -57,8 +57,10 @@ import {
   withExtraCertificates,
   withExtraOutput,
   withInfoProposal,
+  withScriptDataHash,
   withTotalCollateral,
   withValidityUpperBound,
+  withoutScriptDataHash,
 } from '../support/transaction.js';
 
 let service: TestService;
@@ -806,6 +808,31 @@ describe('transaction policy', () => {
     });
 
     expectViolation(await witness(taken.leaseId, transaction), 'no_foreign_scripts', new RegExp(`Input ${txHash(400)}#0 is locked by script`));
+  });
+
+  it('script_data_hash: refuses a body committing to script data the witness set does not carry, which an evaluator accepts all the same', async () => {
+    await fundPool();
+    const taken = await lease();
+    const transaction = await buildCreation(service, taken);
+    const rewritten = withScriptDataHash(transaction, 'ab'.repeat(32));
+
+    expect(await service.provider.evaluateTransaction(rewritten)).toHaveLength(parseTransaction(transaction).transaction?.redeemers.length ?? 0);
+
+    expectViolation(await witness(taken.leaseId, rewritten), 'script_data_hash', /commits to the script data hash abab.* while the witness set carries script data hashing to /);
+    expect(service.db.prepare('SELECT COUNT(*) AS count FROM witnesses').get()).toEqual({ count: 0 });
+  });
+
+  it('script_data_hash: refuses a body committing to no script data hash while the witness set carries redeemers', async () => {
+    await fundPool();
+    const taken = await lease();
+    const transaction = await buildCreation(service, taken);
+
+    expectViolation(
+      await witness(taken.leaseId, withoutScriptDataHash(transaction)),
+      'script_data_hash',
+      /carries redeemers or datums while the body commits to no script data hash/,
+    );
+    expect(service.db.prepare('SELECT COUNT(*) AS count FROM witnesses').get()).toEqual({ count: 0 });
   });
 
   it('evaluates: refuses a transaction the provider cannot evaluate', async () => {

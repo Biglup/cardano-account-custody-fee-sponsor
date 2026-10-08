@@ -208,7 +208,9 @@ set.
 - 422 `invalid_transaction` with `rule` naming the first policy rule that
   failed and `detail` saying how; an operation on an existing account,
   which the fee route does not pay for, is refused here under
-  `sponsor_outflow_bounded`. The lease stays open.
+  `sponsor_outflow_bounded`, and a transaction whose witness set does not
+  match the script data hash its body commits to under
+  `script_data_hash`. The lease stays open.
 - 409 `lease_consumed` for a different transaction on a consumed lease.
 - 429 `quota_exceeded`, detail `witnesses_per_hour: ...` or
   `sponsored_lovelace_per_day: ...`. The lease stays open.
@@ -251,7 +253,9 @@ No lease is involved. The witness is keyed by the transaction hash: the
 same transaction presented again, by any key, receives the same witness
 set.
 
-- 422 `invalid_transaction` with `rule` and `detail`.
+- 422 `invalid_transaction` with `rule` and `detail`; a transaction whose
+  witness set does not match the script data hash its body commits to is
+  refused under `script_data_hash`.
 - 429 `quota_exceeded` under the key's witness quotas; a collateral
   witness sponsors zero lovelace, so the hourly witness quota is the one
   that applies.
@@ -432,13 +436,23 @@ name.
    makes it allowed: referencing the UTxO a logic is parked at does not.
    A grant UTxO names no stake script and no logic by itself: the
    control UTxO an agent spend references does.
-10. `evaluates`: the provider resolves every input and reference input
+10. `script_data_hash`: the script data hash the body commits to is the
+    one the witness set calls for. The hash is recomputed from the
+    redeemers and the datums the witness set carries, as they stand in
+    the transaction, and the language view of the cost models the
+    provider reports for the languages the transaction's scripts are
+    written in. A body committing to another hash, a body committing to
+    none while the witness set carries redeemers or datums, and a body
+    committing to one while it carries neither are all refused, as is a
+    transaction whose scripts are not all Plutus V3, which every script
+    an account runs is.
+11. `evaluates`: the provider resolves every input and reference input
     in one lookup and all of them exist, the provider evaluates the
     transaction with the sponsor UTxOs it builds on supplied, and every
     redeemer declares at least the memory and steps the evaluation
     found it needs; a provider that refuses the lookup is reported here
     too.
-11. `signers`: neither sponsor key is a required signer, no withdrawal
+12. `signers`: neither sponsor key is a required signer, no withdrawal
     draws from the sponsor's reward account, no certificate of any kind
     names a sponsor credential, and no voter is a sponsor credential; a
     signing that would produce any witness beyond the sponsor payment

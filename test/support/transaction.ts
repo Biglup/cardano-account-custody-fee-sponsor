@@ -15,6 +15,7 @@ const BODY_OUTPUTS = 1n;
 const BODY_FEE = 2n;
 const BODY_VALIDITY_UPPER_BOUND = 3n;
 const BODY_CERTIFICATES = 4n;
+const BODY_SCRIPT_DATA_HASH = 11n;
 const BODY_COLLATERAL_RETURN = 16n;
 const BODY_TOTAL_COLLATERAL = 17n;
 const BODY_PROPOSAL_PROCEDURES = 20n;
@@ -162,6 +163,25 @@ export const withBodyField = (txCbor: string, key: bigint, valueCbor: string): s
   const entries = [...readBodyEntries(items.body).filter((entry) => entry.key !== key), { key, value: bytes(valueCbor) }].sort((a, b) =>
     a.key < b.key ? -1 : a.key > b.key ? 1 : 0,
   );
+  const writer = new Cometa.CborWriter().startMap(entries.length);
+  for (const entry of entries) {
+    writer.writeUnsignedInt(entry.key).writeEncoded(entry.value);
+  }
+  return writeTransaction({ ...items, body: bytes(writer.encodeHex()) });
+};
+
+/**
+ * The same transaction with `hash` as the script data hash its body
+ * commits to, as a client that evaluates one set of redeemers and datums
+ * and attaches another leaves the body it had signed.
+ */
+export const withScriptDataHash = (txCbor: string, hash: string): string =>
+  withBodyField(txCbor, BODY_SCRIPT_DATA_HASH, new Cometa.CborWriter().writeByteString(bytes(hash)).encodeHex());
+
+/** The same transaction with its body committing to no script data hash at all, whatever its witness set carries. */
+export const withoutScriptDataHash = (txCbor: string): string => {
+  const items = readTransaction(txCbor);
+  const entries = readBodyEntries(items.body).filter((entry) => entry.key !== BODY_SCRIPT_DATA_HASH);
   const writer = new Cometa.CborWriter().startMap(entries.length);
   for (const entry of entries) {
     writer.writeUnsignedInt(entry.key).writeEncoded(entry.value);
