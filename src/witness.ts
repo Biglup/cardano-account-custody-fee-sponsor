@@ -45,7 +45,7 @@ export interface WitnessService {
 /** The tunables the policy depends on. */
 export type WitnessSettings = Pick<
   Config,
-  'accountScriptHash' | 'maxSponsoredLovelace' | 'maxFeeLovelace' | 'validityMarginSeconds' | 'collateralValiditySeconds' | 'slots'
+  'accountScriptHash' | 'knownLogicHashes' | 'maxSponsoredLovelace' | 'maxFeeLovelace' | 'validityMarginSeconds' | 'collateralValiditySeconds' | 'slots'
 >;
 
 /** Everything the witness service needs injected; `now` lets tests move the clock the validity bounds are measured against. */
@@ -136,6 +136,7 @@ export const createWitnessService = ({
   const policyContext = (mode: PolicyMode, shared: PoolUtxo): PolicyContext => ({
     sponsor: { address: serviceWallet.address, paymentKeyHash: serviceWallet.paymentKeyHash, stakeKeyHash: serviceWallet.stakeKeyHash },
     accountScriptHash: settings.accountScriptHash,
+    knownLogicHashes: new Set(settings.knownLogicHashes),
     mode,
     collateral: shared,
     limits: {

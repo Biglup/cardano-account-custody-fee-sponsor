@@ -19,6 +19,7 @@ export type RuleName =
   | 'uses_shared_collateral'
   | 'bounded_validity'
   | 'account_transaction'
+  | 'known_logic'
   | 'sponsor_outflow_bounded'
   | 'sponsor_outflow_zero'
   | 'no_sponsor_value_elsewhere'
@@ -59,6 +60,8 @@ export type PolicyMode = FeeMode | CollateralMode;
 export interface PolicyContext {
   sponsor: { address: string; paymentKeyHash: string; stakeKeyHash: string };
   accountScriptHash: string;
+  /** The logic scripts the service serves accounts under, by hash. */
+  knownLogicHashes: Set<string>;
   mode: PolicyMode;
   collateral: SponsorUtxo;
   limits: { maxSponsoredLovelace: number; maxFeeLovelace: number; validityMarginSeconds: number; collateralValiditySeconds: number };
@@ -110,6 +113,18 @@ interface AccountTokenInput {
   kind: 'control' | 'grant';
 }
 
+/**
+ * A logic script the transaction names, and where it names it: the datum
+ * of a control UTxO it spends or references, or the datum of a control
+ * output it writes, which is how a creation chooses its logic and an
+ * upgrade moves an account to another one. The hash is undefined when the
+ * datum names nothing a script hash could be read from.
+ */
+interface NamedLogic {
+  logic: string | undefined;
+  where: string;
+}
+
 /** The transaction classified against the sponsor and the account contract, which every rule after the first reads. */
 interface Analysis {
   transaction: ParsedTransaction;
@@ -127,6 +142,10 @@ interface Analysis {
   /** Why the transaction is neither an operation nor a creation, when it is neither. */
   notAccountTransaction: string | undefined;
   stakeScriptHashes: Set<string>;
+  /** Every logic the transaction names, with where it names it, for the known logic rule to judge. */
+  namedLogics: NamedLogic[];
+  /** The logic credentials a withdrawal may draw from: those the named logics resolve to. */
+  logicHashes: Set<string>;
   sponsoredLovelace: bigint;
 }
 
@@ -197,6 +216,40 @@ const accountTokenOf = (input: ResolvedInput, context: PolicyContext): AccountTo
   const kind = kinds.includes('control') ? 'control' : kinds[0];
   return kind === undefined ? undefined : { input, account, kind };
 };
+
+/**
+ * The account a control output belongs to: an output at an account
+ * address whose stake part is a script, holding the state NFT named
+ * after that very script. The validator pins the state NFT to such an
+ * output on every spend and at creation, so this is what names the logic
+ * the account runs once the transaction lands.
+ */
+const controlOutputAccount = (output: ParsedOutput, context: PolicyContext): string | undefined => {
+  if (!isAccountOutput(output, context) || !isScript(output.stakeCredential)) {
+    return undefined;
+  }
+  const account = output.stakeCredential.hash;
+  return output.assets[`${context.accountScriptHash}${account}`] === 1n ? account : undefined;
+};
+
+/**
+ * Every logic the transaction names: the one each control UTxO it spends
+ * or references names in its datum, and the one each control output it
+ * writes names. A creation names its initial logic in the one and only
+ * control output it writes, and an upgrade names the logic it leaves in
+ * the control UTxO it spends and the one it arrives at in the control
+ * output, which is why both are read and both withdraw.
+ */
+const namedLogicsOf = (controls: AccountTokenInput[], transaction: ParsedTransaction, context: PolicyContext): NamedLogic[] => [
+  ...controls.map((control) => ({
+    logic: control.input.output?.logicHash,
+    where: `The control UTxO ${control.input.ref} of account ${control.account}`,
+  })),
+  ...transaction.outputs.flatMap((output) => {
+    const account = controlOutputAccount(output, context);
+    return account === undefined ? [] : [{ logic: output.logicHash, where: `The control output of account ${account}` }];
+  }),
+];
 
 /** Whether a credential is the key the sponsor pays with or stakes with, whatever the view calls it. */
 const namesSponsorKey = (credential: Credential, sponsor: PolicyContext['sponsor']): boolean =>
@@ -313,7 +366,11 @@ const readAccountTransaction = (
  * against the sponsor and the account contract. A transaction spending a
  * control or a grant UTxO is an operation on that account, read against
  * the control UTxOs it spends or references; one spending neither is read
- * as a creation, or as no account transaction at all.
+ * as a creation, or as no account transaction at all. A reference input
+ * is never an input: a UTxO at a foreign address, as the one a reference
+ * script is parked at, is read as neither the sponsor's nor an account's,
+ * and a reference input holding an account token is read as a control
+ * UTxO only when it sits at the account address the token names.
  */
 const analyse = (transaction: ParsedTransaction, inputs: ResolvedInput[], referenceInputs: ResolvedInput[], context: PolicyContext): Analysis => {
   const sponsorInputs = inputs.filter((input) => isSponsorInput(input, context));
@@ -325,6 +382,7 @@ const analyse = (transaction: ParsedTransaction, inputs: ResolvedInput[], refere
   const foreignOutputs = transaction.outputs.filter((output) => !sponsorOutputs.includes(output) && !accountOutputs.includes(output));
   const reading = readAccountTransaction(transaction, accountTokenInputs, referencedControls, context);
   const controls = [...accountTokenInputs.filter((token) => token.kind === 'control'), ...referencedControls];
+  const namedLogics = namedLogicsOf(controls, transaction, context);
   const returned = balanceOf(sponsorOutputs)[LOVELACE] ?? 0n;
   return {
     transaction,
@@ -341,6 +399,8 @@ const analyse = (transaction: ParsedTransaction, inputs: ResolvedInput[], refere
     creation: reading.creation,
     notAccountTransaction: reading.reason,
     stakeScriptHashes: stakeScriptHashesOf(controls, reading.creation),
+    namedLogics,
+    logicHashes: new Set(namedLogics.flatMap((named) => (named.logic === undefined ? [] : [named.logic]))),
     sponsoredLovelace: context.mode.kind === 'fee' ? BigInt(context.mode.fee.lovelace) - returned : 0n,
   };
 };
@@ -463,6 +523,28 @@ const boundedValidity = ({ transaction }: Analysis, context: PolicyContext): big
 const accountTransaction: Rule = ({ notAccountTransaction }) =>
   notAccountTransaction === undefined ? undefined : violation('account_transaction', notAccountTransaction);
 
+/**
+ * Every logic the transaction names is one the service knows. An account
+ * runs the rules of the logic its control datum names, and the validator
+ * admits any registered script there, so a device that signs an upgrade
+ * to a hash the service does not know hands its account to code the
+ * service has never read: the sponsor neither pays for nor lends
+ * collateral to such an account. A control UTxO or output whose datum
+ * names no script hash at all is refused here too, since the validator
+ * reads that field and would abort on it.
+ */
+const knownLogic: Rule = ({ namedLogics }, { knownLogicHashes }) => {
+  for (const named of namedLogics) {
+    if (named.logic === undefined) {
+      return violation('known_logic', `${named.where} names no logic script hash in the first field of its datum`);
+    }
+    if (!knownLogicHashes.has(named.logic)) {
+      return violation('known_logic', `${named.where} names logic ${named.logic}, which is not one of the logic scripts the service knows`);
+    }
+  }
+  return undefined;
+};
+
 /** What an output carries beyond its value, when it carries anything: a datum or a reference script. */
 const carries = (output: ParsedOutput): 'datum' | 'reference script' | undefined =>
   output.hasDatum ? 'datum' : output.hasReferenceScript ? 'reference script' : undefined;
@@ -556,13 +638,22 @@ const noSponsorValueElsewhere: Rule = ({ transaction, otherInputs, foreignOutput
 };
 
 /**
- * Every script the transaction runs or attaches is the account script or
- * one of the account's stake scripts: those named by the control UTxOs
- * it spends or references, or the one it registers at creation.
+ * Every script the transaction runs or attaches belongs to the account:
+ * the account proxy, which pays for every account UTxO and mints every
+ * account token, one of the account's stake scripts, named by the
+ * control UTxOs it spends or references or registered at creation, or
+ * one of the logics those control UTxOs and the control outputs name,
+ * whose zero withdrawal is how the proxy runs the account's rules. A
+ * logic is a stake credential and never pays for an input, mints or
+ * appears on a certificate, so it is allowed only where the account
+ * needs it: as the credential of a withdrawal, and as an attached script
+ * for a transaction that embeds it rather than referencing a parked one.
  */
-const noForeignScripts: Rule = ({ transaction, inputs, stakeScriptHashes }, { accountScriptHash }) => {
+const noForeignScripts: Rule = ({ transaction, inputs, stakeScriptHashes, logicHashes }, { accountScriptHash }) => {
   const allowed = new Set([accountScriptHash, ...stakeScriptHashes]);
+  const runnable = new Set([...allowed, ...logicHashes]);
   const foreign = (hash: string): string => `${hash}, which is neither the account script nor its stake script`;
+  const unrunnable = (hash: string): string => `${hash}, which is neither the account script, its stake script nor a logic its control UTxOs name`;
   for (const input of inputs) {
     const credential = input.output?.paymentCredential;
     if (isScript(credential) && !allowed.has(credential.hash)) {
@@ -582,8 +673,8 @@ const noForeignScripts: Rule = ({ transaction, inputs, stakeScriptHashes }, { ac
     }
   }
   for (const withdrawal of transaction.withdrawals) {
-    if (isScript(withdrawal.credential) && !allowed.has(withdrawal.credential.hash)) {
-      return violation('no_foreign_scripts', `A withdrawal draws from script ${foreign(withdrawal.credential.hash)}`);
+    if (isScript(withdrawal.credential) && !runnable.has(withdrawal.credential.hash)) {
+      return violation('no_foreign_scripts', `A withdrawal draws from script ${unrunnable(withdrawal.credential.hash)}`);
     }
   }
   for (const voter of transaction.voters) {
@@ -595,8 +686,8 @@ const noForeignScripts: Rule = ({ transaction, inputs, stakeScriptHashes }, { ac
     return violation('no_foreign_scripts', 'The transaction carries native script witnesses, which no account transaction needs');
   }
   for (const script of transaction.scripts) {
-    if (!allowed.has(script.hash)) {
-      return violation('no_foreign_scripts', `The transaction attaches script ${foreign(script.hash)}`);
+    if (!runnable.has(script.hash)) {
+      return violation('no_foreign_scripts', `The transaction attaches script ${unrunnable(script.hash)}`);
     }
   }
   return undefined;
@@ -636,7 +727,7 @@ const signers: Rule = ({ transaction }, { sponsor }) => {
 const BEFORE_VALIDITY: Rule[] = [sponsorInputs, sponsorCollateral];
 
 /** The rules checked after the validity bound and before evaluation, in order. */
-const BEFORE_EVALUATION: Rule[] = [accountTransaction, sponsorOutflow, noSponsorValueElsewhere, noForeignScripts];
+const BEFORE_EVALUATION: Rule[] = [accountTransaction, knownLogic, sponsorOutflow, noSponsorValueElsewhere, noForeignScripts];
 
 /**
  * Applies the policy to a transaction that already parsed, in rule

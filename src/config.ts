@@ -11,6 +11,28 @@ const VALID_MNEMONIC_WORD_COUNTS = [12, 15, 18, 21, 24];
 const SCRIPT_HASH = /^[0-9a-f]{56}$/;
 
 /**
+ * The logic script every account the service serves runs unless the
+ * operator names more: the contract's first logic version applied to the
+ * account proxy's hash. An account's control UTxO names its logic by
+ * hash, and the service refuses to pay for or lend collateral to an
+ * account whose rules it does not know.
+ */
+export const CURRENT_LOGIC_HASH = '2cd68e398bdf9fbc8d257614b54403451ee722520ec785fe14f8df5a';
+
+/** The logic hashes a comma separated list names, with surrounding spaces and empty entries dropped. */
+const logicHashesSchema = z
+  .string()
+  .transform((value) =>
+    value
+      .split(',')
+      .map((hash) => hash.trim())
+      .filter((hash) => hash.length > 0),
+  )
+  .refine((hashes) => hashes.length > 0, 'KNOWN_LOGIC_HASHES must name at least one logic script hash')
+  .refine((hashes) => hashes.every((hash) => SCRIPT_HASH.test(hash)), 'KNOWN_LOGIC_HASHES must be 56 character hex script hashes separated by commas')
+  .refine((hashes) => new Set(hashes).size === hashes.length, 'KNOWN_LOGIC_HASHES must not name the same logic script hash twice');
+
+/**
  * The sponsor mnemonic, split into words and checked for shape only: word
  * count and lowercase letters. The validation message never repeats the
  * value under check, so a failure cannot leak the mnemonic into logs or
@@ -29,6 +51,7 @@ const envSchema = z.object({
   BLOCKFROST_PREPROD_PROJECT_ID: z.string().min(1, 'BLOCKFROST_PREPROD_PROJECT_ID is required'),
   SPONSOR_MNEMONIC: mnemonicSchema,
   ACCOUNT_SCRIPT_HASH: z.string().regex(SCRIPT_HASH, 'ACCOUNT_SCRIPT_HASH must be a 56 character hex script hash'),
+  KNOWN_LOGIC_HASHES: logicHashesSchema.default([CURRENT_LOGIC_HASH]),
   ADMIN_API_KEY: z.string().min(1, 'ADMIN_API_KEY is required'),
   PORT: z.coerce.number().int().min(1).max(65_535).default(8787),
   DATABASE_PATH: z.string().min(1).default('./data/sponsor.sqlite'),
@@ -70,6 +93,8 @@ export interface Config {
   blockfrostProjectId: string;
   sponsorMnemonic: string[];
   accountScriptHash: string;
+  /** The logic script hashes the service serves accounts under; a control datum naming any other is refused. */
+  knownLogicHashes: string[];
   adminApiKey: string;
   port: number;
   databasePath: string;
@@ -124,6 +149,7 @@ export const loadConfig = (env: Record<string, string | undefined> = process.env
     blockfrostProjectId: data.BLOCKFROST_PREPROD_PROJECT_ID,
     sponsorMnemonic: data.SPONSOR_MNEMONIC,
     accountScriptHash: data.ACCOUNT_SCRIPT_HASH,
+    knownLogicHashes: data.KNOWN_LOGIC_HASHES,
     adminApiKey: data.ADMIN_API_KEY,
     port: data.PORT,
     databasePath: data.DATABASE_PATH,

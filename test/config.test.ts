@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ConfigError, loadConfig } from '../src/config.js';
+import { CURRENT_LOGIC_HASH, ConfigError, loadConfig } from '../src/config.js';
 import { SLOT_SETTINGS_BY_NETWORK } from '../src/slots.js';
 
 const VALID_MNEMONIC = 'alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima';
@@ -7,7 +7,7 @@ const VALID_MNEMONIC = 'alpha bravo charlie delta echo foxtrot golf hotel india 
 const validEnv = (): Record<string, string> => ({
   BLOCKFROST_PREPROD_PROJECT_ID: 'preprodTestProjectId',
   SPONSOR_MNEMONIC: VALID_MNEMONIC,
-  ACCOUNT_SCRIPT_HASH: '6f275cca0cc4433e6a798d78a2db2934df60dc4fd989274a2d9bb434',
+  ACCOUNT_SCRIPT_HASH: 'ed61963ac94d12c0b320be5a336c36af66bc02c380e0aa3001899253',
   ADMIN_API_KEY: 'test-admin-key',
 });
 
@@ -18,7 +18,8 @@ describe('loadConfig', () => {
     expect(config.network).toBe('preprod');
     expect(config.blockfrostProjectId).toBe('preprodTestProjectId');
     expect(config.sponsorMnemonic).toEqual(VALID_MNEMONIC.split(' '));
-    expect(config.accountScriptHash).toBe('6f275cca0cc4433e6a798d78a2db2934df60dc4fd989274a2d9bb434');
+    expect(config.accountScriptHash).toBe('ed61963ac94d12c0b320be5a336c36af66bc02c380e0aa3001899253');
+    expect(config.knownLogicHashes).toEqual([CURRENT_LOGIC_HASH]);
     expect(config.adminApiKey).toBe('test-admin-key');
     expect(config.port).toBe(8787);
     expect(config.databasePath).toBe('./data/sponsor.sqlite');
@@ -106,5 +107,18 @@ describe('loadConfig', () => {
 
   it('rejects a malformed ACCOUNT_SCRIPT_HASH', () => {
     expect(() => loadConfig({ ...validEnv(), ACCOUNT_SCRIPT_HASH: 'not-a-hash' })).toThrow(/ACCOUNT_SCRIPT_HASH/);
+  });
+
+  it('reads KNOWN_LOGIC_HASHES as a comma separated list, trimmed, and rejects an empty, malformed or repeating one', () => {
+    const second = '11'.repeat(28);
+
+    expect(loadConfig({ ...validEnv(), KNOWN_LOGIC_HASHES: ` ${CURRENT_LOGIC_HASH} , ${second} ,` }).knownLogicHashes).toEqual([CURRENT_LOGIC_HASH, second]);
+    expect(() => loadConfig({ ...validEnv(), KNOWN_LOGIC_HASHES: ' , ' })).toThrow(/KNOWN_LOGIC_HASHES must name at least one logic script hash/);
+    expect(() => loadConfig({ ...validEnv(), KNOWN_LOGIC_HASHES: `${CURRENT_LOGIC_HASH},nonsense` })).toThrow(
+      /KNOWN_LOGIC_HASHES must be 56 character hex script hashes separated by commas/,
+    );
+    expect(() => loadConfig({ ...validEnv(), KNOWN_LOGIC_HASHES: `${CURRENT_LOGIC_HASH},${CURRENT_LOGIC_HASH}` })).toThrow(
+      /KNOWN_LOGIC_HASHES must not name the same logic script hash twice/,
+    );
   });
 });

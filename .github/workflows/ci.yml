@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Biglup/cardano-account-custody-contract
-          ref: b08a2e677a1d5818c40554df345e78a501b63eeb
+          ref: d6244ea34516fc18ff754a3f2fc5eedc7922e6b0
           path: cardano-account-custody-contract
       - uses: actions/setup-node@v4
         with:

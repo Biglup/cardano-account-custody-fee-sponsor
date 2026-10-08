@@ -26,13 +26,22 @@ import {
   grantUtxo,
   grantedState,
   initialState,
+  logicHash,
   operateRedeemer,
+  otherLogicHash,
+  otherLogicRewardAddress,
+  otherLogicScript,
+  parkedLogicUtxo,
+  parkedOtherLogicUtxo,
+  parkedProxyUtxo,
   pointerAddress,
   reserveDatum,
+  runRedeemer,
   scriptUtxo,
   stakeScript,
   stakeScriptHash,
   stateNftAssetId,
+  stateWithoutLogic,
   strangerAddress,
 } from '../support/account.js';
 import { buildAgentSpendOnLease, buildCreation, buildOwnerOperation, clientBuilder, sponsorUtxo, lenientEvaluator, underDeclaringEvaluator } from '../support/client.js';
@@ -104,6 +113,13 @@ const placeControl = (): UTxO => {
   return control;
 };
 
+/** Puts the UTxOs the proxy and the logics are parked at on the fake chain, as the setup of a network leaves them. */
+const placeParkedScripts = (): void => {
+  for (const parked of [parkedProxyUtxo, parkedLogicUtxo, parkedOtherLogicUtxo]) {
+    service.provider.addUtxo(parked);
+  }
+};
+
 /** The hash of the one verification key in a witness set. */
 const keyHashOf = (vkey: string): string => Cometa.uint8ArrayToHex(Cometa.Blake2b.computeHash(Cometa.hexToUint8Array(vkey), 28));
 
@@ -153,6 +169,22 @@ describe('POST /v1/leases/:id/witness', () => {
     const audit = service.db.prepare("SELECT outcome, detail FROM audit WHERE action = 'witness'").all() as { outcome: string; detail: string }[];
     expect(audit).toHaveLength(1);
     expect(JSON.parse(audit[0]?.detail ?? '{}')).toMatchObject({ leaseId: taken.leaseId, txHash: parsed?.hash, kind: 'creation' });
+  });
+
+  it('witnesses a creation that takes the proxy and the logic from the UTxOs they are parked at rather than embedding them', async () => {
+    await fundPool();
+    placeParkedScripts();
+    const taken = await lease();
+    const transaction = await buildCreation(service, taken, { referenced: true });
+
+    const response = await witness(taken.leaseId, transaction);
+
+    expect(response.status).toBe(200);
+    const parsed = parseTransaction(transaction).transaction;
+    expect(parsed?.scripts.map((script) => script.hash)).toEqual([stakeScriptHash]);
+    expect(parsed?.referenceInputs.map((input) => input.index).sort()).toEqual([parkedProxyUtxo.input.index, parkedLogicUtxo.input.index]);
+    expect(parsed?.withdrawals.map((withdrawal) => withdrawal.credential?.hash)).toEqual([logicHash]);
+    expect(lastWitnessAudit()).toMatchObject({ outcome: 'issued', detail: { kind: 'creation' } });
   });
 
   it('answers the same witness set again for the same transaction on a consumed lease', async () => {
@@ -590,6 +622,64 @@ describe('transaction policy', () => {
     const transaction = await buildCreation(service, taken, { controlAddress: disguisedAccountAddress });
 
     expectViolation(await witness(taken.leaseId, transaction), 'account_transaction', /staked to the registered stake credential/);
+  });
+
+  it('known_logic: refuses a creation whose control output names a logic the service does not know', async () => {
+    await fundPool();
+    const taken = await lease();
+    const transaction = await buildCreation(service, taken, { logic: otherLogicHash });
+
+    expectViolation(
+      await witness(taken.leaseId, transaction),
+      'known_logic',
+      new RegExp(`The control output of account ${stakeScriptHash} names logic ${otherLogicHash}, which is not one of the logic scripts the service knows`),
+    );
+  });
+
+  it('known_logic: refuses a creation whose control output names no logic at all in the first field of its datum', async () => {
+    await fundPool();
+    const taken = await lease();
+    const transaction = await buildCreation(service, taken, { state: stateWithoutLogic });
+
+    expectViolation(
+      await witness(taken.leaseId, transaction),
+      'known_logic',
+      new RegExp(`The control output of account ${stakeScriptHash} names no logic script hash in the first field of its datum`),
+    );
+  });
+
+  it('known_logic: serves a creation under a second logic once the operator names it', async () => {
+    service.close();
+    service = await createTestService({ KNOWN_LOGIC_HASHES: `${logicHash},${otherLogicHash}` });
+    apiKey = service.issueKey().apiKey;
+    await fundPool();
+    const taken = await lease();
+
+    const response = await witness(taken.leaseId, await buildCreation(service, taken, { logic: otherLogicHash }));
+
+    expect(response.status).toBe(200);
+    expect(lastWitnessAudit()).toMatchObject({ outcome: 'issued', detail: { kind: 'creation' } });
+  });
+
+  it('no_foreign_scripts: takes the withdrawal of the logic the control output names, and no other, however the other logic is attached', async () => {
+    await fundPool(2, 1);
+    placeParkedScripts();
+    const unnamed = new RegExp(`A withdrawal draws from script ${otherLogicHash}, which is neither the account script, its stake script nor a logic its control UTxOs name`);
+    const drawFromOtherLogic = { rewardAddress: otherLogicRewardAddress, amount: 0n, redeemer: runRedeemer };
+
+    const taken = await lease();
+    const embedded = await buildCreation(service, taken, {
+      referenced: true,
+      customise: (builder) => builder.addScript(otherLogicScript).withdrawRewards(drawFromOtherLogic),
+    });
+    expectViolation(await witness(taken.leaseId, embedded), 'no_foreign_scripts', unnamed);
+
+    const other = await lease();
+    const referenced = await buildCreation(service, other, {
+      referenced: true,
+      customise: (builder) => builder.addReferenceInput(parkedOtherLogicUtxo).withdrawRewards(drawFromOtherLogic),
+    });
+    expectViolation(await witness(other.leaseId, referenced), 'no_foreign_scripts', unnamed);
   });
 
   it('sponsor_outflow_bounded: refuses an owner operation and an agent spend, since a leased fee UTxO pays for account creation only', async () => {

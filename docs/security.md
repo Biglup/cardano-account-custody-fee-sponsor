@@ -48,17 +48,47 @@ sponsor's value from going anywhere but the fee and the account:
   in both modes, returned to the sponsor, and refuses a transaction that
   declares itself failing, which would forfeit the collateral outright.
 - `account_transaction` and `no_foreign_scripts` make sure the only
-  scripts that run are the account contract and the account's own stake
-  script; a lookalike policy, a foreign script input or a foreign
-  certificate is refused. The account a transaction operates is read
-  from the control or grant UTxOs it spends, which hold a token of the
-  account policy at the address the token is named after, and its stake
-  script from the control UTxO it spends or, as an agent spend does,
-  references. A grant UTxO spent without its account's control UTxO, a
-  referenced control UTxO of an account no input operates, a token of
-  the account policy held at the sponsor address, which the sponsor
-  input rules refuse first, and a grant shaped token under any other
-  policy are all refused.
+  scripts that run are the account proxy, the account's own stake script
+  and the logic holding the account's rules; a lookalike policy, a
+  foreign script input or a foreign certificate is refused. The account
+  a transaction operates is read from the control or grant UTxOs it
+  spends, which hold a token of the account policy at the address the
+  token is named after, and its stake script from the control UTxO it
+  spends or, as an agent spend does, references. A grant UTxO spent
+  without its account's control UTxO, a referenced control UTxO of an
+  account no input operates, a token of the account policy held at the
+  sponsor address, which the sponsor input rules refuse first, and a
+  grant shaped token under any other policy are all refused.
+- A reference input is never read as an input. The proxy and the logic
+  are usually parked in UTxOs at an address nobody can spend from and
+  referenced rather than carried, so a reference input at a foreign
+  address is allowed; it is read as neither the sponsor's nor an
+  account's, it names no stake script and no logic, and a UTxO holding
+  an account token counts as a control UTxO only at the account address
+  its token names. A sponsor UTxO among the reference inputs takes
+  nothing from the sponsor, and the same UTxO among the inputs is still
+  refused by the sponsor input rules, which read a sponsor payment
+  credential at any address.
+- `known_logic` keeps the sponsor out of accounts whose rules it has not
+  read. The proxy holds no rules of its own: it runs the logic script
+  the control datum names, and it admits whatever hash that datum
+  carries, so a device that signs an upgrade to an unknown logic hands
+  its account to code nobody vetted. Every logic a transaction names,
+  in the datum of each control UTxO it spends or references and of each
+  control output it writes, must be one `KNOWN_LOGIC_HASHES` lists; a
+  control datum with no script hash in that field is refused too. The
+  sponsor neither pays the fee of nor lends collateral to such a
+  transaction, so an unknown logic can neither spend sponsor lovelace
+  nor put the shared collateral at risk.
+- `no_foreign_scripts` admits one withdrawal credential beyond the
+  account's own scripts: a logic the transaction names, since the zero
+  withdrawal from the logic's reward account is how the proxy runs the
+  account's rules, and an upgrade names two, the logic it leaves and the
+  one it arrives at. Only a control UTxO's datum or a control output's
+  makes a logic allowed there; referencing the UTxO a logic is parked at
+  does not, and a logic is admitted nowhere else, neither as the payment
+  credential of an input, nor as a mint policy, nor on a certificate or
+  a vote.
 - `sponsor_outflow_bounded` lets a leased fee UTxO pay for an account
   creation and for nothing else: an operation on an existing account is
   refused on the fee route whatever it draws, so the sponsor's exposure
@@ -244,6 +274,13 @@ valid for as long as its bound allows.
   is not stored. Issue each client its own key with the quotas it needs,
   and disable a key through `DELETE /admin/keys/:id`, which refuses
   every later request with it and is written to the audit trail.
+- Name a logic in `KNOWN_LOGIC_HASHES` only after reading the version it
+  stands for, and only as the hash of that version applied to
+  `ACCOUNT_SCRIPT_HASH`. The list is what keeps the sponsor out of
+  accounts under rules nobody vetted. Taking a hash off the list stops
+  the service serving the accounts under it: their transactions are
+  refused under `known_logic` and those accounts pay their own way from
+  then on, which is the intended answer to a logic found wanting.
 - Keep the pool small: a few fee UTxOs and a couple of collateral UTxOs,
   one shared and one spare, sized for the traffic expected, with the
   reserve holding what a replenish needs. The pool, not the reserve, is

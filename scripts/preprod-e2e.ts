@@ -13,12 +13,15 @@ import {
   type GrantRequest,
   type GrantUtxo,
   LOVELACE,
+  type NetworkScripts,
   accountByOwner,
   createAccount,
+  currentLogicHash,
   encodeReserveDatum,
   findAccountUtxos,
   isGrantTokenName,
   issueGrant,
+  loadNetworkScripts,
   paymentKeyHashOf,
   posixTimeToSlot,
   revokeGrant,
@@ -313,8 +316,12 @@ const freshWallets = async (provider: Provider, config: Config, mnemonics: strin
   return wallets;
 };
 
-/** The initial state of an account owned by one key: that device alone and zero counters, as the validators demand of every new account. */
-const initialState = (owner: string): AccountState => ({ devices: [owner], grantGeneration: 0n, nextSlot: 0n, revoked: [], outstanding: 0n });
+/**
+ * The initial state of an account owned by one key: the logic it runs,
+ * that device alone and zero counters, as the validators demand of every
+ * new account.
+ */
+const initialState = (owner: string, logic: string): AccountState => ({ logic, devices: [owner], grantGeneration: 0n, nextSlot: 0n, revoked: [], outstanding: 0n });
 
 /** The hex length of a policy id, which every asset id starts with. */
 const POLICY_ID_LENGTH = 56;
@@ -513,6 +520,8 @@ interface Evidence {
   ranAt: string;
   sponsorAddress: string;
   accountScriptHash: string;
+  logicHash: string;
+  network: NetworkScripts;
   poolBefore: PoolCounts;
   replenish: ReplenishBody | undefined;
   poolAfter: PoolCounts;
@@ -580,8 +589,8 @@ const operationLines = (operation: Operation, signer: string, bound: string): st
 /** The evidence document. */
 const evidenceDocument = (evidence: Evidence): string => {
   const { owner, agent, recipient, lease, creation, grant } = evidence;
-  const issued = evidence.grantIssued.grants.find((candidate) => candidate.grant.slot === GRANT_SLOT);
-  const remainingCap = evidence.agentSpend.grants.find((candidate) => candidate.grant.slot === GRANT_SLOT)?.grant.scope.cap;
+  const issued = evidence.grantIssued.grants.find((candidate) => candidate.prefix.slot === GRANT_SLOT);
+  const remainingCap = evidence.agentSpend.grants.find((candidate) => candidate.prefix.slot === GRANT_SLOT)?.grant?.scope.cap;
   const lines = [
     '# Preprod evidence',
     '',
@@ -598,7 +607,11 @@ const evidenceDocument = (evidence: Evidence): string => {
     '## Setup',
     '',
     `- Sponsor address: \`${evidence.sponsorAddress}\``,
-    `- Account script hash: \`${evidence.accountScriptHash}\``,
+    `- Account proxy hash: \`${evidence.accountScriptHash}\``,
+    `- Logic script hash: \`${evidence.logicHash}\`, which every transaction but a plain deposit ran through a withdrawal of zero`,
+    evidence.network.references.length === 0
+      ? '- Reference scripts: none recorded for the network, so every transaction carried the scripts it ran'
+      : `- Reference scripts: ${evidence.network.references.length} parked on the network and referenced rather than carried`,
     `- Pool before the run: ${evidence.poolBefore.fee.free} free fee UTxOs, ${collateralSummary(evidence.poolBefore)}`,
     evidence.replenish?.txId
       ? `- Replenished with ${evidence.replenish.feeOutputs} fee and ${evidence.replenish.collateralOutputs} collateral UTxOs: ${link(evidence.replenish.txId)}`
@@ -658,7 +671,7 @@ const evidenceDocument = (evidence: Evidence): string => {
     '',
     `A lovelace grant in slot ${GRANT_SLOT} to the agent key through \`issueGrant\`: ${ada(grant.scope.perCallCap)} per call, ${ada(grant.scope.cap)} in total,`,
     `expiring at ${new Date(Number(grant.scope.expiresAt)).toISOString()}, the recipient address as the only recipient. The grant token is minted into`,
-    `a grant UTxO at the account address, paid from the funds, under generation ${issued === undefined ? 'unknown' : issued.grant.generation}; the fee`,
+    `a grant UTxO at the account address, paid from the funds, under generation ${issued?.grant?.generation ?? 'unknown'}; the fee`,
     "comes from the reserve, and the control UTxO's next slot and outstanding count move to one.",
     '',
     ...operationLines(evidence.grantIssued, 'the owner device', ADAPTER_BOUND),
@@ -734,6 +747,17 @@ const main = async (): Promise<void> => {
   await Cometa.ready();
   const provider = new Cometa.BlockfrostProvider({ network: Cometa.NetworkMagic.Preprod, projectId: config.blockfrostProjectId });
 
+  const logic = currentLogicHash(config.accountScriptHash);
+  if (!config.knownLogicHashes.includes(logic)) {
+    throw new Error(`The linked contract library pins logic ${logic}, which the service does not know; name it in KNOWN_LOGIC_HASHES`);
+  }
+  const network = loadNetworkScripts(config.network);
+  console.log(
+    network.references.length === 0
+      ? `Logic ${logic}; the contract checkout records no reference script for ${config.network}, so every transaction embeds the scripts it runs`
+      : `Logic ${logic}; ${network.references.length} scripts parked on ${config.network} are referenced rather than embedded`,
+  );
+
   const funding = await walletOf(provider, config.sponsorMnemonic, 0);
   const [owner, agent, recipient] = await freshWallets(provider, config, config.sponsorMnemonic, 3);
   if (owner === undefined || agent === undefined || recipient === undefined) {
@@ -775,7 +799,7 @@ const main = async (): Promise<void> => {
 
     console.log('Step 1: sponsored account creation in fee mode');
     const sponsor = new SponsorWallet({ baseUrl: running.baseUrl, apiKey, provider });
-    const creationTx = await createAccount({ owner: owner.keyHash, wallet: owner.wallet, sponsor, provider, state: initialState(owner.keyHash) });
+    const creationTx = await createAccount({ owner: owner.keyHash, wallet: owner.wallet, sponsor, provider, network, state: initialState(owner.keyHash, logic) });
     const lease = sponsor.lease;
     if (lease === undefined) {
       throw new Error('The sponsor wallet holds no lease after building');
@@ -851,7 +875,14 @@ const main = async (): Promise<void> => {
 
     console.log(`Step 3: owner spend of ${OWNER_SPEND_LOVELACE} lovelace to the recipient, paid from the account's reserve`);
     const ownerSpend = await operate('owner spend paid from the reserve', owner.wallet, 'owner', () =>
-      spendWithDevice({ owner: owner.keyHash, wallet: owner.wallet, collateral, provider, outputs: [{ address: recipient.address, value: { coins: OWNER_SPEND_LOVELACE } }] }),
+      spendWithDevice({
+        owner: owner.keyHash,
+        wallet: owner.wallet,
+        collateral,
+        provider,
+        network,
+        outputs: [{ address: recipient.address, value: { coins: OWNER_SPEND_LOVELACE } }],
+      }),
     );
     if (ownerSpend.amounts.reserveLovelace === undefined) {
       throw new Error('The owner spend did not draw its fee from the reserve');
@@ -871,9 +902,9 @@ const main = async (): Promise<void> => {
       },
     };
     const grantIssued = await operate('grant issued, paid from the account', owner.wallet, 'owner', () =>
-      issueGrant({ owner: owner.keyHash, wallet: owner.wallet, collateral, provider, grants: [grant] }),
+      issueGrant({ owner: owner.keyHash, wallet: owner.wallet, collateral, provider, network, grants: [grant] }),
     );
-    if (!grantIssued.grants.some((candidate) => candidate.grant.slot === GRANT_SLOT) || grantIssued.state.outstanding !== 1n) {
+    if (!grantIssued.grants.some((candidate) => candidate.prefix.slot === GRANT_SLOT) || grantIssued.state.outstanding !== 1n) {
       throw new Error('The account does not hold the issued grant UTxO');
     }
 
@@ -885,6 +916,7 @@ const main = async (): Promise<void> => {
         wallet: agent.wallet,
         collateral,
         provider,
+        network,
         slot: GRANT_SLOT,
         grantee: agent.keyHash,
         outputs: [{ address: recipient.address, value: { coins: lovelace } }],
@@ -921,7 +953,7 @@ const main = async (): Promise<void> => {
 
     console.log(`Step 7: grant in slot ${GRANT_SLOT} revoked, paid from the account`);
     const revoked = await operate('grant revoked, paid from the account', owner.wallet, 'owner', () =>
-      revokeGrant({ owner: owner.keyHash, wallet: owner.wallet, collateral, provider, slot: GRANT_SLOT }),
+      revokeGrant({ owner: owner.keyHash, wallet: owner.wallet, collateral, provider, network, slot: GRANT_SLOT }),
     );
     if (!revoked.state.revoked.includes(GRANT_SLOT)) {
       throw new Error('The control UTxO does not list the revoked slot');
@@ -929,7 +961,7 @@ const main = async (): Promise<void> => {
 
     console.log(`Step 8: dead grant in slot ${GRANT_SLOT} swept, paid from the account`);
     const swept = await operate('dead grant swept, paid from the account', owner.wallet, 'owner', () =>
-      sweepGrant({ owner: owner.keyHash, wallet: owner.wallet, collateral, provider, slots: [GRANT_SLOT] }),
+      sweepGrant({ owner: owner.keyHash, wallet: owner.wallet, collateral, provider, network, slots: [GRANT_SLOT] }),
     );
     if (swept.grants.length !== 0 || swept.state.outstanding !== 0n) {
       throw new Error('The account still holds a grant UTxO after the sweep');
@@ -942,7 +974,8 @@ const main = async (): Promise<void> => {
       wallet: recipient.wallet,
       sponsor: leaking,
       provider,
-      state: initialState(recipient.keyHash),
+      network,
+      state: initialState(recipient.keyHash, logic),
     });
     const leakingTxHash = parsed(leakingTx).hash;
     attempted.push({ hash: leakingTxHash, role: 'creation leaking sponsor value, refused by the service, never submitted' });
@@ -976,6 +1009,8 @@ const main = async (): Promise<void> => {
       ranAt: new Date().toISOString(),
       sponsorAddress: running.sponsorAddress,
       accountScriptHash: config.accountScriptHash,
+      logicHash: logic,
+      network,
       poolBefore: before.body.pool,
       replenish,
       poolAfter: after.body.pool,

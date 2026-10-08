@@ -9,6 +9,7 @@ import {
   DEVICE_KEY,
   GRANT_LOVELACE,
   GRANT_SLOT,
+  PARKED_LOVELACE,
   accountAddress,
   accountRewardAddress,
   accountScript,
@@ -25,9 +26,11 @@ import {
   grantUtxo,
   grantedState,
   initialState,
+  logicScript,
   operateRedeemer,
   otherControlUtxo,
   otherStakeScriptHash,
+  parkingAddress,
   scriptCredential,
   stakeScript,
   stakeScriptHash,
@@ -326,6 +329,57 @@ describe('a client trying to drain the sponsor', () => {
     });
     expectViolation(await witness(taken.leaseId, onLease), 'uses_leased_fee_input', new RegExp(`Input ${txHash(305)}#0 belongs to the sponsor but is not the leased fee UTxO`));
     expect(witnessCount()).toBe(0);
+  });
+
+  it('cannot pass a UTxO parking a reference script off as the account control UTxO by referencing it', async () => {
+    await fundPool();
+    const grant = grantUtxo(txHash(302));
+    const fund = fundUtxo(txHash(301), 20_000_000n);
+    const disguised: UTxO = {
+      input: { txId: txHash(307), index: 0 },
+      output: {
+        address: parkingAddress,
+        value: { coins: PARKED_LOVELACE, assets: { [stateNftAssetId]: 1n } },
+        datum: grantedState,
+        scriptReference: logicScript,
+      },
+    };
+    for (const utxo of [grant, fund, disguised]) {
+      service.provider.addUtxo(utxo);
+    }
+    const shared = await collateral();
+
+    const transaction = await buildAgentSpend(service, shared, { control: disguised, grant, fund });
+
+    expectViolation(
+      await collateralWitness(transaction),
+      'account_transaction',
+      new RegExp(`Input ${txHash(302)}#0 is a grant UTxO of account ${stakeScriptHash}, whose control UTxO is neither spent nor referenced`),
+    );
+    expect(witnessCount()).toBe(0);
+  });
+
+  it('gains nothing by referencing a sponsor UTxO instead of spending it, which the sponsor input rules still refuse', async () => {
+    await fundPool();
+    const control = controlUtxo(txHash(300));
+    const fund = fundUtxo(txHash(301), 20_000_000n);
+    service.provider.addUtxo(control);
+    service.provider.addUtxo(fund);
+    const shared = await collateral();
+    const reserve: UTxO = { input: { txId: txHash(308), index: 0 }, output: { address: shared.sponsorAddress, value: { coins: 100_000_000n } } };
+    service.provider.addUtxo(reserve);
+
+    const referencing = await buildAccountPaidOperation(service, shared, control, fund, {
+      customise: (builder) => builder.addReferenceInput(reserve),
+    });
+    expect((await collateralWitness(referencing)).status).toBe(200);
+    expect(lastAudit('witness')).toMatchObject({ outcome: 'issued', detail: { mode: 'collateral', kind: 'operation', sponsoredLovelace: 0 } });
+
+    const spending = await buildAccountPaidOperation(service, shared, control, fund, {
+      customise: (builder) => builder.addInput({ utxo: reserve }).sendLovelace({ address: strangerAddress, amount: 97_000_000n }),
+    });
+    expectViolation(await collateralWitness(spending), 'no_sponsor_inputs', new RegExp(`Input ${txHash(308)}#0 belongs to the sponsor, which contributes collateral only`));
+    expect(witnessCount()).toBe(1);
   });
 
   it('cannot pass a UTxO holding a grant shaped token of a foreign policy off as a grant UTxO', async () => {

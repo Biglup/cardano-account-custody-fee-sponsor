@@ -8,7 +8,7 @@ const TEST_MNEMONIC = 'test test test test test test test test test test test ju
 const testEnv = (): Record<string, string> => ({
   BLOCKFROST_PREPROD_PROJECT_ID: 'preprodTestProjectId',
   SPONSOR_MNEMONIC: TEST_MNEMONIC,
-  ACCOUNT_SCRIPT_HASH: '6f275cca0cc4433e6a798d78a2db2934df60dc4fd989274a2d9bb434',
+  ACCOUNT_SCRIPT_HASH: 'ed61963ac94d12c0b320be5a336c36af66bc02c380e0aa3001899253',
   ADMIN_API_KEY: 'test-admin-key',
 });
 

@@ -15,6 +15,8 @@ import {
   grantAssetId,
   grantUtxo,
   grantedState,
+  logicHash,
+  logicRewardAddress,
   pointerAddress,
   stakeScriptHash,
   stateNftAssetId,
@@ -63,11 +65,19 @@ describe('parseTransaction', () => {
     expect(parsed?.collateralReturn?.address).toBe(lease.sponsorAddress);
     expect(parsed?.totalCollateral).toBeGreaterThan(0n);
     expect(parsed?.requiredSigners).toEqual([DEVICE_KEY]);
-    expect(parsed?.scripts.map((script) => script.hash).sort()).toEqual([accountScriptHash, stakeScriptHash].sort());
-    expect(parsed?.redeemers.map((redeemer) => redeemer.purpose).sort()).toEqual([Cometa.RedeemerPurpose.certificate, Cometa.RedeemerPurpose.mint]);
+    expect(parsed?.withdrawals).toEqual([
+      { rewardAddress: logicRewardAddress.toAddress().toString(), credential: { hash: logicHash, type: Cometa.CredentialType.ScriptHash }, lovelace: 0n },
+    ]);
+    expect(parsed?.scripts.map((script) => script.hash).sort()).toEqual([accountScriptHash, stakeScriptHash, logicHash].sort());
+    expect(parsed?.redeemers.map((redeemer) => redeemer.purpose).sort()).toEqual([
+      Cometa.RedeemerPurpose.certificate,
+      Cometa.RedeemerPurpose.mint,
+      Cometa.RedeemerPurpose.withdrawal,
+    ]);
     expect(Object.fromEntries(parsed?.redeemers.map((redeemer) => [redeemer.purpose, redeemer.executionUnits]) ?? [])).toEqual({
       certificate: { memory: 900_000n, steps: 350_000_000n },
       mint: { memory: 1_200_000n, steps: 480_000_000n },
+      withdrawal: { memory: 600_000n, steps: 250_000_000n },
     });
     const control = parsed?.outputs.find((output) => output.address === accountAddress);
     expect(control?.paymentCredential).toEqual({ hash: accountScriptHash, type: Cometa.CredentialType.ScriptHash });

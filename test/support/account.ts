@@ -1,27 +1,26 @@
 import { readFileSync } from 'node:fs';
-import type { Credential, PlutusData, PlutusScript, RewardAddress, UTxO } from '@biglup/cometa';
+import type { PlutusData, PlutusScript, RewardAddress, UTxO } from '@biglup/cometa';
+import {
+  type AccountState,
+  type Blueprint,
+  type Grant,
+  applyParameters,
+  bytes,
+  currentLogicScript,
+  encodeAccountRedeemer,
+  encodeAccountState,
+  encodeGrant,
+  encodeLogicRedeemer,
+  encodeMintRedeemer,
+  encodeReserveDatum,
+  encodeStakeRedeemer,
+  logicScriptHash,
+  logicValidator,
+} from 'cardano-account-custody-offchain';
 import { Cometa } from '../../src/cometa.js';
 
-/** The parts of the contract's Aiken blueprint the fixtures read. */
-interface Blueprint {
-  validators: { title: string; compiledCode: string }[];
-}
-
-/** The scope of a grant as the fixtures write it: a lovelace grant with its caps, its expiry and its recipients. */
-export interface GrantScope {
-  perCallCap: bigint;
-  cap: bigint;
-  expiresAt: bigint;
-  recipients: string[];
-}
-
-/** A grant as the fixtures write it into a grant UTxO's datum. */
-export interface Grant {
-  slot: bigint;
-  grantee: string;
-  generation: bigint;
-  scope: GrantScope;
-}
+export type { AccountState, Grant };
+export { encodeAccountState, encodeGrant };
 
 /** The key of the account's only device, which signs every owner operation. */
 export const DEVICE_KEY = 'aa'.repeat(28);
@@ -38,6 +37,9 @@ export const CONTROL_LOVELACE = 2_000_000n;
 /** The lovelace a grant UTxO carries in the fixtures. */
 export const GRANT_LOVELACE = 2_000_000n;
 
+/** The lovelace a UTxO parking a reference script carries in the fixtures. */
+export const PARKED_LOVELACE = 30_000_000n;
+
 /** The slot of the fixture grant, the first an account issues. */
 export const GRANT_SLOT = 0n;
 
@@ -49,6 +51,9 @@ export const GRANT_FEE_BOUND = 1_500_000n;
 
 /** When the fixture grant expires: far enough out for every validity bound the tests set. */
 export const GRANT_EXPIRES_AT = 1_800_000_000_000n;
+
+/** The parameter the fixtures' second logic version is applied to, which is not the proxy hash and so yields another hash. */
+const OTHER_LOGIC_PARAMETER = '02'.repeat(28);
 
 /** The blueprint of the account custody contract, as `aiken build` writes it. */
 const blueprint = JSON.parse(readFileSync(new URL('./plutus.json', import.meta.url), 'utf8')) as Blueprint;
@@ -62,17 +67,21 @@ const compiledCode = (prefix: string): string => {
   return validator.compiledCode;
 };
 
-const plutusScript = (bytes: string): PlutusScript => ({ type: Cometa.ScriptType.Plutus, bytes, version: Cometa.PlutusLanguageVersion.V3 });
+const plutusScript = (code: string): PlutusScript => ({ type: Cometa.ScriptType.Plutus, bytes: code, version: Cometa.PlutusLanguageVersion.V3 });
 
-/** The account validator, whose hash is the payment credential of every account and the policy of every account token. */
+/**
+ * The account proxy, whose hash is the payment credential of every
+ * account and the policy of every account token. It takes no parameters,
+ * so the blueprint's code is the proxy every account on a network shares.
+ */
 export const accountScript = plutusScript(compiledCode('account.account'));
 export const accountScriptHash = Cometa.computeScriptHash(accountScript);
 
 /**
  * The account's stake script. The contract applies the stake validator
- * to the owner key and the account script hash; the fixtures use the
- * validator as the blueprint ships it, since the policy only ever
- * compares script hashes and never runs the script.
+ * to the owner key and the proxy hash; the fixtures use the validator as
+ * the blueprint ships it, since the policy only ever compares script
+ * hashes and never runs the script.
  */
 export const stakeScript = plutusScript(compiledCode('account_stake.account_stake'));
 export const stakeScriptHash = Cometa.computeScriptHash(stakeScript);
@@ -80,10 +89,25 @@ export const stakeScriptHash = Cometa.computeScriptHash(stakeScript);
 /** The stake script hash of another account, whose script the policy never runs either. */
 export const otherStakeScriptHash = '11'.repeat(28);
 
+/**
+ * The logic the fixture accounts run: the contract's current version
+ * applied to the proxy hash, which is what their control datum names and
+ * what the zero withdrawal of every operation draws from.
+ */
+export const logicScript: PlutusScript = currentLogicScript(accountScriptHash, blueprint);
+export const logicHash = logicScriptHash(logicScript);
+
+/** A second logic version, the same validator under another parameter, which an upgrade can move an account to. */
+export const otherLogicScript: PlutusScript = plutusScript(applyParameters(logicValidator(blueprint).compiledCode, [bytes(OTHER_LOGIC_PARAMETER)]));
+export const otherLogicHash = logicScriptHash(otherLogicScript);
+
 /** A script credential. */
 export const scriptCredential = (hash: string): { hash: string; type: typeof Cometa.CredentialType.ScriptHash } => ({ hash, type: Cometa.CredentialType.ScriptHash });
 
-/** The address of an account: the account script paying, the account's stake script staking. */
+/** The reward account of a script credential, which only that script may draw from. */
+export const rewardAddressOf = (hash: string): RewardAddress => Cometa.RewardAddress.fromCredentials(Cometa.NetworkId.Testnet, scriptCredential(hash));
+
+/** The address of an account: the account proxy paying, the account's stake script staking. */
 export const accountAddressOf = (stakeHash: string): string =>
   Cometa.BaseAddress.fromCredentials(Cometa.NetworkId.Testnet, scriptCredential(accountScriptHash), scriptCredential(stakeHash)).toAddress().toString();
 
@@ -94,7 +118,13 @@ export const accountAddress = accountAddressOf(stakeScriptHash);
 export const otherAccountAddress = accountAddressOf(otherStakeScriptHash);
 
 /** The reward account of the account's stake script. */
-export const accountRewardAddress: RewardAddress = Cometa.RewardAddress.fromCredentials(Cometa.NetworkId.Testnet, scriptCredential(stakeScriptHash));
+export const accountRewardAddress: RewardAddress = rewardAddressOf(stakeScriptHash);
+
+/** The reward account the zero withdrawal of the fixture accounts' logic draws from. */
+export const logicRewardAddress: RewardAddress = rewardAddressOf(logicHash);
+
+/** The reward account the second logic version's withdrawal draws from. */
+export const otherLogicRewardAddress: RewardAddress = rewardAddressOf(otherLogicHash);
 
 /** The asset id of an account's state NFT: the account policy and the stake script hash as the name. */
 export const stateNftAssetIdOf = (stakeHash: string): string => `${accountScriptHash}${stakeHash}`;
@@ -114,86 +144,80 @@ export const grantAssetIdOf = (slot: bigint): string => `${accountScriptHash}${g
 /** The asset id of the fixture grant's token. */
 export const grantAssetId = grantAssetIdOf(GRANT_SLOT);
 
-/** A constructor with the given index and fields. */
-const constr = (index: number, fields: PlutusData[] = []): PlutusData => ({ constructor: BigInt(index), fields: { items: fields } });
+/** The state of an account under `logic` owned by `device`: that one device, zero counters, no revoked slot. */
+export const initialStateUnder = (logic: string, device: string = DEVICE_KEY): AccountState => ({
+  logic,
+  devices: [device],
+  grantGeneration: 0n,
+  nextSlot: 0n,
+  revoked: [],
+  outstanding: 0n,
+});
 
-/** The devices, generation, next slot, revoked slots and outstanding count of an account state, as the fixtures write it. */
-export interface AccountState {
-  devices: string[];
-  grantGeneration: bigint;
-  nextSlot: bigint;
-  revoked: bigint[];
-  outstanding: bigint;
-}
+/** The inline datum of a freshly created account owned by `device`, under the logic the fixtures run. */
+export const initialStateOf = (device: string): PlutusData => encodeAccountState(initialStateUnder(logicHash, device));
 
-/** An account state as the inline datum of a control UTxO, with its fields in declaration order. */
-export const encodeState = (state: AccountState): PlutusData =>
-  constr(0, [
-    { items: state.devices.map((device) => Cometa.hexToUint8Array(device)) },
-    state.grantGeneration,
-    state.nextSlot,
-    { items: [...state.revoked] },
-    state.outstanding,
-  ]);
-
-/** The state of a freshly created account owned by `device`: that one device, zero counters, no revoked slot. */
-export const initialStateOf = (device: string): PlutusData => encodeState({ devices: [device], grantGeneration: 0n, nextSlot: 0n, revoked: [], outstanding: 0n });
-
-/** The state of a freshly created account: the fixture device, zero counters, no revoked slot. */
+/** The inline datum of a freshly created account: the fixture device, zero counters, no revoked slot. */
 export const initialState: PlutusData = initialStateOf(DEVICE_KEY);
 
-/** The state of the account once it has issued the fixture grant: the next slot and the outstanding count at one. */
-export const grantedState: PlutusData = encodeState({ devices: [DEVICE_KEY], grantGeneration: 0n, nextSlot: 1n, revoked: [], outstanding: 1n });
+/** The inline datum of a freshly created account naming `logic` in place of the one the fixtures run. */
+export const stateUnderLogic = (logic: string): PlutusData => encodeAccountState(initialStateUnder(logic));
 
-/** The asset class of lovelace: the empty policy id and the empty asset name. */
-const lovelaceAsset = constr(0, [new Uint8Array(0), new Uint8Array(0)]);
+/**
+ * A control datum whose first field is not a script hash, as a client
+ * writing a state of a shape the proxy cannot read a logic from leaves
+ * it: one field, an integer where the logic belongs.
+ */
+export const stateWithoutLogic: PlutusData = { constructor: 0n, fields: { items: [0n] } };
 
-/** A grant as the inline datum of a grant UTxO: the slot, the grantee, the generation and the scope, a lovelace scope with zero lovelace caps. */
-export const encodeGrant = (grant: Grant): PlutusData =>
-  constr(0, [
-    grant.slot,
-    Cometa.hexToUint8Array(grant.grantee),
-    grant.generation,
-    constr(0, [lovelaceAsset, grant.scope.perCallCap, grant.scope.cap, 0n, 0n, grant.scope.expiresAt, { items: grant.scope.recipients.map(encodeAddress) }]),
-  ]);
+/** The inline datum of the account once it has issued the fixture grant: the next slot and the outstanding count at one. */
+export const grantedState: PlutusData = encodeAccountState({ ...initialStateUnder(logicHash), nextSlot: 1n, outstanding: 1n });
 
-/** An address as the Plutus V3 script context presents it: a key or script credential, with an optional inline stake credential. */
-const encodeAddress = (address: string): PlutusData => {
-  const parsed = Cometa.Address.fromString(address);
-  const base = parsed.asBase();
-  const enterprise = parsed.asEnterprise();
-  const credential = (named: Credential): PlutusData => constr(named.type === Cometa.CredentialType.KeyHash ? 0 : 1, [Cometa.hexToUint8Array(named.hash)]);
-  if (base) {
-    return constr(0, [credential(base.getPaymentCredential()), constr(0, [constr(0, [credential(base.getStakeCredential())])])]);
-  }
-  if (enterprise) {
-    return constr(0, [credential(enterprise.getCredential()), constr(1)]);
-  }
-  throw new Error('Only base and enterprise addresses can be written into a grant');
-};
+/**
+ * The inline datum an upgrade writes back: the logic the account arrives
+ * at in the first field and the grant generation one higher, which is
+ * what kills every grant issued under the logic it leaves.
+ */
+export const upgradedState = (logic: string): PlutusData => encodeAccountState({ ...initialStateUnder(logic), grantGeneration: 1n });
 
 /** The fixture grant: slot zero to the agent key under generation zero, the cap per call and in total, no recipient restriction. */
-export const fixtureGrant: Grant = { slot: GRANT_SLOT, grantee: AGENT_KEY, generation: 0n, scope: { perCallCap: GRANT_CAP, cap: GRANT_CAP, expiresAt: GRANT_EXPIRES_AT, recipients: [] } };
+export const fixtureGrant: Grant = {
+  slot: GRANT_SLOT,
+  grantee: AGENT_KEY,
+  generation: 0n,
+  scope: {
+    asset: { policyId: '', assetName: '' },
+    perCallCap: GRANT_CAP,
+    cap: GRANT_CAP,
+    lovelacePerCallCap: 0n,
+    lovelaceCap: 0n,
+    expiresAt: GRANT_EXPIRES_AT,
+    recipients: [],
+  },
+};
 
 /** The grant after a spend that pays `lovelace` away: the remaining cap reduced by the payout and the fee bound, as the contract's builder writes it. */
 export const grantAfterSpend = (grant: Grant, lovelace: bigint): Grant => ({ ...grant, scope: { ...grant.scope, cap: grant.scope.cap - lovelace - GRANT_FEE_BOUND } });
 
-/** The spend redeemers of the account validator, in constructor order; none carries data. */
-export const deviceRedeemer: PlutusData = constr(0);
-export const spendWithGrantRedeemer: PlutusData = constr(1);
-export const sweepGrantRedeemer: PlutusData = constr(2);
-export const fundRedeemer: PlutusData = constr(3);
+/** The spend redeemers of the account proxy; none carries data. */
+export const deviceRedeemer: PlutusData = encodeAccountRedeemer({ kind: 'device' });
+export const spendWithGrantRedeemer: PlutusData = encodeAccountRedeemer({ kind: 'spendWithGrant' });
+export const sweepGrantRedeemer: PlutusData = encodeAccountRedeemer({ kind: 'sweepGrant' });
+export const fundRedeemer: PlutusData = encodeAccountRedeemer({ kind: 'fund' });
 
-/** The mint redeemers of the account validator, in constructor order; none carries data. */
-export const createAccountRedeemer: PlutusData = constr(0);
-export const issueGrantsRedeemer: PlutusData = constr(1);
-export const burnGrantsRedeemer: PlutusData = constr(2);
+/** The mint redeemers of the account proxy; none carries data. */
+export const createAccountRedeemer: PlutusData = encodeMintRedeemer({ kind: 'createAccount' });
+export const issueGrantsRedeemer: PlutusData = encodeMintRedeemer({ kind: 'issueGrants' });
+export const burnGrantsRedeemer: PlutusData = encodeMintRedeemer({ kind: 'burnGrants' });
 
 /** The redeemer of every stake script run, which carries no data. */
-export const operateRedeemer: PlutusData = constr(0);
+export const operateRedeemer: PlutusData = encodeStakeRedeemer();
+
+/** The redeemer of every logic run, which carries no data. */
+export const runRedeemer: PlutusData = encodeLogicRedeemer();
 
 /** The datum a reserve carries: constructor zero with no fields, which the validator never reads. */
-export const reserveDatum: PlutusData = constr(0);
+export const reserveDatum: PlutusData = encodeReserveDatum();
 
 /** The control UTxO of the account at a fictitious earlier transaction, carrying the state NFT and a state inline, the initial one unless given. */
 export const controlUtxo = (txId: string, lovelace = CONTROL_LOVELACE, state: PlutusData = initialState): UTxO => ({
@@ -245,12 +269,40 @@ export const byronAddress = Cometa.ByronAddress.fromCredentials(STRANGER_KEY, { 
   .toAddress()
   .toString();
 
-/** A script that is neither the account script nor an account's stake script: the always succeeding Plutus script. */
+/** A script that is neither the account proxy, an account's stake script nor a logic: the always succeeding Plutus script. */
 export const foreignScript: PlutusScript = plutusScript('4e4d01000033222220051200120011');
 export const foreignScriptHash = Cometa.computeScriptHash(foreignScript);
 
 /** The address paying to the foreign script. */
 export const foreignScriptAddress = Cometa.EnterpriseAddress.fromCredentials(Cometa.NetworkId.Testnet, scriptCredential(foreignScriptHash)).toAddress().toString();
+
+/**
+ * The always fail script the setup of a network parks its reference
+ * scripts under, so that nobody can spend the UTxOs holding them. The
+ * fixtures name its hash and never run it.
+ */
+export const parkingScriptHash = 'ab'.repeat(28);
+
+/** The address the reference scripts of the fixtures are parked at. */
+export const parkingAddress = Cometa.EnterpriseAddress.fromCredentials(Cometa.NetworkId.Testnet, scriptCredential(parkingScriptHash)).toAddress().toString();
+
+/** A UTxO parking a script as a reference script, as the setup of a network leaves it for every transaction to reference. */
+export const parkedScriptUtxo = (txId: string, index: number, script: PlutusScript): UTxO => ({
+  input: { txId, index },
+  output: { address: parkingAddress, value: { coins: PARKED_LOVELACE }, scriptReference: script },
+});
+
+/** The transaction the fixtures' parked reference scripts sit in. */
+export const PARKED_SCRIPTS_TX = 'cc'.repeat(32);
+
+/** The parked UTxO a transaction references the account proxy from. */
+export const parkedProxyUtxo: UTxO = parkedScriptUtxo(PARKED_SCRIPTS_TX, 0, accountScript);
+
+/** The parked UTxO a transaction references the logic the fixture accounts run from. */
+export const parkedLogicUtxo: UTxO = parkedScriptUtxo(PARKED_SCRIPTS_TX, 1, logicScript);
+
+/** The parked UTxO the second logic version sits at, which a transaction may reference without any account naming it. */
+export const parkedOtherLogicUtxo: UTxO = parkedScriptUtxo(PARKED_SCRIPTS_TX, 2, otherLogicScript);
 
 /** A UTxO at an address paying to a script, which only a transaction running that script can spend. */
 export const scriptUtxo = (txId: string, address: string, lovelace: bigint): UTxO => ({

@@ -1,4 +1,4 @@
-import type { AssetAmounts, Credential, PlutusLanguageVersion, Provider, RedeemerPurpose, TxIn, TxOut, UTxO } from '@biglup/cometa';
+import type { AssetAmounts, Credential, PlutusData, PlutusLanguageVersion, Provider, RedeemerPurpose, TxIn, TxOut, UTxO } from '@biglup/cometa';
 import { z } from 'zod';
 import { Cometa } from '../cometa.js';
 import { utxoRef } from '../pool/utxo.js';
@@ -17,6 +17,13 @@ export interface ParsedOutput {
   stakeCredential: Credential | undefined;
   hasDatum: boolean;
   hasReferenceScript: boolean;
+  /**
+   * The 28 byte script hash the first field of the output's inline datum
+   * names, when it carries one shaped that way. An account's control
+   * UTxO names there the logic script its rules live in, which is the
+   * only field of the state the account validator reads.
+   */
+  logicHash: string | undefined;
 }
 
 /**
@@ -117,6 +124,10 @@ const outputSchema = z
   .object({ address: z.string(), amount: amountSchema, plutus_data: z.unknown().optional(), script_ref: z.unknown().optional() })
   .loose();
 const credentialSchema = z.object({ tag: z.enum(['pubkey_hash', 'script_hash']), value: hash28 });
+const datumFieldSchema = z.object({ tag: z.string(), value: z.unknown().optional() }).loose();
+const inlineDatumSchema = z
+  .object({ tag: z.literal('datum'), value: z.object({ tag: z.literal('constr'), alternative: z.literal('0'), data: z.array(datumFieldSchema) }).loose() })
+  .loose();
 const poolParametersSchema = z.object({ operator: z.string(), reward_account: z.string(), pool_owners: z.array(hash28) }).loose();
 const certificateSchema = z
   .object({
@@ -226,6 +237,36 @@ const stakeCredentialOf = (address: string): Credential | undefined => {
   return parsed.asBase()?.getStakeCredential() ?? parsed.asReward()?.getCredential() ?? undefined;
 };
 
+/** The hex length of a 28 byte script hash, which is what a control datum names as its logic. */
+const SCRIPT_HASH_HEX_LENGTH = 56;
+
+/**
+ * The script hash the first field of an inline datum names, as the
+ * CIP-116 view of a transaction output presents the datum: a byte string
+ * of 28 bytes in the first field of the first constructor. A datum of any
+ * other shape, a datum hash and an output with no datum name none.
+ */
+const inlineLogicHash = (data: unknown): string | undefined => {
+  const parsed = inlineDatumSchema.safeParse(data);
+  const first = parsed.success ? parsed.data.value.data[0] : undefined;
+  return first?.tag === 'bytes' && typeof first.value === 'string' && first.value.length === SCRIPT_HASH_HEX_LENGTH && hash28.safeParse(first.value).success
+    ? first.value
+    : undefined;
+};
+
+/** The same first field, read off an inline datum as the chain reports it. */
+const datumLogicHash = (datum: PlutusData | undefined): string | undefined => {
+  if (datum === undefined || !Cometa.isPlutusDataConstr(datum) || datum.constructor !== 0n) {
+    return undefined;
+  }
+  const first = datum.fields.items[0];
+  if (first === undefined || !Cometa.isPlutusDataByteArray(first)) {
+    return undefined;
+  }
+  const hash = Cometa.uint8ArrayToHex(first);
+  return hash.length === SCRIPT_HASH_HEX_LENGTH ? hash : undefined;
+};
+
 /** The `txHash#index` reference of an input. */
 const inputRef = (input: TxIn): string => utxoRef(input.txId, input.index);
 
@@ -267,6 +308,7 @@ const toOutput = (output: InspectedOutput): ParsedOutput => ({
   stakeCredential: stakeCredentialOf(output.address),
   hasDatum: output.plutus_data !== undefined,
   hasReferenceScript: output.script_ref !== undefined,
+  logicHash: inlineLogicHash(output.plutus_data),
 });
 
 /** A certificate with every credential it names collected, so that no certificate kind can name a signer the policy does not see. */
@@ -321,6 +363,7 @@ const toParsedOutput = (output: TxOut): ParsedOutput => ({
   stakeCredential: stakeCredentialOf(output.address),
   hasDatum: output.datum !== undefined || output.datumHash !== undefined,
   hasReferenceScript: output.scriptReference !== undefined,
+  logicHash: datumLogicHash(output.datum),
 });
 
 /** A refusal under the first rule. */

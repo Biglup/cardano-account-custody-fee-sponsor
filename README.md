@@ -13,8 +13,8 @@ contract's own builders work unchanged.
 
 A custody account is created by a device key whose owner may hold no
 ADA. Creation costs a fee, a stake registration deposit and the lovelace
-of the control UTxO, and it needs collateral because the account script
-runs. The service lets a dApp pay for that: it leases one of its fee
+of the control UTxO, and it needs collateral because the account scripts
+run. The service lets a dApp pay for that: it leases one of its fee
 UTxOs to the dApp, the dApp builds the creation on it, and the service
 signs once the transaction draws nothing from the sponsor beyond the fee,
 the deposit and the control UTxO.
@@ -41,6 +41,32 @@ Two modes follow from this, both served by the same policy:
   sponsor; the sponsor declares collateral and nothing else, for any
   operation on an existing account.
 
+### The contract the policy reads
+
+Every account pays to one permanent script, the account proxy, whose
+hash is `ACCOUNT_SCRIPT_HASH` and is also the policy of every account
+token. The proxy holds no rules of its own: the account's rules live in
+a logic script, named by hash in the first field of the control UTxO's
+datum, and the proxy runs it by requiring a withdrawal of zero from that
+logic's reward account on every transaction that spends an account UTxO
+or mints under the policy, bar a plain deposit. An account moves to
+another version of its rules by writing a different logic into its
+control output, and that upgrade withdraws from both the logic it leaves
+and the one it arrives at.
+
+The service therefore reads the logic a transaction names and refuses
+any it does not know, under `known_logic`: an account whose rules the
+operator has never read is not one the sponsor pays for or lends
+collateral to. `KNOWN_LOGIC_HASHES` is the list it serves.
+
+The proxy and the logic are large scripts, so a network usually parks
+them in UTxOs at an address nobody can spend from and transactions
+reference them instead of carrying them. Such a reference input sits at
+a foreign address and is allowed, but a reference input is never read as
+an input: it is neither the sponsor's nor an account's, and it names no
+logic and no stake script. Only a control UTxO, spent or referenced at
+the account address its token is named after, does that.
+
 ## Flows
 
 ### Sponsored creation, fee mode
@@ -55,7 +81,7 @@ sequenceDiagram
     D->>D: createAccount builds on the leased fee UTxO and the shared collateral
     D->>S: POST /v1/leases/{id}/witness with the transaction
     S->>C: resolve the inputs, evaluate the scripts
-    S->>S: apply the ten rules in fee mode
+    S->>S: apply the policy rules in fee mode
     S-->>D: 200 sponsor witness set, lease consumed
     D->>D: append the owner device signature
     D->>C: submit
@@ -73,7 +99,7 @@ sequenceDiagram
     W->>W: build the operation paid from the account, collateral from the sponsor
     W->>S: POST /v1/collateral/witness with the transaction
     S->>C: resolve the inputs, evaluate the scripts
-    S->>S: apply the ten rules in collateral mode
+    S->>S: apply the policy rules in collateral mode
     S-->>W: 200 sponsor witness set keyed by transaction hash
     W->>W: append the device or agent signature
     W->>C: submit
@@ -366,8 +392,19 @@ name.
    an explicit deposit, names the token after that credential and locks
    it in exactly one output at an account address staked to that
    credential. A token under another policy, whatever its name, and a
-   token held at any other address count for nothing.
-6. `sponsor_outflow_bounded` in fee mode: the transaction is an account
+   token held at any other address count for nothing. A reference input
+   is never an input: one at any other address, as a parked reference
+   script is, is neither the sponsor's nor an account's, and one holding
+   an account token is read as a control UTxO only at the account
+   address its token names.
+6. `known_logic`: every logic the transaction names is one
+   `KNOWN_LOGIC_HASHES` lists. A logic is named in the first field of
+   the datum of each control UTxO the transaction spends or references
+   and of each control output it writes, which is where a creation
+   chooses its logic and an upgrade names the one it moves to; a datum
+   with no script hash in that field is refused here too, since the
+   proxy reads it.
+7. `sponsor_outflow_bounded` in fee mode: the transaction is an account
    creation, since a leased fee UTxO pays for nothing else and an
    operation on an existing account is refused whatever it draws; the
    fee is at most `MAX_FEE_LOVELACE`, exactly one output pays the sponsor
@@ -379,23 +416,29 @@ name.
    base, enterprise or pointer address, and no withdrawal draws from
    the sponsor's reward account; the fee is the account's and not
    capped.
-7. `no_sponsor_value_elsewhere`: every output away from the sponsor and
+8. `no_sponsor_value_elsewhere`: every output away from the sponsor and
    the account is covered, asset by asset, by the non sponsor inputs and
    the withdrawals that are not the sponsor's.
-8. `no_foreign_scripts`: every script input, mint policy, script
-   credential of a certificate, withdrawal or vote, and attached Plutus
-   script is the account script or the account's stake script, that is,
-   the stake script named by a control UTxO the transaction spends or
-   references, which is the name of its state NFT, or the one it
-   registers at creation, and the transaction carries no native script
-   witness. A grant UTxO names no stake script by itself: the control
-   UTxO an agent spend references does.
-9. `evaluates`: the provider resolves every input and reference input in
-   one lookup and all of them exist, the provider evaluates the
-   transaction with the sponsor UTxOs it builds on supplied, and every
-   redeemer declares at least the memory and steps the evaluation found
-   it needs; a provider that refuses the lookup is reported here too.
-10. `signers`: neither sponsor key is a required signer, no withdrawal
+9. `no_foreign_scripts`: every script input, mint policy, script
+   credential of a certificate or vote, and attached Plutus script is
+   the account proxy or the account's stake script, that is, the stake
+   script named by a control UTxO the transaction spends or references,
+   which is the name of its state NFT, or the one it registers at
+   creation, and the transaction carries no native script witness. A
+   withdrawal may draw from one more credential: a logic the transaction
+   names, under rule 6, since that zero withdrawal is how the proxy runs
+   the account's rules, and an upgrade names two. A logic is allowed
+   nowhere else, and only a control UTxO's datum or a control output's
+   makes it allowed: referencing the UTxO a logic is parked at does not.
+   A grant UTxO names no stake script and no logic by itself: the
+   control UTxO an agent spend references does.
+10. `evaluates`: the provider resolves every input and reference input
+    in one lookup and all of them exist, the provider evaluates the
+    transaction with the sponsor UTxOs it builds on supplied, and every
+    redeemer declares at least the memory and steps the evaluation
+    found it needs; a provider that refuses the lookup is reported here
+    too.
+11. `signers`: neither sponsor key is a required signer, no withdrawal
     draws from the sponsor's reward account, no certificate of any kind
     names a sponsor credential, and no voter is a sponsor credential; a
     signing that would produce any witness beyond the sponsor payment
@@ -483,13 +526,14 @@ the working directory is loaded into the environment first. Required:
 | -------- | ----- |
 | `BLOCKFROST_PREPROD_PROJECT_ID` | Blockfrost project id for preprod |
 | `SPONSOR_MNEMONIC` | 12, 15, 18, 21 or 24 lowercase words; the sponsor wallet is account 0, payment index 0, stake index 0 |
-| `ACCOUNT_SCRIPT_HASH` | the account validator's hash, 56 hex characters |
+| `ACCOUNT_SCRIPT_HASH` | the account proxy's hash, 56 hex characters |
 | `ADMIN_API_KEY` | the bearer token of the admin routes |
 
 Optional, with defaults:
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
+| `KNOWN_LOGIC_HASHES` | the current logic, `2cd68e398bdf9fbc8d257614b54403451ee722520ec785fe14f8df5a` | the logic script hashes the service serves accounts under, comma separated, each 56 hex characters |
 | `PORT` | `8787` | listening port |
 | `DATABASE_PATH` | `./data/sponsor.sqlite` | sqlite database file |
 | `LEASE_TTL_SECONDS` | `600` | how long a lease holds a fee UTxO |
@@ -507,7 +551,10 @@ Optional, with defaults:
 
 `FEE_UTXO_LOVELACE` and `COLLATERAL_UTXO_LOVELACE` must differ by more
 than ten percent of the larger, or a UTxO of either size could not be
-told from the other. The mnemonic reaches the process only through its
+told from the other. `KNOWN_LOGIC_HASHES` must name at least one hash
+and none of them twice; each is a logic version applied to
+`ACCOUNT_SCRIPT_HASH`, so naming a hash built against another proxy
+serves no account. The mnemonic reaches the process only through its
 environment: the service reads it once, derives the wallet, empties it
 from the configuration and removes `SPONSOR_MNEMONIC`,
 `BLOCKFROST_PREPROD_PROJECT_ID` and `ADMIN_API_KEY` from the process
@@ -522,18 +569,23 @@ Requires Node 22.
 2. Install dependencies with `npm ci`. The contract's off-chain library
    is a development dependency linked from a sibling checkout at
    `../cardano-account-custody-contract/offchain`, so the install needs
-   that checkout present. Only `npm run typecheck:scripts` and the
-   preprod proof use it, and both need it built there with `npm run
-   build` in that directory; the service, its tests, `npm run lint` and
-   `npm run typecheck` do not. The `file:` dependency and the continuous
-   integration workflow are pinned to contract commit `b08a2e6`, the one
-   whose builders the preprod proof builds on;
-   `package-lock.json` must be regenerated whenever the contract's
-   off-chain package changes its dependencies. The pinned commit is
-   revision 2 of the validators, with each grant in its own grant UTxO,
-   reserves, and the account validator at hash
-   `6f275cca0cc4433e6a798d78a2db2934df60dc4fd989274a2d9bb434`, which is
-   what `ACCOUNT_SCRIPT_HASH` must name.
+   that checkout present, built there with `npm run build` in that
+   directory: the test fixtures, `npm run typecheck:scripts` and the
+   preprod proof all read it, and only the service itself, `npm run
+   lint` and `npm run build` do without. The `file:` dependency and the
+   continuous integration workflow are pinned to contract commit
+   `d6244ea34516fc18ff754a3f2fc5eedc7922e6b0`, the one whose builders
+   the preprod proof builds on and whose blueprint
+   `test/support/plutus.json` is a copy of; `package-lock.json` must be
+   regenerated whenever the contract's off-chain package changes its
+   dependencies. The pinned commit is revision 3 of the validators, with
+   a permanent account proxy at hash
+   `ed61963ac94d12c0b320be5a336c36af66bc02c380e0aa3001899253`, which is
+   what `ACCOUNT_SCRIPT_HASH` must name, the account's rules in a
+   replaceable logic script, whose current version applied to that proxy
+   hashes to `2cd68e398bdf9fbc8d257614b54403451ee722520ec785fe14f8df5a`,
+   which is what `KNOWN_LOGIC_HASHES` defaults to, and the stake
+   validator applied to the same proxy hash.
 3. Start the service with `npm run dev`, or `npm run start` without the
    file watcher.
 
@@ -722,6 +774,12 @@ a creation paying sponsor value to a third party refused under
 `lease_consumed`, with every transaction, who paid what and every
 refusal body.
 
+The recorded run predates revision 3 of the contract, so the document
+describes the single account validator that revision replaced with the
+proxy and its logic; a rerun records the proxy hash, the logic every
+transaction withdrew zero from and whether the network's parked
+reference scripts were referenced.
+
 `npm run preprod-e2e` reruns it and rewrites the document. It spends
 test ADA from the sponsor wallet: it starts the service in this process
 from `.env` on a free local port, issues a client key, replenishes with
@@ -741,10 +799,10 @@ surroundings.
 
 ## Commands
 
-- `npm test` runs the test suite.
+- `npm test` runs the test suite, whose fixtures build their transactions with the sibling contract checkout's off-chain library and so need it built.
 - `npm run lint` runs eslint.
-- `npm run typecheck` runs the TypeScript compiler with no output over the service and its tests.
-- `npm run typecheck:scripts` does the same over `scripts`, which needs the sibling contract checkout built.
+- `npm run typecheck` runs the TypeScript compiler with no output over the service and its tests, which needs the sibling contract checkout built.
+- `npm run typecheck:scripts` does the same over `scripts`, which needs it too.
 - `npm run build` compiles the package to `dist`, which is what another project imports the client adapter from.
 - `npm run dev` runs the service with a file watcher; `npm run start` without.
 - `npm run replenish` splits the sponsor wallet into pool UTxOs up to the configured targets.

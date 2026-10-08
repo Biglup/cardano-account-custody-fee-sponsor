@@ -19,13 +19,21 @@ import {
   grantAssetId,
   grantUtxo,
   grantedState,
+  logicHash,
   operateRedeemer,
+  otherLogicHash,
   otherStakeScriptHash,
+  parkedLogicUtxo,
+  parkedOtherLogicUtxo,
+  parkedProxyUtxo,
   reserveUtxo,
-  scriptCredential,
+  rewardAddressOf,
   scriptUtxo,
   stakeScript,
   stakeScriptHash,
+  stateNftAssetId,
+  stateUnderLogic,
+  stateWithoutLogic,
   strangerAddress,
   sweepGrantRedeemer,
 } from '../support/account.js';
@@ -35,6 +43,7 @@ import {
   buildAgentSpend,
   buildCreation,
   buildReservePaidOperation,
+  buildUpgrade,
   collateralClientBuilder,
   sponsorUtxo,
   underDeclaringEvaluator,
@@ -87,6 +96,13 @@ const placeAccount = (): { control: UTxO; fund: UTxO } => {
   return { control, fund };
 };
 
+/** Puts the UTxOs the proxy and the logic are parked at on the fake chain, as the setup of a network leaves them. */
+const placeParkedScripts = (): void => {
+  for (const parked of [parkedProxyUtxo, parkedLogicUtxo, parkedOtherLogicUtxo]) {
+    service.provider.addUtxo(parked);
+  }
+};
+
 /** Puts an account that issued the fixture grant on the fake chain: its control UTxO, the grant UTxO and a fund UTxO. */
 const placeGrantedAccount = (): { control: UTxO; grant: UTxO; fund: UTxO } => {
   const control = controlUtxo(txHash(300), undefined, grantedState);
@@ -97,10 +113,6 @@ const placeGrantedAccount = (): { control: UTxO; grant: UTxO; fund: UTxO } => {
   service.provider.addUtxo(fund);
   return { control, grant, fund };
 };
-
-/** The reward address of the stake script `hash`, which only that script may draw from. */
-const rewardAddressOf = (hash: string): ReturnType<typeof Cometa.RewardAddress.fromCredentials> =>
-  Cometa.RewardAddress.fromCredentials(Cometa.NetworkId.Testnet, scriptCredential(hash));
 
 /** The number of witnesses issued so far. */
 const witnessCount = (): number => (service.db.prepare('SELECT COUNT(*) AS count FROM witnesses').get() as { count: number }).count;
@@ -222,6 +234,24 @@ describe('POST /v1/collateral/witness', () => {
     expect(witnessAudit()).toEqual([
       { outcome: 'issued', detail: { mode: 'collateral', txHash: parsed?.hash, kind: 'operation', sponsoredLovelace: 0, fee: parsed?.fee.toString() } },
     ]);
+  });
+
+  it('witnesses an owner operation that takes the proxy and the logic from the UTxOs they are parked at', async () => {
+    await fundPool();
+    placeParkedScripts();
+    const { control, fund } = placeAccount();
+    const shared = await collateral();
+    const transaction = await buildAccountPaidOperation(service, shared, control, fund, { referenced: true });
+    const parsed = parseTransaction(transaction).transaction;
+    expect(parsed?.scripts).toEqual([]);
+    expect(parsed?.referenceInputs.map((input) => input.index).sort()).toEqual([parkedProxyUtxo.input.index, parkedLogicUtxo.input.index]);
+    expect(parsed?.withdrawals.map((withdrawal) => withdrawal.credential?.hash)).toEqual([logicHash]);
+
+    const response = await witness(transaction);
+
+    expect(response.status).toBe(200);
+    expectSponsorWitness(response.body.witnessSet, transaction, [control, fund, sponsorUtxo(shared)], DEVICE_KEY);
+    expect(witnessAudit().at(-1)).toMatchObject({ outcome: 'issued', detail: { kind: 'operation', sponsoredLovelace: 0 } });
   });
 
   it('witnesses an owner operation paid from a reserve, recreated with the fee taken out', async () => {
@@ -460,9 +490,64 @@ describe('collateral mode policy', () => {
     expectViolation(
       await witness(other),
       'no_foreign_scripts',
-      new RegExp(`A withdrawal draws from script ${otherStakeScriptHash}, which is neither the account script nor its stake script`),
+      new RegExp(`A withdrawal draws from script ${otherStakeScriptHash}, which is neither the account script, its stake script nor a logic its control UTxOs name`),
     );
     expect(witnessCount()).toBe(1);
+  });
+
+  it('known_logic: refuses an operation whose control UTxO names a logic the service does not know, spent or referenced', async () => {
+    await fundPool();
+    const control = controlUtxo(txHash(300), undefined, stateUnderLogic(otherLogicHash));
+    const grant = grantUtxo(txHash(302));
+    const fund = fundUtxo(txHash(301), 20_000_000n);
+    for (const utxo of [control, grant, fund]) {
+      service.provider.addUtxo(utxo);
+    }
+    const shared = await collateral();
+    const unknown = new RegExp(
+      `The control UTxO ${txHash(300)}#0 of account ${stakeScriptHash} names logic ${otherLogicHash}, which is not one of the logic scripts the service knows`,
+    );
+
+    const spent = await buildAccountPaidOperation(service, shared, control, fund, { logic: otherLogicHash });
+    expectViolation(await witness(spent), 'known_logic', unknown);
+
+    const referenced = await buildAgentSpend(service, shared, { control, grant, fund }, { logic: otherLogicHash });
+    expectViolation(await witness(referenced), 'known_logic', unknown);
+    expect(witnessCount()).toBe(0);
+  });
+
+  it('known_logic: refuses an operation whose control UTxO names no logic at all in the first field of its datum', async () => {
+    await fundPool();
+    const control = controlUtxo(txHash(300), undefined, stateWithoutLogic);
+    const fund = fundUtxo(txHash(301), 20_000_000n);
+    service.provider.addUtxo(control);
+    service.provider.addUtxo(fund);
+    const shared = await collateral();
+
+    const transaction = await buildAccountPaidOperation(service, shared, control, fund);
+
+    expectViolation(
+      await witness(transaction),
+      'known_logic',
+      new RegExp(`The control UTxO ${txHash(300)}#0 of account ${stakeScriptHash} names no logic script hash in the first field of its datum`),
+    );
+    expect(witnessCount()).toBe(0);
+  });
+
+  it('known_logic: refuses an upgrade to a logic the service does not know, naming the control output it arrives at', async () => {
+    await fundPool();
+    placeParkedScripts();
+    const { control, fund } = placeAccount();
+    const shared = await collateral();
+
+    const transaction = await buildUpgrade(service, shared, control, fund, otherLogicHash, { referenced: true });
+
+    expectViolation(
+      await witness(transaction),
+      'known_logic',
+      new RegExp(`The control output of account ${stakeScriptHash} names logic ${otherLogicHash}, which is not one of the logic scripts the service knows`),
+    );
+    expect(witnessCount()).toBe(0);
   });
 
   it('sponsor_outflow_zero: refuses an output to the sponsor, at its address or at its payment key alone', async () => {
@@ -510,5 +595,49 @@ describe('collateral mode policy', () => {
 
     expectViolation(await witness(transaction), 'no_sponsor_inputs', new RegExp(`Input ${txHash(100)}#0 belongs to the sponsor`));
     expect(witnessCount()).toBe(1);
+  });
+});
+
+describe('an account upgrading its logic, with both versions known to the service', () => {
+  beforeEach(async () => {
+    service.close();
+    service = await createTestService({ KNOWN_LOGIC_HASHES: `${logicHash},${otherLogicHash}` });
+    apiKey = service.issueKey().apiKey;
+  });
+
+  it('witnesses an upgrade that withdraws from the logic it leaves and the logic it arrives at', async () => {
+    await fundPool();
+    placeParkedScripts();
+    const { control, fund } = placeAccount();
+    const shared = await collateral();
+    const transaction = await buildUpgrade(service, shared, control, fund, otherLogicHash, { referenced: true });
+    const parsed = parseTransaction(transaction).transaction;
+    expect(parsed?.withdrawals.map((withdrawal) => withdrawal.credential?.hash).sort()).toEqual([logicHash, otherLogicHash].sort());
+    expect(parsed?.outputs.find((output) => output.assets[stateNftAssetId] === 1n)?.logicHash).toBe(otherLogicHash);
+
+    const response = await witness(transaction);
+
+    expect(response.status).toBe(200);
+    expectSponsorWitness(response.body.witnessSet, transaction, [control, fund, sponsorUtxo(shared)], DEVICE_KEY);
+    expect(witnessAudit().at(-1)).toMatchObject({ outcome: 'issued', detail: { kind: 'operation', sponsoredLovelace: 0 } });
+  });
+
+  it('refuses an upgrade that withdraws from neither of the two logics it names', async () => {
+    await fundPool();
+    placeParkedScripts();
+    const { control, fund } = placeAccount();
+    const shared = await collateral();
+
+    const transaction = await buildUpgrade(service, shared, control, fund, otherLogicHash, {
+      referenced: true,
+      customise: (builder) => builder.withdrawRewards({ rewardAddress: rewardAddressOf(otherStakeScriptHash), amount: 0n, redeemer: operateRedeemer }).addScript(stakeScript),
+    });
+
+    expectViolation(
+      await witness(transaction),
+      'no_foreign_scripts',
+      new RegExp(`A withdrawal draws from script ${otherStakeScriptHash}, which is neither the account script, its stake script nor a logic its control UTxOs name`),
+    );
+    expect(witnessCount()).toBe(0);
   });
 });
