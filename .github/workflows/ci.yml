@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: Biglup/cardano-account-custody-contract
-          ref: d6244ea34516fc18ff754a3f2fc5eedc7922e6b0
+          ref: 393a593d6ed52fbcc5c726f54854a576990b7a6d
           path: cardano-account-custody-contract
       - uses: actions/setup-node@v4
         with:
@@ -28,6 +28,7 @@ jobs:
       - run: npm run build
         working-directory: cardano-account-custody-contract/offchain
       - run: npm ci
+      - run: cmp contract/plutus.json ../cardano-account-custody-contract/plutus.json
       - run: npm run lint
       - run: npm run typecheck
       - run: npm run typecheck:scripts

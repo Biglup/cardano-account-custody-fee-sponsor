@@ -2,10 +2,12 @@ import type Database from 'better-sqlite3';
 import type { Provider } from '@biglup/cometa';
 import type { Express } from 'express';
 import type { Logger } from 'pino';
+import { loadStakeValidator } from './blueprint.js';
 import type { Config } from './config.js';
 import { openDatabase } from './db/connection.js';
 import { applyMigrations } from './db/migrations.js';
 import { createApp } from './http/app.js';
+import { type StakeScriptHashOf, createStakeScriptDerivation } from './policy/stake-script.js';
 import { type SharedCollateral, createSharedCollateral } from './pool/collateral.js';
 import { type LeaseService, createLeaseService } from './pool/leases.js';
 import { type ReplenishFn, createReplenish } from './pool/replenish.js';
@@ -14,6 +16,9 @@ import { type WitnessStore, createWitnessStore } from './pool/witnesses.js';
 import { bindSponsorAddress } from './sponsor.js';
 import { type ServiceWallet, loadServiceWallet } from './wallet.js';
 import { type WitnessService, createWitnessService } from './witness.js';
+
+/** A device key the stake validator is applied to once at startup, so a blueprint whose validator is not a Plutus program fails before the service serves anything. */
+const PROBE_DEVICE_KEY = '00'.repeat(28);
 
 /** Everything the service is assembled from; `now` lets tests move the clock every component reads. */
 export interface ServiceDependencies {
@@ -29,6 +34,8 @@ export interface Service {
   db: Database.Database;
   provider: Provider;
   serviceWallet: ServiceWallet;
+  /** The stake script hash of the account a device key owns, derived from the contract build, which a creation must register. */
+  stakeScriptHashOf: StakeScriptHashOf;
   sync: PoolSync;
   collateral: SharedCollateral;
   witnesses: WitnessStore;
@@ -45,8 +52,12 @@ export interface Service {
 /**
  * Assembles the service from its configuration and a provider: the
  * sponsor wallet derived from the mnemonic, which is wiped from the
- * configuration in the process, the database at the configured path with
- * its migrations applied and bound to the sponsor address, which refuses
+ * configuration in the process, the stake script derivation over the
+ * account stake validator read from the blueprint at the configured
+ * path, which must be the build the configured account script hash
+ * names and is applied once here so a validator that is no program
+ * fails now rather than on the first creation, the database at the
+ * configured path with its migrations applied and bound to the sponsor address, which refuses
  * a database of another sponsor, the pool sync, the shared collateral, the
  * witness store, the lease, replenish and witness services, and the
  * express application over them. Nothing is started;
@@ -60,6 +71,13 @@ export const createService = async ({ config, provider, logger, now = () => new 
     serviceWallet = await loadServiceWallet(config, provider);
   } catch {
     throw new Error('Failed to derive the sponsor wallet from SPONSOR_MNEMONIC');
+  }
+  const stakeScriptHashOf = createStakeScriptDerivation(loadStakeValidator(config.blueprintPath, config.accountScriptHash), config.accountScriptHash);
+  try {
+    stakeScriptHashOf(PROBE_DEVICE_KEY);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'unknown error';
+    throw new Error(`The stake validator in the blueprint at ${config.blueprintPath} is not a Plutus program: ${message}`);
   }
 
   const db = openDatabase(config.databasePath);
@@ -76,7 +94,7 @@ export const createService = async ({ config, provider, logger, now = () => new 
   const witnesses = createWitnessStore({ db, now });
   const leases = createLeaseService({ db, sync, witnesses, settings: config, now, logger });
   const replenish = createReplenish({ db, provider, serviceWallet, sync, settings: config, logger });
-  const witness = createWitnessService({ db, provider, serviceWallet, leases, witnesses, collateral, settings: config, now, logger });
+  const witness = createWitnessService({ db, provider, serviceWallet, stakeScriptHashOf, leases, witnesses, collateral, settings: config, now, logger });
 
   const app = createApp({
     db,
@@ -99,6 +117,7 @@ export const createService = async ({ config, provider, logger, now = () => new 
     db,
     provider,
     serviceWallet,
+    stakeScriptHashOf,
     sync,
     collateral,
     witnesses,

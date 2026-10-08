@@ -52,7 +52,9 @@ logic's reward account on every transaction that spends an account UTxO
 or mints under the policy, bar a plain deposit. An account moves to
 another version of its rules by writing a different logic into its
 control output, and that upgrade withdraws from both the logic it leaves
-and the one it arrives at.
+and the one it arrives at. An upgrade cannot embed both logics, since
+two logic scripts and the proxy exceed the 16 KiB transaction size
+limit, so an upgrade references parked copies of the logics instead.
 
 The service therefore reads the logic a transaction names and refuses
 any it does not know, under `known_logic`: an account whose rules the
@@ -394,13 +396,19 @@ name.
    exactly one token under the policy, named with the 28 bytes of a
    stake script hash, registers exactly one script stake credential with
    an explicit deposit, names the token after that credential and locks
-   it in exactly one output at an account address staked to that
-   credential. A token under another policy, whatever its name, and a
-   token held at any other address count for nothing. A reference input
-   is never an input: one at any other address, as a parked reference
-   script is, is neither the sponsor's nor an account's, and one holding
-   an account token is read as a control UTxO only at the account
-   address its token names.
+   it in exactly one output at an account address staked to that same
+   script credential, and that credential is the contract's own stake
+   script: the stake validator applied to one of the device keys the
+   control output's datum lists and to `ACCOUNT_SCRIPT_HASH`, which the
+   service derives from the blueprint at `BLUEPRINT_PATH` and keeps per
+   device key. A datum listing no device keys is refused, and one
+   listing more than the eight devices a well formed state carries is
+   refused before anything is derived. A token under another policy,
+   whatever its name, and a token held at any other address count for
+   nothing. A reference input is never an input: one at any other
+   address, as a parked reference script is, is neither the sponsor's
+   nor an account's, and one holding an account token is read as a
+   control UTxO only at the account address its token names.
 6. `known_logic`: every logic the transaction names is one
    `KNOWN_LOGIC_HASHES` lists. A logic is named in the first field of
    the datum of each control UTxO the transaction spends or references
@@ -423,19 +431,29 @@ name.
 8. `no_sponsor_value_elsewhere`: every output away from the sponsor and
    the account is covered, asset by asset, by the non sponsor inputs and
    the withdrawals that are not the sponsor's.
-9. `no_foreign_scripts`: every script input, mint policy, script
-   credential of a certificate or vote, and attached Plutus script is
-   the account proxy or the account's stake script, that is, the stake
-   script named by a control UTxO the transaction spends or references,
-   which is the name of its state NFT, or the one it registers at
-   creation, and the transaction carries no native script witness. A
-   withdrawal may draw from one more credential: a logic the transaction
-   names, under rule 6, since that zero withdrawal is how the proxy runs
-   the account's rules, and an upgrade names two. A logic is allowed
-   nowhere else, and only a control UTxO's datum or a control output's
-   makes it allowed: referencing the UTxO a logic is parked at does not.
-   A grant UTxO names no stake script and no logic by itself: the
-   control UTxO an agent spend references does.
+9. `no_foreign_scripts`: every script input and every mint policy is the
+   account proxy, since the stake validator has only withdraw and
+   publish handlers and so neither locks an input nor mints; every
+   script credential of a certificate or vote is the account proxy or
+   the account's stake script, that is, the stake script named by a
+   control UTxO the transaction spends or references, which is the name
+   of its state NFT, or the one it registers at creation; and the
+   transaction carries no native script witness. A logic the transaction
+   names, under rule 6, is admitted in two places and nowhere else: as
+   the credential of a withdrawal, since that zero withdrawal is how the
+   proxy runs the account's rules, and an upgrade names two, and as an
+   attached Plutus script, which is how a transaction that embeds the
+   logic rather than referencing a parked copy carries it; every
+   attached Plutus script is the proxy, the account's stake script or
+   such a logic. Only a control UTxO's datum or a control output's makes
+   a logic allowed: referencing the UTxO a logic is parked at does not.
+   A withdrawal that names a logic and draws any lovelace is refused,
+   which is stricter than the contract and safe: the logic credential is
+   never delegated, so its reward balance stays zero and the ledger never
+   needs a non zero draw. A withdrawal map drawing from the same reward
+   account twice is refused as well, since no ledger decodes one. A
+   grant UTxO names no stake script and no logic by itself: the control
+   UTxO an agent spend references does.
 10. `script_data_hash`: the script data hash the body commits to is the
     one the witness set calls for. The hash is recomputed from the
     redeemers and the datums the witness set carries, as they stand in
@@ -445,13 +463,20 @@ name.
     none while the witness set carries redeemers or datums, and a body
     committing to one while it carries neither are all refused, as is a
     transaction whose scripts are not all Plutus V3, which every script
-    an account runs is.
+    an account runs is. The rule fetches the protocol parameters from
+    the provider on every request, so the cost models in the language
+    view are always the chain's current ones.
 11. `evaluates`: the provider resolves every input and reference input
     in one lookup and all of them exist, the provider evaluates the
     transaction with the sponsor UTxOs it builds on supplied, and every
     redeemer declares at least the memory and steps the evaluation
     found it needs; a provider that refuses the lookup is reported here
-    too.
+    too. This rule is load bearing against path confusion inside the
+    contract: the structural rules do not tell the proxy's owner path, a
+    control UTxO spent under the device redeemer, from its agent path, a
+    grant UTxO spent under the grant redeemer with the control UTxO
+    referenced, so a transaction that mixes the two is refused only by
+    the scripts themselves running here.
 12. `signers`: neither sponsor key is a required signer, no withdrawal
     draws from the sponsor's reward account, no certificate of any kind
     names a sponsor credential, and no voter is a sponsor credential; a
@@ -550,6 +575,7 @@ Optional, with defaults:
 | `KNOWN_LOGIC_HASHES` | the current logic, `2cd68e398bdf9fbc8d257614b54403451ee722520ec785fe14f8df5a` | the logic script hashes the service serves accounts under, comma separated, each 56 hex characters |
 | `PORT` | `8787` | listening port |
 | `DATABASE_PATH` | `./data/sponsor.sqlite` | sqlite database file |
+| `BLUEPRINT_PATH` | `contract/plutus.json` at the repository root | the blueprint of the contract build `ACCOUNT_SCRIPT_HASH` names, which the service reads the account stake validator from; the service refuses to start on a blueprint whose account proxy hashes to anything else |
 | `LEASE_TTL_SECONDS` | `600` | how long a lease holds a fee UTxO |
 | `MAX_SPONSORED_LOVELACE` | `6000000` | the most a transaction may draw from the sponsor |
 | `MAX_FEE_LOVELACE` | `2000000` | the largest fee a sponsored transaction may carry |
@@ -585,12 +611,20 @@ Requires Node 22.
    `../cardano-account-custody-contract/offchain`, so the install needs
    that checkout present, built there with `npm run build` in that
    directory: the test fixtures, `npm run typecheck:scripts` and the
-   preprod proof all read it, and only the service itself, `npm run
-   lint` and `npm run build` do without. The `file:` dependency and the
-   continuous integration workflow are pinned to contract commit
-   `d6244ea34516fc18ff754a3f2fc5eedc7922e6b0`, the one whose builders
-   the preprod proof builds on and whose blueprint
-   `test/support/plutus.json` is a copy of; `package-lock.json` must be
+   preprod proof all read it, and only `npm run lint` and `npm run
+   build` do without. The service itself needs no checkout: it ships
+   the contract build's blueprint as `contract/plutus.json`, which
+   `BLUEPRINT_PATH` defaults to wherever the service is started from,
+   and derives every account's stake script from the stake validator in
+   it. The blueprint must be the build `ACCOUNT_SCRIPT_HASH` names, and
+   the service refuses to start on one whose account proxy hashes to
+   anything else, since the stake validator of another build would
+   admit creations the configured proxy does not govern. The `file:`
+   dependency and the continuous integration workflow are pinned to
+   contract commit `393a593d6ed52fbcc5c726f54854a576990b7a6d`, the one
+   whose builders the preprod proof builds on and whose blueprint
+   `contract/plutus.json` is a copy of, which the workflow compares byte
+   for byte against the pinned checkout; `package-lock.json` must be
    regenerated whenever the contract's off-chain package changes its
    dependencies. The pinned commit is revision 3 of the validators, with
    a permanent account proxy at hash

@@ -7,7 +7,7 @@ import {
   DEVICE_KEY,
   type Grant,
   accountAddress,
-  accountRewardAddress,
+  accountOf,
   accountScript,
   createAccountRedeemer,
   deviceRedeemer,
@@ -29,8 +29,6 @@ import {
   rewardAddressOf,
   runRedeemer,
   spendWithGrantRedeemer,
-  stakeScript,
-  stateNftAssetId,
   strangerAddress,
   upgradedState,
 } from './account.js';
@@ -226,25 +224,28 @@ export const runLogic = (
 
 /**
  * Shapes a builder into an account creation, as the contract's builder
- * does on a sponsor's builder: the stake credential is registered with
- * its deposit, the state NFT is minted into a control output at the
- * account address with the initial state inline, naming the logic the
- * account starts under, that logic withdraws zero so that it validates
- * the arriving state, the owner device signs, and whatever the builder
- * spends pays for all of it.
+ * does on a sponsor's builder: the stake credential of the owner
+ * device's account, which is the stake validator applied to that device
+ * and the proxy hash, is registered with its deposit, the state NFT
+ * named after it is minted into a control output at the account address
+ * with the initial state inline, naming the logic the account starts
+ * under, that logic withdraws zero so that it validates the arriving
+ * state, the owner device signs, and whatever the builder spends pays
+ * for all of it.
  */
 export const shapeCreation = (builder: TransactionBuilder, options: CreationOptions = {}): TransactionBuilder => {
   const device = options.device ?? DEVICE_KEY;
   const logic = options.logic ?? logicHash;
-  builder.registerStakeAddress({ rewardAddress: accountRewardAddress, redeemer: operateRedeemer });
-  builder.mintToken({ assetIdHex: stateNftAssetId, amount: 1n, redeemer: createAccountRedeemer });
+  const account = accountOf(device);
+  builder.registerStakeAddress({ rewardAddress: account.rewardAddress, redeemer: operateRedeemer });
+  builder.mintToken({ assetIdHex: account.stateNftAssetId, amount: 1n, redeemer: createAccountRedeemer });
   builder.lockValue({
-    scriptAddress: options.controlAddress ?? accountAddress,
-    value: { coins: options.controlLovelace ?? CONTROL_LOVELACE, assets: { [stateNftAssetId]: 1n } },
+    scriptAddress: options.controlAddress ?? account.address,
+    value: { coins: options.controlLovelace ?? CONTROL_LOVELACE, assets: { [account.stateNftAssetId]: 1n } },
     datum: inlineDatum(options.state ?? encodeAccountState(initialStateUnder(logic, device))),
   });
   runLogic(builder, options, logic);
-  attachProxy(builder.addSigner(device), options).addScript(stakeScript);
+  attachProxy(builder.addSigner(device), options).addScript(account.stakeScript);
   options.customise?.(builder);
   return builder;
 };

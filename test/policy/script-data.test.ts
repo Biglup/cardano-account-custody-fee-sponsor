@@ -208,6 +208,15 @@ describe('script data hash', () => {
     expect(scriptIntegrityHash({ redeemers: undefined, datums: undefined }, [], PROTOCOL_PARAMETERS)).toBeUndefined();
   });
 
+  it('names the language as people write it when the parameters price no cost model for it', () => {
+    const unpriced = { ...PROTOCOL_PARAMETERS, costModels: [{ language: 'PlutusV1', costs: new Array(V1_COST_MODEL_LENGTH).fill(0) }] };
+
+    expect(() => scriptIntegrityHash({ redeemers: REDEEMERS, datums: undefined }, [Cometa.PlutusLanguageVersion.V3], unpriced)).toThrow(
+      'The protocol parameters hold no cost model for Plutus V3',
+    );
+    expect(() => scriptIntegrityHash({ redeemers: REDEEMERS, datums: undefined }, [V2], unpriced)).toThrow('The protocol parameters hold no cost model for Plutus V2');
+  });
+
   it('builds the language view from the cost models the chain reports, not from a fixed one', async () => {
     const transaction = await buildCreation(service, lease);
     const others = { ...PROTOCOL_PARAMETERS, costModels: [{ language: 'PlutusV3', costs: [1, 2, 3] }] };

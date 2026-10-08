@@ -407,14 +407,15 @@ describe('a client trying to drain the sponsor', () => {
     expect(witnessCount()).toBe(0);
   });
 
-  it('is sponsored for an account whose stake script the service has never seen, when the state NFT is minted under the account policy', async () => {
+  it('cannot have the sponsor pay for an account whose stake credential is a script of its own, whether the state NFT is minted under the account policy or not', async () => {
     await fundPool(2, 1);
     const taken = await lease();
 
-    const genuine = await witness(taken.leaseId, await buildForeignStakeCreation(taken, accountScriptHash));
-    expect(genuine.status).toBe(200);
-    const audit = service.db.prepare("SELECT detail FROM audit WHERE action = 'witness' AND outcome = 'issued'").get() as { detail: string };
-    expect(JSON.parse(audit.detail)).toMatchObject({ kind: 'creation' });
+    expectViolation(
+      await witness(taken.leaseId, await buildForeignStakeCreation(taken, accountScriptHash)),
+      'account_transaction',
+      new RegExp(`The stake credential ${foreignScriptHash} is not this contract's stake script for any device the control output lists`),
+    );
 
     const other = await lease();
     expectViolation(
@@ -422,6 +423,7 @@ describe('a client trying to drain the sponsor', () => {
       'account_transaction',
       /No input is an account control or grant UTxO and nothing is minted under the account policy/,
     );
+    expect(witnessCount()).toBe(0);
   });
 });
 

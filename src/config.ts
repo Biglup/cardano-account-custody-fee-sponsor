@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { type Network, SLOT_SETTINGS_BY_NETWORK, type SlotSettings } from './slots.js';
 
@@ -46,6 +47,9 @@ const mnemonicSchema = z
     'SPONSOR_MNEMONIC must have 12, 15, 18, 21 or 24 lowercase words',
   );
 
+/** The blueprint of the contract build the service ships with, read unless `BLUEPRINT_PATH` names another. */
+const DEFAULT_BLUEPRINT_PATH = fileURLToPath(new URL('../contract/plutus.json', import.meta.url));
+
 /** The environment variables the service reads, with defaults for every operational tunable. */
 const envSchema = z.object({
   BLOCKFROST_PREPROD_PROJECT_ID: z.string().min(1, 'BLOCKFROST_PREPROD_PROJECT_ID is required'),
@@ -55,6 +59,7 @@ const envSchema = z.object({
   ADMIN_API_KEY: z.string().min(1, 'ADMIN_API_KEY is required'),
   PORT: z.coerce.number().int().min(1).max(65_535).default(8787),
   DATABASE_PATH: z.string().min(1).default('./data/sponsor.sqlite'),
+  BLUEPRINT_PATH: z.string().min(1).default(DEFAULT_BLUEPRINT_PATH),
   LEASE_TTL_SECONDS: z.coerce.number().int().positive().default(600),
   MAX_SPONSORED_LOVELACE: z.coerce.number().int().positive().default(6_000_000),
   MAX_FEE_LOVELACE: z.coerce.number().int().positive().default(2_000_000),
@@ -98,6 +103,8 @@ export interface Config {
   adminApiKey: string;
   port: number;
   databasePath: string;
+  /** The blueprint of the contract build `accountScriptHash` names, which the service reads the account stake validator from to tell a custody account's stake credential from any other script. */
+  blueprintPath: string;
   leaseTtlSeconds: number;
   maxSponsoredLovelace: number;
   maxFeeLovelace: number;
@@ -153,6 +160,7 @@ export const loadConfig = (env: Record<string, string | undefined> = process.env
     adminApiKey: data.ADMIN_API_KEY,
     port: data.PORT,
     databasePath: data.DATABASE_PATH,
+    blueprintPath: data.BLUEPRINT_PATH,
     leaseTtlSeconds: data.LEASE_TTL_SECONDS,
     maxSponsoredLovelace: data.MAX_SPONSORED_LOVELACE,
     maxFeeLovelace: data.MAX_FEE_LOVELACE,

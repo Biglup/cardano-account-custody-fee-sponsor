@@ -1,5 +1,6 @@
 import type { PlutusLanguageVersion, ProtocolParameters } from '@biglup/cometa';
 import { Cometa } from '../cometa.js';
+import { plutusVersionName } from './parse.js';
 
 /**
  * The redeemers and the datums a transaction's witness set carries, each
@@ -70,7 +71,7 @@ export const witnessScriptData = (cbor: string): WitnessScriptData => {
 const costsOf = (language: PlutusLanguageVersion, parameters: ProtocolParameters): number[] => {
   const model = parameters.costModels.find((candidate) => COST_MODEL_LANGUAGES[candidate.language] === language);
   if (model === undefined) {
-    throw new Error(`The protocol parameters hold no cost model for Plutus language ${language}`);
+    throw new Error(`The protocol parameters hold no cost model for ${plutusVersionName(language)}`);
   }
   return model.costs;
 };

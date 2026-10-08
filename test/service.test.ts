@@ -1,9 +1,10 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import type { LeaseBody } from '../src/api.js';
+import { BLUEPRINT_PATH, accountScriptHash, unappliedStakeScript, unappliedStakeScriptHash } from './support/account.js';
 import { buildCreation } from './support/client.js';
 import { OTHER_MNEMONIC, type TestService, createTestService, txHash } from './support/service.js';
 
@@ -28,6 +29,21 @@ afterEach(() => {
   rmSync(directory, { recursive: true, force: true });
 });
 
+/** A validator entry of a blueprint, as far as these tests rewrite one. */
+interface Validator {
+  title: string;
+  compiledCode: string;
+}
+
+/** Writes the shipped blueprint with `rewrite` applied to each validator's compiled code as `name` in the test's directory and returns its path. */
+const blueprintWith = (name: string, rewrite: (validator: Validator) => string): string => {
+  const shipped = JSON.parse(readFileSync(BLUEPRINT_PATH, 'utf8')) as { validators: Validator[] };
+  const validators = shipped.validators.map((validator) => ({ ...validator, compiledCode: rewrite(validator) }));
+  const path = join(directory, name);
+  writeFileSync(path, JSON.stringify({ ...shipped, validators }));
+  return path;
+};
+
 /** Builds a test service over the shared database file, remembering it for the cleanup. */
 const open = async (overrides: Record<string, string> = {}, shared: Parameters<typeof createTestService>[1] = {}): Promise<TestService> => {
   const service = await createTestService({ DATABASE_PATH: databasePath, ...overrides }, shared);
@@ -36,6 +52,36 @@ const open = async (overrides: Record<string, string> = {}, shared: Parameters<t
 };
 
 describe('createService', () => {
+  it('refuses to start without the blueprint the stake validator is read from, before creating the database', async () => {
+    const missing = join(directory, 'missing.json');
+
+    await expect(open({ BLUEPRINT_PATH: missing })).rejects.toThrow(`The blueprint at ${missing} cannot be read`);
+
+    expect(existsSync(databasePath)).toBe(false);
+  });
+
+  it('refuses to start on a blueprint of another build, whose account proxy is not the one ACCOUNT_SCRIPT_HASH names, before creating the database', async () => {
+    const otherBuild = blueprintWith('other-build.json', ({ title, compiledCode }) =>
+      title.startsWith('account.account.') ? unappliedStakeScript.bytes : compiledCode,
+    );
+
+    await expect(open({ BLUEPRINT_PATH: otherBuild })).rejects.toThrow(
+      `The blueprint at ${otherBuild} is a build whose account proxy hashes to ${unappliedStakeScriptHash}, not to the ${accountScriptHash} that ACCOUNT_SCRIPT_HASH names`,
+    );
+
+    expect(existsSync(databasePath)).toBe(false);
+  });
+
+  it('refuses to start on a blueprint whose stake validator is hex but no Plutus program, before creating the database', async () => {
+    const noProgram = blueprintWith('no-program.json', ({ title, compiledCode }) =>
+      title.startsWith('account_stake.account_stake.') ? '44deadbeef' : compiledCode,
+    );
+
+    await expect(open({ BLUEPRINT_PATH: noProgram })).rejects.toThrow(`The stake validator in the blueprint at ${noProgram} is not a Plutus program`);
+
+    expect(existsSync(databasePath)).toBe(false);
+  });
+
   it('binds the database to the sponsor address on first start and refuses a start from another mnemonic', async () => {
     const first = await open();
     const address = first.serviceWallet.address;

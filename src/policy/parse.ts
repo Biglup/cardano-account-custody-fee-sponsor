@@ -26,6 +26,15 @@ export interface ParsedOutput {
    * only field of the state the account validator reads.
    */
   logicHash: string | undefined;
+  /**
+   * The 28 byte key hashes the second field of the output's inline datum
+   * lists, when it carries a list of them there. An account's control
+   * UTxO lists there the devices that own the account, which is the only
+   * field of the state the account stake validator reads. Only an output
+   * the transaction writes carries them: no rule reads the devices of a
+   * UTxO the chain reports, so none are read off one.
+   */
+  devices: string[] | undefined;
 }
 
 /**
@@ -130,6 +139,7 @@ const outputSchema = z
   .loose();
 const credentialSchema = z.object({ tag: z.enum(['pubkey_hash', 'script_hash']), value: hash28 });
 const datumFieldSchema = z.object({ tag: z.string(), value: z.unknown().optional() }).loose();
+const datumListSchema = z.object({ tag: z.literal('list'), contents: z.array(datumFieldSchema) }).loose();
 const inlineDatumSchema = z
   .object({ tag: z.literal('datum'), value: z.object({ tag: z.literal('constr'), alternative: z.literal('0'), data: z.array(datumFieldSchema) }).loose() })
   .loose();
@@ -233,6 +243,16 @@ export const plutusLanguageOf = (label: string): PlutusLanguageVersion => {
   return language;
 };
 
+/** The name of each Plutus language as people write it; the ledger numbers the languages from zero, so the number alone reads as off by one. */
+const PLUTUS_VERSION_NAMES: ReadonlyMap<PlutusLanguageVersion, string> = new Map([
+  [Cometa.PlutusLanguageVersion.V1, 'Plutus V1'],
+  [Cometa.PlutusLanguageVersion.V2, 'Plutus V2'],
+  [Cometa.PlutusLanguageVersion.V3, 'Plutus V3'],
+]);
+
+/** The name of a Plutus language for a message, falling back to the ledger's number for one the policy has no name for. */
+export const plutusVersionName = (language: PlutusLanguageVersion): string => PLUTUS_VERSION_NAMES.get(language) ?? `Plutus language ${language}`;
+
 /**
  * The credential a Shelley address pays to, at a base, enterprise or
  * pointer address, or undefined for an address form without one, such as
@@ -254,8 +274,20 @@ const stakeCredentialOf = (address: string): Credential | undefined => {
   return parsed.asBase()?.getStakeCredential() ?? parsed.asReward()?.getCredential() ?? undefined;
 };
 
-/** The hex length of a 28 byte script hash, which is what a control datum names as its logic. */
-const SCRIPT_HASH_HEX_LENGTH = 56;
+/** The hex length of a 28 byte hash, which is what a control datum names as its logic and lists as its devices. */
+const HASH_HEX_LENGTH = 56;
+
+/** The 28 byte hash a field of an inline datum holds, as the CIP-116 view presents it, or undefined for a field of any other shape. */
+const inlineHash = (field: z.infer<typeof datumFieldSchema> | undefined): string | undefined =>
+  field?.tag === 'bytes' && typeof field.value === 'string' && field.value.length === HASH_HEX_LENGTH && hash28.safeParse(field.value).success
+    ? field.value
+    : undefined;
+
+/** The fields of an inline datum that is a first constructor, as the CIP-116 view presents it, or undefined for a datum hash, no datum or any other shape. */
+const inlineFields = (data: unknown): z.infer<typeof datumFieldSchema>[] | undefined => {
+  const parsed = inlineDatumSchema.safeParse(data);
+  return parsed.success ? parsed.data.value.data : undefined;
+};
 
 /**
  * The script hash the first field of an inline datum names, as the
@@ -263,26 +295,35 @@ const SCRIPT_HASH_HEX_LENGTH = 56;
  * of 28 bytes in the first field of the first constructor. A datum of any
  * other shape, a datum hash and an output with no datum name none.
  */
-const inlineLogicHash = (data: unknown): string | undefined => {
-  const parsed = inlineDatumSchema.safeParse(data);
-  const first = parsed.success ? parsed.data.value.data[0] : undefined;
-  return first?.tag === 'bytes' && typeof first.value === 'string' && first.value.length === SCRIPT_HASH_HEX_LENGTH && hash28.safeParse(first.value).success
-    ? first.value
-    : undefined;
+const inlineLogicHash = (data: unknown): string | undefined => inlineHash(inlineFields(data)?.[0]);
+
+/**
+ * The key hashes the second field of an inline datum lists, as the
+ * CIP-116 view presents it: a list of 28 byte byte strings in the second
+ * field of the first constructor. A list holding anything else, a datum
+ * of any other shape, a datum hash and an output with no datum list none.
+ */
+const inlineDevices = (data: unknown): string[] | undefined => {
+  const list = datumListSchema.safeParse(inlineFields(data)?.[1]);
+  const devices = list.success ? list.data.contents.map(inlineHash) : undefined;
+  return devices?.every((device): device is string => device !== undefined) ? devices : undefined;
 };
 
-/** The same first field, read off an inline datum as the chain reports it. */
-const datumLogicHash = (datum: PlutusData | undefined): string | undefined => {
-  if (datum === undefined || !Cometa.isPlutusDataConstr(datum) || datum.constructor !== 0n) {
+/** The 28 byte hash a field of a datum holds, as the chain reports it, or undefined for a field of any other shape. */
+const datumHash = (field: PlutusData | undefined): string | undefined => {
+  if (field === undefined || !Cometa.isPlutusDataByteArray(field)) {
     return undefined;
   }
-  const first = datum.fields.items[0];
-  if (first === undefined || !Cometa.isPlutusDataByteArray(first)) {
-    return undefined;
-  }
-  const hash = Cometa.uint8ArrayToHex(first);
-  return hash.length === SCRIPT_HASH_HEX_LENGTH ? hash : undefined;
+  const hash = Cometa.uint8ArrayToHex(field);
+  return hash.length === HASH_HEX_LENGTH ? hash : undefined;
 };
+
+/** The fields of a datum that is a first constructor, as the chain reports it, or undefined for no datum or any other shape. */
+const datumFields = (datum: PlutusData | undefined): PlutusData[] | undefined =>
+  datum !== undefined && Cometa.isPlutusDataConstr(datum) && datum.constructor === 0n ? datum.fields.items : undefined;
+
+/** The same first field, read off an inline datum as the chain reports it. */
+const datumLogicHash = (datum: PlutusData | undefined): string | undefined => datumHash(datumFields(datum)?.[0]);
 
 /** The `txHash#index` reference of an input. */
 const inputRef = (input: TxIn): string => utxoRef(input.txId, input.index);
@@ -327,6 +368,7 @@ const toOutput = (output: InspectedOutput): ParsedOutput => ({
   hasReferenceScript: output.script_ref !== undefined,
   referenceScriptLanguage: inspectedScriptLanguage(output.script_ref),
   logicHash: inlineLogicHash(output.plutus_data),
+  devices: inlineDevices(output.plutus_data),
 });
 
 /** A certificate with every credential it names collected, so that no certificate kind can name a signer the policy does not see. */
@@ -384,6 +426,7 @@ const toParsedOutput = (output: TxOut): ParsedOutput => ({
   referenceScriptLanguage:
     output.scriptReference !== undefined && Cometa.isPlutusScript(output.scriptReference) ? output.scriptReference.version : undefined,
   logicHash: datumLogicHash(output.datum),
+  devices: undefined,
 });
 
 /** A refusal under the first rule. */

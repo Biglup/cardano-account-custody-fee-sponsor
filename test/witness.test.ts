@@ -5,10 +5,11 @@ import { InvalidTransactionError, LeaseConsumedError, LeaseExpiredError, QuotaEx
 import { toLeaseBody } from '../src/http/leases.js';
 import type { ApiKey } from '../src/keys.js';
 import { parseTransaction } from '../src/policy/parse.js';
+import type { StakeScriptHashOf } from '../src/policy/stake-script.js';
 import type { Lease, LeaseService } from '../src/pool/leases.js';
 import type { WitnessStore } from '../src/pool/witnesses.js';
 import { type WitnessService, createWitnessService } from '../src/witness.js';
-import { CONTROL_LOVELACE } from './support/account.js';
+import { CONTROL_LOVELACE, DEVICE_KEY, stateWithDevices } from './support/account.js';
 import { buildCreation } from './support/client.js';
 import { type TestService, createTestService, txHash } from './support/service.js';
 
@@ -62,11 +63,12 @@ const staleLeases = (leases: LeaseService): LeaseService => ({
 const unguardedWitnesses = (witnesses: WitnessStore): WitnessStore => ({ ...witnesses, quotaShortfall: () => undefined });
 
 /** A witness service on the test service's components, with some of them replaced. */
-const witnessWith = (overrides: { wallet?: Wallet; leases?: LeaseService; witnesses?: WitnessStore }): WitnessService =>
+const witnessWith = (overrides: { wallet?: Wallet; stakeScriptHashOf?: StakeScriptHashOf; leases?: LeaseService; witnesses?: WitnessStore }): WitnessService =>
   createWitnessService({
     db: service.db,
     provider: service.provider,
     serviceWallet: { ...service.serviceWallet, wallet: overrides.wallet ?? service.serviceWallet.wallet },
+    stakeScriptHashOf: overrides.stakeScriptHashOf ?? service.stakeScriptHashOf,
     leases: overrides.leases ?? service.leases,
     witnesses: overrides.witnesses ?? service.witnesses,
     collateral: service.collateral,
@@ -89,6 +91,34 @@ const sponsoredBy = (creation: string): bigint => (parseTransaction(creation).tr
 const withDailyQuota = (lovelace: bigint): ApiKey => ({ ...apiKey, quotas: { ...apiKey.quotas, sponsoredLovelacePerDay: Number(lovelace) } });
 
 describe('witness service', () => {
+  it('refuses a creation listing nine devices before deriving any stake script, and derives one per device listed until the owner is found', async () => {
+    let derivations = 0;
+    const counting: StakeScriptHashOf = (device) => {
+      derivations += 1;
+      return service.stakeScriptHashOf(device);
+    };
+    const witness = witnessWith({ stakeScriptHashOf: counting });
+    const others = Array.from({ length: 8 }, (_, index) => (index + 1).toString(16).padStart(2, '0').repeat(28));
+
+    const nine = await witness.issue(apiKey, lease.id, await buildCreation(service, leaseBody, { state: stateWithDevices([...others, DEVICE_KEY]) })).catch((err: unknown) => err);
+
+    expect(nine).toBeInstanceOf(InvalidTransactionError);
+    expect((nine as InvalidTransactionError).toResponseBody()).toEqual({
+      error: 'invalid_transaction',
+      rule: 'account_transaction',
+      detail: 'The control output lists 9 devices where a well formed state carries at most 8',
+    });
+    expect(derivations).toBe(0);
+    expect(lastOutcome()).toBe('account_transaction');
+    expect(witnessCount()).toBe(0);
+
+    const eight = await witness.issue(apiKey, lease.id, await buildCreation(service, leaseBody, { state: stateWithDevices([...others.slice(0, 7), DEVICE_KEY]) }));
+
+    expect(eight.leaseId).toBe(lease.id);
+    expect(derivations).toBe(8);
+    expect(witnessCount()).toBe(1);
+  });
+
   it('refuses with the daily quota once what the key sponsored today plus this transaction would pass it, and signs just under it', async () => {
     service.fund(txHash(101), 0, 100_000_000n);
     await service.sync.run();

@@ -4,8 +4,9 @@ import type { PoolUtxo } from '../pool/utxo.js';
 import { utxoRef } from '../pool/utxo.js';
 import { type SlotSettings, slotAt, slotToTime } from '../slots.js';
 import { evaluates } from './evaluate.js';
-import { type ParsedCertificate, type ParsedOutput, type ParsedTransaction, type ResolvedInput, plutusLanguageOf } from './parse.js';
+import { type ParsedCertificate, type ParsedOutput, type ParsedTransaction, type ResolvedInput, plutusLanguageOf, plutusVersionName } from './parse.js';
 import { type WitnessScriptData, scriptIntegrityHash, witnessScriptData } from './script-data.js';
+import type { StakeScriptHashOf } from './stake-script.js';
 
 /**
  * The machine name of a policy rule, listed in the order the rules are
@@ -62,6 +63,8 @@ export type PolicyMode = FeeMode | CollateralMode;
 export interface PolicyContext {
   sponsor: { address: string; paymentKeyHash: string; stakeKeyHash: string };
   accountScriptHash: string;
+  /** The stake script hash of the account a device key owns: the contract's stake validator applied to that key and to the account script hash. */
+  stakeScriptHashOf: StakeScriptHashOf;
   /** The logic scripts the service serves accounts under, by hash. */
   knownLogicHashes: Set<string>;
   mode: PolicyMode;
@@ -162,6 +165,9 @@ const STATE_NFT_NAME_LENGTH = 56;
 
 /** The hex length of a grant token name: the stake script hash followed by the grant's slot as four bytes. */
 const GRANT_TOKEN_NAME_LENGTH = 64;
+
+/** The most devices a well formed account state lists, which bounds how many stake scripts a creation can have derived. */
+const MAX_DEVICES = 8;
 
 /** The quantity of every asset, lovelace included, a list of outputs holds in total. */
 const balanceOf = (outputs: ParsedOutput[]): AssetAmounts => {
@@ -295,7 +301,14 @@ type AccountReading =
  * the 28 bytes of a stake script hash, exactly one registration of a
  * script stake credential with an explicit deposit, the token named after
  * that credential and sitting in exactly one output at an account
- * address staked to that same credential.
+ * address staked to that same script credential, and that credential the
+ * contract's own stake script for one of the devices the output's datum
+ * lists. The proxy mints the state NFT for any script credential, so
+ * without the last check a client could register a script of its own,
+ * answering to no device, and have the sponsor pay for an account the
+ * contract's owner guarantees never hold for. A datum listing more
+ * devices than a well formed state carries is refused before any script
+ * is derived, so a client cannot make the service derive without bound.
  */
 const readCreation = (transaction: ParsedTransaction, context: PolicyContext): Creation | string => {
   const minted = Object.entries(transaction.mint).filter(([assetId]) => assetId.startsWith(context.accountScriptHash));
@@ -324,8 +337,19 @@ const readCreation = (transaction: ParsedTransaction, context: PolicyContext): C
   if (controlOutput === undefined || holders.length !== 1 || !isAccountOutput(controlOutput, context)) {
     return 'The minted state NFT must sit in exactly one output at an account address';
   }
-  if (controlOutput.stakeCredential?.hash !== registration.credential.hash) {
+  const stakeCredential = registration.credential.hash;
+  if (!isScript(controlOutput.stakeCredential) || controlOutput.stakeCredential.hash !== stakeCredential) {
     return 'The control output must be staked to the registered stake credential';
+  }
+  const devices = controlOutput.devices;
+  if (devices === undefined) {
+    return 'The control output does not list device keys in the second field of its datum';
+  }
+  if (devices.length > MAX_DEVICES) {
+    return `The control output lists ${devices.length} devices where a well formed state carries at most ${MAX_DEVICES}`;
+  }
+  if (!devices.some((device) => context.stakeScriptHashOf(device) === stakeCredential)) {
+    return `The stake credential ${stakeCredential} is not this contract's stake script for any device the control output lists`;
   }
   return { registration, deposit: registration.deposit ?? 0n, controlOutput };
 };
@@ -640,55 +664,65 @@ const noSponsorValueElsewhere: Rule = ({ transaction, otherInputs, foreignOutput
 };
 
 /**
- * Every script the transaction runs or attaches belongs to the account:
- * the account proxy, which pays for every account UTxO and mints every
- * account token, one of the account's stake scripts, named by the
- * control UTxOs it spends or references or registered at creation, or
- * one of the logics those control UTxOs and the control outputs name,
- * whose zero withdrawal is how the proxy runs the account's rules. A
- * logic is a stake credential and never pays for an input, mints or
- * appears on a certificate, so it is allowed only where the account
- * needs it: as the credential of a withdrawal, and as an attached script
- * for a transaction that embeds it rather than referencing a parked one.
- * A logic runs on a withdrawal of zero, so one that draws lovelace is
- * refused here as well.
+ * Every script the transaction runs or attaches belongs to the account.
+ * The account proxy alone pays for every account UTxO and mints every
+ * account token: the stake validator has only withdraw and publish
+ * handlers, so no account transaction locks an input with a stake
+ * script or mints under one, and an input or a mint under any script
+ * but the proxy is foreign. A certificate or a vote may name the proxy
+ * or one of the account's stake scripts, named by the control UTxOs the
+ * transaction spends or references or registered at creation. A logic
+ * those control UTxOs and the control outputs name is admitted in two
+ * places and nowhere else: as the credential of a withdrawal, whose
+ * zero draw is how the proxy runs the account's rules, and as an
+ * attached script for a transaction that embeds it rather than
+ * referencing a parked one. A logic runs on a withdrawal of zero, so
+ * one that draws lovelace is refused, and a second withdrawal from a
+ * reward account already drawn from is refused too, since the ledger
+ * cannot decode such a withdrawal map.
  */
 const noForeignScripts: Rule = ({ transaction, inputs, stakeScriptHashes, logicHashes }, { accountScriptHash }) => {
-  const allowed = new Set([accountScriptHash, ...stakeScriptHashes]);
-  const runnable = new Set([...allowed, ...logicHashes]);
+  const accountScripts = new Set([accountScriptHash, ...stakeScriptHashes]);
+  const runnable = new Set([...accountScripts, ...logicHashes]);
+  const notProxy = (hash: string): string => `${hash}, which is not the account script`;
   const foreign = (hash: string): string => `${hash}, which is neither the account script nor its stake script`;
   const unrunnable = (hash: string): string => `${hash}, which is neither the account script, its stake script nor a logic its control UTxOs name`;
   for (const input of inputs) {
     const credential = input.output?.paymentCredential;
-    if (isScript(credential) && !allowed.has(credential.hash)) {
-      return violation('no_foreign_scripts', `Input ${input.ref} is locked by script ${foreign(credential.hash)}`);
+    if (isScript(credential) && credential.hash !== accountScriptHash) {
+      return violation('no_foreign_scripts', `Input ${input.ref} is locked by script ${notProxy(credential.hash)}`);
     }
   }
   for (const assetId of Object.keys(transaction.mint)) {
     const policyId = assetId.slice(0, accountScriptHash.length);
-    if (!allowed.has(policyId)) {
-      return violation('no_foreign_scripts', `The transaction mints under policy ${foreign(policyId)}`);
+    if (policyId !== accountScriptHash) {
+      return violation('no_foreign_scripts', `The transaction mints under policy ${notProxy(policyId)}`);
     }
   }
   for (const certificate of transaction.certificates) {
-    const credential = certificate.credentials.find((named) => isScript(named) && !allowed.has(named.hash));
+    const credential = certificate.credentials.find((named) => isScript(named) && !accountScripts.has(named.hash));
     if (credential !== undefined) {
       return violation('no_foreign_scripts', `The ${certificate.kind} certificate names script ${foreign(credential.hash)}`);
     }
   }
+  const drawn = new Set<string>();
   for (const withdrawal of transaction.withdrawals) {
-    if (isScript(withdrawal.credential) && !runnable.has(withdrawal.credential.hash)) {
-      return violation('no_foreign_scripts', `A withdrawal draws from script ${unrunnable(withdrawal.credential.hash)}`);
+    if (drawn.has(withdrawal.rewardAddress)) {
+      return violation('no_foreign_scripts', `The transaction withdraws from ${withdrawal.rewardAddress} twice, which the ledger cannot decode`);
     }
-    if (isScript(withdrawal.credential) && logicHashes.has(withdrawal.credential.hash) && withdrawal.lovelace !== 0n) {
-      return violation(
-        'no_foreign_scripts',
-        `The withdrawal that runs logic ${withdrawal.credential.hash} draws ${withdrawal.lovelace} lovelace, and a logic runs on a withdrawal of zero`,
-      );
+    drawn.add(withdrawal.rewardAddress);
+    if (isScript(withdrawal.credential)) {
+      const hash = withdrawal.credential.hash;
+      if (!runnable.has(hash)) {
+        return violation('no_foreign_scripts', `A withdrawal draws from script ${unrunnable(hash)}`);
+      }
+      if (logicHashes.has(hash) && withdrawal.lovelace !== 0n) {
+        return violation('no_foreign_scripts', `The withdrawal that runs logic ${hash} draws ${withdrawal.lovelace} lovelace, and a logic runs on a withdrawal of zero`);
+      }
     }
   }
   for (const voter of transaction.voters) {
-    if (isScript(voter.credential) && !allowed.has(voter.credential.hash)) {
+    if (isScript(voter.credential) && !accountScripts.has(voter.credential.hash)) {
       return violation('no_foreign_scripts', `The ${voter.kind} voter is script ${foreign(voter.credential.hash)}`);
     }
   }
@@ -754,7 +788,7 @@ const scriptDataHash = async (analysis: Analysis, provider: Provider): Promise<V
   const languages = languagesOf(analysis);
   const foreign = languages.find((language) => language !== Cometa.PlutusLanguageVersion.V3);
   if (foreign !== undefined) {
-    return violation('script_data_hash', `The transaction carries a script of Plutus language ${foreign}, and every script an account runs is Plutus V3`);
+    return violation('script_data_hash', `The transaction carries a script of ${plutusVersionName(foreign)}, and every script an account runs is Plutus V3`);
   }
   let computed: string | undefined;
   try {
@@ -808,14 +842,13 @@ const BEFORE_EVALUATION: Rule[] = [accountTransaction, knownLogic, sponsorOutflo
  * Applies the policy to a transaction that already parsed, in rule
  * order: the structural rules first, then the script data hash the body
  * commits to, then evaluation through the provider, then the signer
- * rules, stopping at the first violation. The
- * same rules serve both modes; the mode in the context decides what the
- * sponsor inputs, the collateral, the validity bound and the sponsor
- * outflow rules ask, and the name each answers under. The verdict also
- * says what the transaction was read as and how much sponsor lovelace it
- * draws, which is what the audit trail records, and an approval carries
- * the validity upper bound as verified, which is what the witness is
- * recorded with.
+ * rules, stopping at the first violation. The same rules serve both
+ * modes; the mode in the context decides what the sponsor inputs, the
+ * collateral, the validity bound and the sponsor outflow rules ask, and
+ * the name each answers under. The verdict also says what the
+ * transaction was read as and how much sponsor lovelace it draws, which
+ * is what the audit trail records, and an approval carries the validity
+ * upper bound as verified, which is what the witness is recorded with.
  */
 export const applyPolicy = async (
   transaction: ParsedTransaction,

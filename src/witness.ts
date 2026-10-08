@@ -16,6 +16,7 @@ import {
 import type { ApiKey } from './keys.js';
 import { type ParsedTransaction, parseTransaction, resolveInputs } from './policy/parse.js';
 import { type PolicyApproval, type PolicyContext, type PolicyMode, type Violation, applyPolicy } from './policy/rules.js';
+import type { StakeScriptHashOf } from './policy/stake-script.js';
 import type { SharedCollateral } from './pool/collateral.js';
 import type { Lease, LeaseService } from './pool/leases.js';
 import { type PoolUtxo, parseUtxoRef } from './pool/utxo.js';
@@ -53,6 +54,8 @@ export interface WitnessServiceDependencies {
   db: Database.Database;
   provider: Provider;
   serviceWallet: ServiceWallet;
+  /** The stake script hash of the account a device key owns, which a creation's registered credential is checked against. */
+  stakeScriptHashOf: StakeScriptHashOf;
   leases: LeaseService;
   witnesses: WitnessStore;
   collateral: SharedCollateral;
@@ -123,6 +126,7 @@ export const createWitnessService = ({
   db,
   provider,
   serviceWallet,
+  stakeScriptHashOf,
   leases,
   witnesses,
   collateral,
@@ -136,6 +140,7 @@ export const createWitnessService = ({
   const policyContext = (mode: PolicyMode, shared: PoolUtxo): PolicyContext => ({
     sponsor: { address: serviceWallet.address, paymentKeyHash: serviceWallet.paymentKeyHash, stakeKeyHash: serviceWallet.stakeKeyHash },
     accountScriptHash: settings.accountScriptHash,
+    stakeScriptHashOf,
     knownLogicHashes: new Set(settings.knownLogicHashes),
     mode,
     collateral: shared,

@@ -6,10 +6,13 @@ import type { LeaseBody } from '../../src/api.js';
 import { parseTransaction } from '../../src/policy/parse.js';
 import type { RuleName } from '../../src/policy/rules.js';
 import {
+  AGENT_KEY,
   CONTROL_LOVELACE,
   DEVICE_KEY,
+  PARKED_LOVELACE,
   STRANGER_KEY,
   accountAddress,
+  accountAddressOf,
   accountRewardAddress,
   accountScript,
   accountScriptHash,
@@ -27,6 +30,7 @@ import {
   grantedState,
   initialState,
   logicHash,
+  logicRewardAddress,
   operateRedeemer,
   otherLogicHash,
   otherLogicRewardAddress,
@@ -34,17 +38,25 @@ import {
   parkedLogicUtxo,
   parkedOtherLogicUtxo,
   parkedProxyUtxo,
+  parkingAddress,
   pointerAddress,
   reserveDatum,
+  rewardAddressOf,
   runRedeemer,
+  scriptCredential,
   scriptUtxo,
   stakeScript,
   stakeScriptHash,
   stateNftAssetId,
+  stateNftAssetIdOf,
+  stateWithDevices,
+  stateWithoutDevices,
   stateWithoutLogic,
   strangerAddress,
+  unappliedStakeScript,
+  unappliedStakeScriptHash,
 } from '../support/account.js';
-import { buildAgentSpendOnLease, buildCreation, buildOwnerOperation, clientBuilder, sponsorUtxo, lenientEvaluator, underDeclaringEvaluator } from '../support/client.js';
+import { buildAgentSpendOnLease, buildCreation, buildOwnerOperation, clientBuilder, runLogic, sponsorUtxo, lenientEvaluator, underDeclaringEvaluator } from '../support/client.js';
 import { type TestService, createTestService, txHash } from '../support/service.js';
 import {
   authCommitteeHotCertificate,
@@ -57,9 +69,12 @@ import {
   withExtraCertificates,
   withExtraOutput,
   withInfoProposal,
+  withReferenceInputs,
+  withRepeatedWithdrawal,
   withScriptDataHash,
   withTotalCollateral,
   withValidityUpperBound,
+  withoutScriptData,
   withoutScriptDataHash,
 } from '../support/transaction.js';
 
@@ -618,12 +633,67 @@ describe('transaction policy', () => {
     expectViolation(await witness(taken.leaseId, await builder.build()), 'account_transaction', /mints a state NFT named with the 28 bytes of its stake script hash/);
   });
 
-  it('account_transaction: refuses a creation whose control output is staked to a credential other than the registered one', async () => {
+  it('account_transaction: refuses a creation whose control output is staked to a credential other than the registered one, or to a key of its hash', async () => {
     await fundPool();
     const taken = await lease();
     const transaction = await buildCreation(service, taken, { controlAddress: disguisedAccountAddress });
 
     expectViolation(await witness(taken.leaseId, transaction), 'account_transaction', /staked to the registered stake credential/);
+
+    const keyStaked = Cometa.BaseAddress.fromCredentials(Cometa.NetworkId.Testnet, scriptCredential(accountScriptHash), { hash: stakeScriptHash, type: Cometa.CredentialType.KeyHash })
+      .toAddress()
+      .toString();
+    expectViolation(await witness(taken.leaseId, await buildCreation(service, taken, { controlAddress: keyStaked })), 'account_transaction', /staked to the registered stake credential/);
+  });
+
+  it('account_transaction: witnesses a creation whose stake credential is the stake script of the first device its control output lists, or of the last', async () => {
+    await fundPool(2, 1);
+    const first = await lease();
+
+    const ownerFirst = await witness(first.leaseId, await buildCreation(service, first, { state: stateWithDevices([DEVICE_KEY, AGENT_KEY]) }));
+    expect(ownerFirst.status).toBe(200);
+    expect(lastWitnessAudit()).toMatchObject({ outcome: 'issued', detail: { leaseId: first.leaseId, kind: 'creation' } });
+
+    const last = await lease();
+    const ownerLast = await witness(last.leaseId, await buildCreation(service, last, { state: stateWithDevices([AGENT_KEY, STRANGER_KEY, DEVICE_KEY]) }));
+    expect(ownerLast.status).toBe(200);
+    expect(lastWitnessAudit()).toMatchObject({ outcome: 'issued', detail: { leaseId: last.leaseId, kind: 'creation' } });
+  });
+
+  it('account_transaction: refuses a creation whose stake credential is the stake script of no device the control output lists, the unapplied validator included', async () => {
+    await fundPool();
+    const taken = await lease();
+    const notListed = new RegExp(`The stake credential ${stakeScriptHash} is not this contract's stake script for any device the control output lists`);
+
+    expectViolation(await witness(taken.leaseId, await buildCreation(service, taken, { state: stateWithDevices([AGENT_KEY]) })), 'account_transaction', notListed);
+
+    const builder = clientBuilder(service, taken);
+    builder.registerStakeAddress({ rewardAddress: rewardAddressOf(unappliedStakeScriptHash), redeemer: operateRedeemer });
+    builder.mintToken({ assetIdHex: stateNftAssetIdOf(unappliedStakeScriptHash), amount: 1n, redeemer: createAccountRedeemer });
+    builder.lockValue({
+      scriptAddress: accountAddressOf(unappliedStakeScriptHash),
+      value: { coins: CONTROL_LOVELACE, assets: { [stateNftAssetIdOf(unappliedStakeScriptHash)]: 1n } },
+      datum: { type: Cometa.DatumType.InlineData, inlineDatum: initialState },
+    });
+    runLogic(builder);
+    builder.addSigner(DEVICE_KEY).addScript(accountScript).addScript(unappliedStakeScript);
+    expectViolation(
+      await witness(taken.leaseId, await builder.build()),
+      'account_transaction',
+      new RegExp(`The stake credential ${unappliedStakeScriptHash} is not this contract's stake script for any device the control output lists`),
+    );
+    expect((service.db.prepare('SELECT COUNT(*) AS count FROM witnesses').get() as { count: number }).count).toBe(0);
+  });
+
+  it('account_transaction: refuses a creation whose control output does not list device keys in the second field of its datum', async () => {
+    await fundPool();
+    const taken = await lease();
+
+    expectViolation(
+      await witness(taken.leaseId, await buildCreation(service, taken, { state: stateWithoutDevices })),
+      'account_transaction',
+      /The control output does not list device keys in the second field of its datum/,
+    );
   });
 
   it('known_logic: refuses a creation whose control output names a logic the service does not know', async () => {
@@ -833,6 +903,54 @@ describe('transaction policy', () => {
       /carries redeemers or datums while the body commits to no script data hash/,
     );
     expect(service.db.prepare('SELECT COUNT(*) AS count FROM witnesses').get()).toEqual({ count: 0 });
+  });
+
+  it('script_data_hash: refuses a body committing to a script data hash while the witness set carries neither redeemers nor datums', async () => {
+    await fundPool();
+    const taken = await lease();
+    const transaction = withoutScriptData(await buildCreation(service, taken));
+    expect(parseTransaction(transaction).transaction?.redeemers).toEqual([]);
+
+    expectViolation(
+      await witness(taken.leaseId, transaction),
+      'script_data_hash',
+      /The body commits to the script data hash [0-9a-f]{64} while the witness set carries neither redeemers nor datums/,
+    );
+    expect(service.db.prepare('SELECT COUNT(*) AS count FROM witnesses').get()).toEqual({ count: 0 });
+  });
+
+  it('script_data_hash: refuses a reference input carrying a Plutus V2 reference script, naming the language as people write it', async () => {
+    await fundPool();
+    const taken = await lease();
+    const parkedV2: UTxO = {
+      input: { txId: txHash(600), index: 0 },
+      output: {
+        address: parkingAddress,
+        value: { coins: PARKED_LOVELACE },
+        scriptReference: { type: Cometa.ScriptType.Plutus, bytes: foreignScript.bytes, version: Cometa.PlutusLanguageVersion.V2 },
+      },
+    };
+    service.provider.addUtxo(parkedV2);
+    const transaction = withReferenceInputs(await buildCreation(service, taken), [parkedV2.input]);
+    expect(parseTransaction(transaction).transaction?.referenceInputs).toEqual([parkedV2.input]);
+
+    expectViolation(
+      await witness(taken.leaseId, transaction),
+      'script_data_hash',
+      /The transaction carries a script of Plutus V2, and every script an account runs is Plutus V3/,
+    );
+  });
+
+  it('no_foreign_scripts: refuses a withdrawal map drawing from the same reward account twice', async () => {
+    await fundPool();
+    const taken = await lease();
+    const transaction = withRepeatedWithdrawal(await buildCreation(service, taken));
+
+    expectViolation(
+      await witness(taken.leaseId, transaction),
+      'no_foreign_scripts',
+      new RegExp(`The transaction withdraws from ${logicRewardAddress.toAddress().toString()} twice, which the ledger cannot decode`),
+    );
   });
 
   it('evaluates: refuses a transaction the provider cannot evaluate', async () => {

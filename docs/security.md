@@ -54,7 +54,19 @@ sponsor's value from going anywhere but the fee and the account:
   a transaction operates is read from the control or grant UTxOs it
   spends, which hold a token of the account policy at the address the
   token is named after, and its stake script from the control UTxO it
-  spends or, as an agent spend does, references. A grant UTxO spent
+  spends or, as an agent spend does, references. A creation's stake
+  credential must be the contract's own stake script applied to one of
+  the devices its control output lists and to `ACCOUNT_SCRIPT_HASH`,
+  which the service derives itself from the stake validator in the
+  blueprint at `BLUEPRINT_PATH` and keeps per device key: the proxy
+  mints the state NFT for any script credential, so without this a
+  client could register an always true script of its own as the
+  credential, write whatever state it liked into the control output and
+  have the sponsor pay the fee, the deposit and the control output for an
+  account none of the contract's owner guarantees hold for. A datum
+  listing more than the eight devices a well formed state carries is
+  refused before anything is derived, so a client cannot make the
+  service derive without bound. A grant UTxO spent
   without its account's control UTxO, a referenced control UTxO of an
   account no input operates, a token of the account policy held at the
   sponsor address, which the sponsor input rules refuse first, and a
@@ -68,7 +80,11 @@ sponsor's value from going anywhere but the fee and the account:
   its token names. A sponsor UTxO among the reference inputs takes
   nothing from the sponsor, and the same UTxO among the inputs is still
   refused by the sponsor input rules, which read a sponsor payment
-  credential at any address.
+  credential at any address. An upgrade cannot embed both logics, since
+  two logic scripts and the proxy exceed the transaction size limit the
+  first rule enforces, so an upgrade references parked copies of the
+  logics; the policy reads which logics it names from the control datums
+  all the same, never from the parked UTxOs.
 - `known_logic` keeps the sponsor out of accounts whose rules it has not
   read. The proxy holds no rules of its own: it runs the logic script
   the control datum names, and it admits whatever hash that datum
@@ -80,15 +96,22 @@ sponsor's value from going anywhere but the fee and the account:
   sponsor neither pays the fee of nor lends collateral to such a
   transaction, so an unknown logic can neither spend sponsor lovelace
   nor put the shared collateral at risk.
-- `no_foreign_scripts` admits one withdrawal credential beyond the
-  account's own scripts: a logic the transaction names, since the zero
+- `no_foreign_scripts` lets only the proxy lock an input or mint, since
+  the stake validator has only withdraw and publish handlers. It admits
+  a logic the transaction names in two places and nowhere else: as a withdrawal credential, since the zero
   withdrawal from the logic's reward account is how the proxy runs the
   account's rules, and an upgrade names two, the logic it leaves and the
-  one it arrives at. Only a control UTxO's datum or a control output's
+  one it arrives at; and as an attached Plutus script, which is how a
+  transaction that embeds the logic rather than referencing a parked
+  copy carries it. Only a control UTxO's datum or a control output's
   makes a logic allowed there; referencing the UTxO a logic is parked at
-  does not, and a logic is admitted nowhere else, neither as the payment
-  credential of an input, nor as a mint policy, nor on a certificate or
-  a vote.
+  does not, and a logic is admitted neither as the payment credential of
+  an input, nor as a mint policy, nor on a certificate or a vote. A
+  withdrawal that names a logic and draws any lovelace is refused, which
+  is stricter than the contract and safe: the logic credential is never
+  delegated, so its reward balance stays zero and the ledger never needs
+  a non zero draw. A second withdrawal from a reward account already
+  drawn from is refused as well, since no ledger decodes such a map.
 - `sponsor_outflow_bounded` lets a leased fee UTxO pay for an account
   creation and for nothing else: an operation on an existing account is
   refused on the fee route whatever it draws, so the sponsor's exposure
@@ -121,7 +144,12 @@ a redeemer that declares less budget than the evaluation found it needs,
 so a witnessed transaction can only fail in phase one, which spends no
 collateral. A transaction flagged as failing is refused outright. This is
 what lets one collateral UTxO back every transaction at once, without a
-lease: nothing the service signs can take it.
+lease: nothing the service signs can take it. The rule is load bearing
+against path confusion inside the contract as well: the structural rules
+do not tell the proxy's owner path, a control UTxO spent under the
+device redeemer, from its agent path, a grant UTxO spent under the grant
+redeemer with the control UTxO referenced, so a transaction that mixes
+the two is refused only by the scripts themselves running here.
 
 Evaluation alone does not establish that, because the sponsor signs a
 body and the scripts run on a witness set. The redeemers and the datums

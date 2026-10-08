@@ -1,8 +1,12 @@
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { CURRENT_LOGIC_HASH, ConfigError, loadConfig } from '../src/config.js';
 import { SLOT_SETTINGS_BY_NETWORK } from '../src/slots.js';
 
 const VALID_MNEMONIC = 'alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima';
+
+/** The blueprint the service ships with, at the repository root whatever the working directory. */
+const SHIPPED_BLUEPRINT_PATH = resolve(import.meta.dirname, '..', 'contract', 'plutus.json');
 
 const validEnv = (): Record<string, string> => ({
   BLOCKFROST_PREPROD_PROJECT_ID: 'preprodTestProjectId',
@@ -23,6 +27,7 @@ describe('loadConfig', () => {
     expect(config.adminApiKey).toBe('test-admin-key');
     expect(config.port).toBe(8787);
     expect(config.databasePath).toBe('./data/sponsor.sqlite');
+    expect(config.blueprintPath).toBe(SHIPPED_BLUEPRINT_PATH);
     expect(config.leaseTtlSeconds).toBe(600);
     expect(config.maxSponsoredLovelace).toBe(6_000_000);
     expect(config.maxFeeLovelace).toBe(2_000_000);
@@ -42,6 +47,7 @@ describe('loadConfig', () => {
     const config = loadConfig({
       ...validEnv(),
       PORT: '9000',
+      BLUEPRINT_PATH: './build/plutus.json',
       LEASE_TTL_SECONDS: '120',
       MAX_FEE_LOVELACE: '1000000',
       VALIDITY_MARGIN_SECONDS: '0',
@@ -52,6 +58,7 @@ describe('loadConfig', () => {
     });
 
     expect(config.port).toBe(9000);
+    expect(config.blueprintPath).toBe('./build/plutus.json');
     expect(config.leaseTtlSeconds).toBe(120);
     expect(config.maxFeeLovelace).toBe(1_000_000);
     expect(config.validityMarginSeconds).toBe(0);

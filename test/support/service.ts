@@ -3,6 +3,7 @@ import pino from 'pino';
 import { loadConfig } from '../../src/config.js';
 import { type ApiKey, type QuotaOverrides, createApiKey } from '../../src/keys.js';
 import { type Service, createService } from '../../src/service.js';
+import { BLUEPRINT_PATH } from './account.js';
 import { FakeProvider } from './fake.js';
 import { fakeTransactionId, transactionParts } from './transaction.js';
 
@@ -25,6 +26,7 @@ export const testEnv = (overrides: Record<string, string> = {}): Record<string, 
   ACCOUNT_SCRIPT_HASH: 'ed61963ac94d12c0b320be5a336c36af66bc02c380e0aa3001899253',
   ADMIN_API_KEY: TEST_ADMIN_KEY,
   DATABASE_PATH: ':memory:',
+  BLUEPRINT_PATH,
   ...overrides,
 });
 
@@ -77,6 +79,7 @@ export const createTestService = async (overrides: Record<string, string> = {}, 
     db: service.db,
     provider,
     serviceWallet: service.serviceWallet,
+    stakeScriptHashOf: service.stakeScriptHashOf,
     sync: service.sync,
     collateral: service.collateral,
     witnesses: service.witnesses,

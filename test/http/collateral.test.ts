@@ -28,6 +28,7 @@ import {
   parkedProxyUtxo,
   reserveUtxo,
   rewardAddressOf,
+  scriptCredential,
   scriptUtxo,
   stakeScript,
   stakeScriptHash,
@@ -493,6 +494,26 @@ describe('collateral mode policy', () => {
       new RegExp(`A withdrawal draws from script ${otherStakeScriptHash}, which is neither the account script, its stake script nor a logic its control UTxOs name`),
     );
     expect(witnessCount()).toBe(1);
+  });
+
+  it('no_foreign_scripts: refuses a mint under the account stake script and an input locked by it, since the proxy alone pays for and mints account tokens', async () => {
+    await fundPool();
+    const { control, fund } = placeAccount();
+    const shared = await collateral();
+
+    const minting = await buildAccountPaidOperation(service, shared, control, fund, {
+      customise: (builder) => builder.mintToken({ assetIdHex: `${stakeScriptHash}00`, amount: 1n, redeemer: operateRedeemer }).addScript(stakeScript),
+    });
+    expectViolation(await witness(minting), 'no_foreign_scripts', new RegExp(`The transaction mints under policy ${stakeScriptHash}, which is not the account script`));
+
+    const stakeScriptAddress = Cometa.EnterpriseAddress.fromCredentials(Cometa.NetworkId.Testnet, scriptCredential(stakeScriptHash)).toAddress().toString();
+    const locked = scriptUtxo(txHash(400), stakeScriptAddress, 10_000_000n);
+    service.provider.addUtxo(locked);
+    const spending = await buildAccountPaidOperation(service, shared, control, fund, {
+      customise: (builder) => builder.addInput({ utxo: locked, redeemer: operateRedeemer }).addScript(stakeScript).sendLovelace({ address: strangerAddress, amount: 10_000_000n }),
+    });
+    expectViolation(await witness(spending), 'no_foreign_scripts', new RegExp(`Input ${txHash(400)}#0 is locked by script ${stakeScriptHash}, which is not the account script`));
+    expect(witnessCount()).toBe(0);
   });
 
   it('no_foreign_scripts: refuses a withdrawal that runs the logic but draws lovelace, since a logic runs on zero', async () => {

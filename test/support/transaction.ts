@@ -15,10 +15,16 @@ const BODY_OUTPUTS = 1n;
 const BODY_FEE = 2n;
 const BODY_VALIDITY_UPPER_BOUND = 3n;
 const BODY_CERTIFICATES = 4n;
+const BODY_WITHDRAWALS = 5n;
 const BODY_SCRIPT_DATA_HASH = 11n;
 const BODY_COLLATERAL_RETURN = 16n;
 const BODY_TOTAL_COLLATERAL = 17n;
+const BODY_REFERENCE_INPUTS = 18n;
 const BODY_PROPOSAL_PROCEDURES = 20n;
+
+/** The keys of the witness set fields the script data hash commits to. */
+const WITNESS_DATUMS = 4n;
+const WITNESS_REDEEMERS = 5n;
 
 /** The keys of a post Alonzo output map and the CBOR tag wrapping an encoded script. */
 const OUTPUT_ADDRESS = 0;
@@ -141,7 +147,7 @@ export const markInvalid = (txCbor: string): string => writeTransaction({ ...rea
 
 const bytes = (hex: string): Uint8Array => Cometa.hexToUint8Array(hex);
 
-/** The entries of a transaction body, each value still encoded. */
+/** The entries of a transaction body or a witness set, each value still encoded. */
 interface BodyEntry {
   key: bigint;
   value: Uint8Array;
@@ -150,6 +156,15 @@ interface BodyEntry {
 const readBodyEntries = (body: Uint8Array): BodyEntry[] => {
   const reader = Cometa.CborReader.fromHex(Cometa.uint8ArrayToHex(body));
   return readItems(reader, () => ({ key: BigInt(reader.readUnsignedInt().toString()), value: reader.readEncodedValue() }), { map: true });
+};
+
+/** A body or a witness set map holding the entries, in the order given. */
+const writeEntries = (entries: BodyEntry[]): Uint8Array => {
+  const writer = new Cometa.CborWriter().startMap(entries.length);
+  for (const entry of entries) {
+    writer.writeUnsignedInt(entry.key).writeEncoded(entry.value);
+  }
+  return bytes(writer.encodeHex());
 };
 
 /**
@@ -163,11 +178,53 @@ export const withBodyField = (txCbor: string, key: bigint, valueCbor: string): s
   const entries = [...readBodyEntries(items.body).filter((entry) => entry.key !== key), { key, value: bytes(valueCbor) }].sort((a, b) =>
     a.key < b.key ? -1 : a.key > b.key ? 1 : 0,
   );
-  const writer = new Cometa.CborWriter().startMap(entries.length);
-  for (const entry of entries) {
-    writer.writeUnsignedInt(entry.key).writeEncoded(entry.value);
+  return writeTransaction({ ...items, body: writeEntries(entries) });
+};
+
+/**
+ * The same transaction with the given inputs as its reference inputs, in
+ * place of whatever it referenced, as a client editing the body by hand
+ * can set; nothing rebalances it.
+ */
+export const withReferenceInputs = (txCbor: string, inputs: TxIn[]): string => {
+  const writer = new Cometa.CborWriter().startArray(inputs.length);
+  for (const input of inputs) {
+    writer.startArray(2).writeByteString(bytes(input.txId)).writeUnsignedInt(input.index);
   }
-  return writeTransaction({ ...items, body: bytes(writer.encodeHex()) });
+  return withBodyField(txCbor, BODY_REFERENCE_INPUTS, writer.encodeHex());
+};
+
+/**
+ * The same transaction with its witness set stripped of the redeemers
+ * and the datums it carried, while its body still commits to the script
+ * data hash taken over them, as a client that signs a body and then
+ * drops the script data leaves it.
+ */
+export const withoutScriptData = (txCbor: string): string => {
+  const items = readTransaction(txCbor);
+  const entries = readBodyEntries(items.witnessSet).filter((entry) => entry.key !== WITNESS_REDEEMERS && entry.key !== WITNESS_DATUMS);
+  return writeTransaction({ ...items, witnessSet: writeEntries(entries) });
+};
+
+/**
+ * The same transaction with its first withdrawal entered twice in the
+ * withdrawal map, as a map no ledger decodes, while the transaction
+ * still decodes for everything the policy reads; nothing rebalances it.
+ */
+export const withRepeatedWithdrawal = (txCbor: string): string => {
+  const entry = readBodyEntries(readTransaction(txCbor).body).find((candidate) => candidate.key === BODY_WITHDRAWALS);
+  if (entry === undefined) {
+    throw new Error('The transaction carries no withdrawals to repeat');
+  }
+  const reader = Cometa.CborReader.fromHex(Cometa.uint8ArrayToHex(entry.value));
+  const withdrawals = readItems(reader, () => ({ key: reader.readEncodedValue(), value: reader.readEncodedValue() }), { map: true });
+  const writer = new Cometa.CborWriter().startMap(withdrawals.length + 1);
+  for (const withdrawal of [...withdrawals, withdrawals[0]]) {
+    if (withdrawal !== undefined) {
+      writer.writeEncoded(withdrawal.key).writeEncoded(withdrawal.value);
+    }
+  }
+  return withBodyField(txCbor, BODY_WITHDRAWALS, writer.encodeHex());
 };
 
 /**
@@ -181,12 +238,7 @@ export const withScriptDataHash = (txCbor: string, hash: string): string =>
 /** The same transaction with its body committing to no script data hash at all, whatever its witness set carries. */
 export const withoutScriptDataHash = (txCbor: string): string => {
   const items = readTransaction(txCbor);
-  const entries = readBodyEntries(items.body).filter((entry) => entry.key !== BODY_SCRIPT_DATA_HASH);
-  const writer = new Cometa.CborWriter().startMap(entries.length);
-  for (const entry of entries) {
-    writer.writeUnsignedInt(entry.key).writeEncoded(entry.value);
-  }
-  return writeTransaction({ ...items, body: bytes(writer.encodeHex()) });
+  return writeTransaction({ ...items, body: writeEntries(readBodyEntries(items.body).filter((entry) => entry.key !== BODY_SCRIPT_DATA_HASH)) });
 };
 
 /** The same transaction with `slot` as its validity upper bound, whatever the slot, as a client editing the body by hand can set. */
