@@ -61,6 +61,16 @@ any it does not know, under `known_logic`: an account whose rules the
 operator has never read is not one the sponsor pays for or lends
 collateral to. `KNOWN_LOGIC_HASHES` is the list it serves.
 
+The contract carries two logic versions, and the list defaults to both:
+`2cd68e398bdf9fbc8d257614b54403451ee722520ec785fe14f8df5a` for logic v1,
+which is the version a new account is created under, and
+`69baa8a8c877247028c56c8130449e186e3658d541536d168f92db3d` for logic v2,
+the version an account arrives at when its devices sign an upgrade. Both
+are served because an upgrade runs both logics and accounts sit on either
+side of it for as long as the upgrade window lasts: serving v1 alone
+would refuse the upgrade itself, and serving v2 alone would strand every
+account that has not moved yet.
+
 The proxy and the logic are large scripts, so a network usually parks
 them in UTxOs at an address nobody can spend from and transactions
 reference them instead of carrying them. Such a reference input sits at
@@ -572,7 +582,7 @@ Optional, with defaults:
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
-| `KNOWN_LOGIC_HASHES` | the current logic, `2cd68e398bdf9fbc8d257614b54403451ee722520ec785fe14f8df5a` | the logic script hashes the service serves accounts under, comma separated, each 56 hex characters |
+| `KNOWN_LOGIC_HASHES` | logic v1, `2cd68e398bdf9fbc8d257614b54403451ee722520ec785fe14f8df5a`, and logic v2, `69baa8a8c877247028c56c8130449e186e3658d541536d168f92db3d` | the logic script hashes the service serves accounts under, comma separated, each 56 hex characters |
 | `PORT` | `8787` | listening port |
 | `DATABASE_PATH` | `./data/sponsor.sqlite` | sqlite database file |
 | `BLUEPRINT_PATH` | `contract/plutus.json` at the repository root | the blueprint of the contract build `ACCOUNT_SCRIPT_HASH` names, which the service reads the account stake validator from; the service refuses to start on a blueprint whose account proxy hashes to anything else |
@@ -660,19 +670,23 @@ Requires Node 22.
    anything else, since the stake validator of another build would
    admit creations the configured proxy does not govern. The `file:`
    dependency and the continuous integration workflow are pinned to
-   contract commit `393a593d6ed52fbcc5c726f54854a576990b7a6d`, the one
+   contract commit `cf3e20ddbe5f51ef40411b37d045e581c89dc1b2`, the one
    whose builders the preprod proof builds on and whose blueprint
    `contract/plutus.json` is a copy of, which the workflow compares byte
    for byte against the pinned checkout; `package-lock.json` must be
    regenerated whenever the contract's off-chain package changes its
-   dependencies. The pinned commit is revision 3 of the validators, with
-   a permanent account proxy at hash
-   `ed61963ac94d12c0b320be5a336c36af66bc02c380e0aa3001899253`, which is
-   what `ACCOUNT_SCRIPT_HASH` must name, the account's rules in a
-   replaceable logic script, whose current version applied to that proxy
-   hashes to `2cd68e398bdf9fbc8d257614b54403451ee722520ec785fe14f8df5a`,
-   which is what `KNOWN_LOGIC_HASHES` defaults to, and the stake
-   validator applied to the same proxy hash.
+   dependencies. The pinned commit is revision 3 of the validators with a
+   second logic version added, and carries a permanent account proxy at
+   hash `ed61963ac94d12c0b320be5a336c36af66bc02c380e0aa3001899253`, which
+   is what `ACCOUNT_SCRIPT_HASH` must name, the account's rules in a
+   replaceable logic script, whose first version applied to that proxy
+   hashes to `2cd68e398bdf9fbc8d257614b54403451ee722520ec785fe14f8df5a`
+   and whose second hashes to
+   `69baa8a8c877247028c56c8130449e186e3658d541536d168f92db3d`, which are
+   what `KNOWN_LOGIC_HASHES` defaults to, and the stake validator applied
+   to the same proxy hash. The proxy, the stake validator and the first
+   logic version are byte identical to the commit before, so no existing
+   account changes hash.
 3. Start the service with `npm run dev`, or `npm run start` without the
    file watcher.
 
@@ -788,7 +802,7 @@ Plain values:
 | Variable | What it is |
 | -------- | ---------- |
 | `ACCOUNT_SCRIPT_HASH` | required; the hash of the account proxy in the shipped blueprint, `ed61963ac94d12c0b320be5a336c36af66bc02c380e0aa3001899253`, which the service checks the blueprint against at startup |
-| `KNOWN_LOGIC_HASHES` | the logic versions served, defaulting to the current one; name a hash only after reading the version it stands for |
+| `KNOWN_LOGIC_HASHES` | the logic versions served, defaulting to logic v1 and logic v2, so that accounts on either side of an upgrade are served; name a hash only after reading the version it stands for |
 | `PROVIDER_BASE_URL` | a Blockfrost compatible endpoint other than the hosted preprod one; behind the Lace proxy, `https://<proxy host>/<surface>/preprod/api/v0` with the surface the proxy's operators allocated to the service, and no project id |
 | `TRUST_PROXY_HOPS` | the number of reverse proxies in front of the service, and never more |
 | `LEASE_TTL_SECONDS`, `MAX_SPONSORED_LOVELACE`, `MAX_FEE_LOVELACE`, `FEE_UTXO_LOVELACE`, `COLLATERAL_UTXO_LOVELACE`, `FEE_UTXO_COUNT`, `COLLATERAL_UTXO_COUNT`, `VALIDITY_MARGIN_SECONDS`, `COLLATERAL_VALIDITY_SECONDS`, `IP_RATE_LIMIT_PER_MINUTE`, `KEY_RATE_LIMIT_PER_MINUTE` | the quotas and limits, with the defaults of the configuration table |

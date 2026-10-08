@@ -1,12 +1,23 @@
+import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CURRENT_LOGIC_HASH, ConfigError, loadConfig } from '../src/config.js';
+import { CURRENT_LOGIC_HASH, ConfigError, LOGIC_V2_HASH, loadConfig } from '../src/config.js';
 import { SLOT_SETTINGS_BY_NETWORK } from '../src/slots.js';
 
 const VALID_MNEMONIC = 'alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima';
 
 /** The blueprint the service ships with, at the repository root whatever the working directory. */
 const SHIPPED_BLUEPRINT_PATH = resolve(import.meta.dirname, '..', 'contract', 'plutus.json');
+
+/** The example environment file an operator copies before filling in the required variables. */
+const EXAMPLE_ENV_PATH = resolve(import.meta.dirname, '..', '.env.example');
+
+/** What the example environment file sets a variable to, and nothing when it does not set it. */
+const exampleValueOf = (name: string): string | undefined =>
+  readFileSync(EXAMPLE_ENV_PATH, 'utf8')
+    .split('\n')
+    .find((line) => line.startsWith(`${name}=`))
+    ?.slice(name.length + 1);
 
 const validEnv = (): Record<string, string> => ({
   BLOCKFROST_PREPROD_PROJECT_ID: 'preprodTestProjectId',
@@ -71,7 +82,7 @@ describe('loadConfig', () => {
     expect(config.blockfrostBaseUrl).toBeUndefined();
     expect(config.sponsorMnemonic).toEqual(VALID_MNEMONIC.split(' '));
     expect(config.accountScriptHash).toBe('ed61963ac94d12c0b320be5a336c36af66bc02c380e0aa3001899253');
-    expect(config.knownLogicHashes).toEqual([CURRENT_LOGIC_HASH]);
+    expect(config.knownLogicHashes).toEqual([CURRENT_LOGIC_HASH, LOGIC_V2_HASH]);
     expect(config.adminApiKey).toBe('test-admin-key');
     expect(config.port).toBe(8787);
     expect(config.databasePath).toBe('./data/sponsor.sqlite');
@@ -175,5 +186,12 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ ...validEnv(), KNOWN_LOGIC_HASHES: `${CURRENT_LOGIC_HASH},${CURRENT_LOGIC_HASH}` })).toThrow(
       /KNOWN_LOGIC_HASHES must not name the same logic script hash twice/,
     );
+  });
+
+  it('is offered the same two logic hashes by the example environment file, the version new accounts run first', () => {
+    const example = exampleValueOf('KNOWN_LOGIC_HASHES');
+
+    expect(example).toBe(`${CURRENT_LOGIC_HASH},${LOGIC_V2_HASH}`);
+    expect(loadConfig({ ...validEnv(), KNOWN_LOGIC_HASHES: example }).knownLogicHashes).toEqual([CURRENT_LOGIC_HASH, LOGIC_V2_HASH]);
   });
 });

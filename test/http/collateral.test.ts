@@ -20,10 +20,12 @@ import {
   grantUtxo,
   grantedState,
   logicHash,
+  logicV2Hash,
   operateRedeemer,
   otherLogicHash,
   otherStakeScriptHash,
   parkedLogicUtxo,
+  parkedLogicV2Utxo,
   parkedOtherLogicUtxo,
   parkedProxyUtxo,
   reserveUtxo,
@@ -34,6 +36,7 @@ import {
   stakeScriptHash,
   stateNftAssetId,
   stateUnderLogic,
+  stateUnderLogicV2,
   stateWithoutLogic,
   strangerAddress,
   sweepGrantRedeemer,
@@ -97,9 +100,9 @@ const placeAccount = (): { control: UTxO; fund: UTxO } => {
   return { control, fund };
 };
 
-/** Puts the UTxOs the proxy and the logic are parked at on the fake chain, as the setup of a network leaves them. */
+/** Puts the UTxOs the proxy and the logics are parked at on the fake chain, as the setup of a network leaves them. */
 const placeParkedScripts = (): void => {
-  for (const parked of [parkedProxyUtxo, parkedLogicUtxo, parkedOtherLogicUtxo]) {
+  for (const parked of [parkedProxyUtxo, parkedLogicUtxo, parkedLogicV2Utxo, parkedOtherLogicUtxo]) {
     service.provider.addUtxo(parked);
   }
 };
@@ -583,6 +586,42 @@ describe('collateral mode policy', () => {
       new RegExp(`The control output of account ${stakeScriptHash} names logic ${otherLogicHash}, which is not one of the logic scripts the service knows`),
     );
     expect(witnessCount()).toBe(0);
+  });
+
+  it('known_logic: witnesses an operation on an account that has upgraded to the second logic version, which the default list names', async () => {
+    await fundPool();
+    const control = controlUtxo(txHash(300), undefined, stateUnderLogicV2);
+    const fund = fundUtxo(txHash(301), 20_000_000n);
+    service.provider.addUtxo(control);
+    service.provider.addUtxo(fund);
+    const shared = await collateral();
+
+    const transaction = await buildAccountPaidOperation(service, shared, control, fund, { logic: logicV2Hash });
+    const parsed = parseTransaction(transaction).transaction;
+    expect(parsed?.withdrawals.map((withdrawal) => withdrawal.credential?.hash)).toEqual([logicV2Hash]);
+
+    const response = await witness(transaction);
+
+    expect(response.status).toBe(200);
+    expectSponsorWitness(response.body.witnessSet, transaction, [control, fund, sponsorUtxo(shared)], DEVICE_KEY);
+    expect(witnessAudit().at(-1)).toMatchObject({ outcome: 'issued', detail: { kind: 'operation', sponsoredLovelace: 0 } });
+  });
+
+  it('known_logic: witnesses an upgrade from the current logic to the second version, both named by default', async () => {
+    await fundPool();
+    placeParkedScripts();
+    const { control, fund } = placeAccount();
+    const shared = await collateral();
+
+    const transaction = await buildUpgrade(service, shared, control, fund, logicV2Hash, { referenced: true });
+    const parsed = parseTransaction(transaction).transaction;
+    expect(parsed?.withdrawals.map((withdrawal) => withdrawal.credential?.hash).sort()).toEqual([logicHash, logicV2Hash].sort());
+    expect(parsed?.outputs.find((output) => output.assets[stateNftAssetId] === 1n)?.logicHash).toBe(logicV2Hash);
+
+    const response = await witness(transaction);
+
+    expect(response.status).toBe(200);
+    expectSponsorWitness(response.body.witnessSet, transaction, [control, fund, sponsorUtxo(shared)], DEVICE_KEY);
   });
 
   it('sponsor_outflow_zero: refuses an output to the sponsor, at its address or at its payment key alone', async () => {

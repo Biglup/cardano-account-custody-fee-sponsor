@@ -5,6 +5,7 @@ import {
   type AccountState,
   type Blueprint,
   type Grant,
+  LOGIC_V2_TITLE,
   applyParameters,
   bytes,
   currentLogicScript,
@@ -17,6 +18,7 @@ import {
   encodeStakeRedeemer,
   logicScriptHash,
   logicValidator,
+  logicVersionScript,
   stakeScript as contractStakeScript,
 } from 'cardano-account-custody-offchain';
 import { Cometa } from '../../src/cometa.js';
@@ -54,7 +56,7 @@ export const GRANT_FEE_BOUND = 1_500_000n;
 /** When the fixture grant expires: far enough out for every validity bound the tests set. */
 export const GRANT_EXPIRES_AT = 1_800_000_000_000n;
 
-/** The parameter the fixtures' second logic version is applied to, which is not the proxy hash and so yields another hash. */
+/** The parameter the fixtures' unknown logic is applied to, which is not the proxy hash and so yields a hash no published version has. */
 const OTHER_LOGIC_PARAMETER = '02'.repeat(28);
 
 /** The blueprint of the account custody contract the service ships with, as `aiken build` writes it, for the fixtures and the test service alike. */
@@ -115,7 +117,15 @@ export const otherStakeScriptHash = '11'.repeat(28);
 export const logicScript: PlutusScript = currentLogicScript(accountScriptHash, blueprint);
 export const logicHash = logicScriptHash(logicScript);
 
-/** A second logic version, the same validator under another parameter, which an upgrade can move an account to. */
+/**
+ * The contract's second logic version applied to the proxy hash, which
+ * an upgrade moves an account to and which the service serves alongside
+ * the current one.
+ */
+export const logicV2Script: PlutusScript = logicVersionScript(LOGIC_V2_TITLE, accountScriptHash, blueprint);
+export const logicV2Hash = logicScriptHash(logicV2Script);
+
+/** A logic the blueprint carries no version of: the current validator under another parameter, which stands for rules nobody has read. */
 export const otherLogicScript: PlutusScript = plutusScript(applyParameters(logicValidator(blueprint).compiledCode, [bytes(OTHER_LOGIC_PARAMETER)]));
 export const otherLogicHash = logicScriptHash(otherLogicScript);
 
@@ -141,7 +151,7 @@ export const accountRewardAddress: RewardAddress = rewardAddressOf(stakeScriptHa
 /** The reward account the zero withdrawal of the fixture accounts' logic draws from. */
 export const logicRewardAddress: RewardAddress = rewardAddressOf(logicHash);
 
-/** The reward account the second logic version's withdrawal draws from. */
+/** The reward account the unknown logic's withdrawal draws from. */
 export const otherLogicRewardAddress: RewardAddress = rewardAddressOf(otherLogicHash);
 
 /** The asset id of an account's state NFT: the account policy and the stake script hash as the name. */
@@ -196,6 +206,9 @@ export const initialState: PlutusData = initialStateOf(DEVICE_KEY);
 
 /** The inline datum of a freshly created account naming `logic` in place of the one the fixtures run. */
 export const stateUnderLogic = (logic: string): PlutusData => encodeAccountState(initialStateUnder(logic));
+
+/** The control datum of an account that has upgraded to the contract's second logic version. */
+export const stateUnderLogicV2: PlutusData = stateUnderLogic(logicV2Hash);
 
 /**
  * A control datum whose first field is not a script hash, as a client
@@ -342,8 +355,11 @@ export const parkedProxyUtxo: UTxO = parkedScriptUtxo(PARKED_SCRIPTS_TX, 0, acco
 /** The parked UTxO a transaction references the logic the fixture accounts run from. */
 export const parkedLogicUtxo: UTxO = parkedScriptUtxo(PARKED_SCRIPTS_TX, 1, logicScript);
 
-/** The parked UTxO the second logic version sits at, which a transaction may reference without any account naming it. */
-export const parkedOtherLogicUtxo: UTxO = parkedScriptUtxo(PARKED_SCRIPTS_TX, 2, otherLogicScript);
+/** The parked UTxO an upgrade references the contract's second logic version from. */
+export const parkedLogicV2Utxo: UTxO = parkedScriptUtxo(PARKED_SCRIPTS_TX, 2, logicV2Script);
+
+/** The parked UTxO the unknown logic sits at, which a transaction may reference without any account naming it. */
+export const parkedOtherLogicUtxo: UTxO = parkedScriptUtxo(PARKED_SCRIPTS_TX, 3, otherLogicScript);
 
 /** A UTxO at an address paying to a script, which only a transaction running that script can spend. */
 export const scriptUtxo = (txId: string, address: string, lovelace: bigint): UTxO => ({

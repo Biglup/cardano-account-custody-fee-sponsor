@@ -12,13 +12,28 @@ const VALID_MNEMONIC_WORD_COUNTS = [12, 15, 18, 21, 24];
 const SCRIPT_HASH = /^[0-9a-f]{56}$/;
 
 /**
- * The logic script every account the service serves runs unless the
- * operator names more: the contract's first logic version applied to the
- * account proxy's hash. An account's control UTxO names its logic by
- * hash, and the service refuses to pay for or lend collateral to an
- * account whose rules it does not know.
+ * The logic script a new account is created under: the contract's first
+ * logic version applied to the account proxy's hash. An account's
+ * control UTxO names its logic by hash, and the service refuses to pay
+ * for or lend collateral to an account whose rules it does not know.
  */
 export const CURRENT_LOGIC_HASH = '2cd68e398bdf9fbc8d257614b54403451ee722520ec785fe14f8df5a';
+
+/**
+ * The contract's second logic version applied to the account proxy's
+ * hash: the version an account arrives at when its devices sign an
+ * upgrade.
+ */
+export const LOGIC_V2_HASH = '69baa8a8c877247028c56c8130449e186e3658d541536d168f92db3d';
+
+/**
+ * The logic versions the service serves unless the operator names
+ * others: the current one and the one accounts upgrade to. An upgrade
+ * runs both logics, and accounts sit on either side of it for as long as
+ * the upgrade window lasts, so serving one of the two alone would either
+ * refuse every upgrade or strand every account that has already moved.
+ */
+export const DEFAULT_KNOWN_LOGIC_HASHES = [CURRENT_LOGIC_HASH, LOGIC_V2_HASH];
 
 /** The logic hashes a comma separated list names, with surrounding spaces and empty entries dropped. */
 const logicHashesSchema = z
@@ -59,7 +74,7 @@ const envSchema = z.object({
   PROVIDER_BASE_URL: z.preprocess(blankAsUnset, z.string().url('PROVIDER_BASE_URL must be a URL').optional()),
   SPONSOR_MNEMONIC: mnemonicSchema,
   ACCOUNT_SCRIPT_HASH: z.string().regex(SCRIPT_HASH, 'ACCOUNT_SCRIPT_HASH must be a 56 character hex script hash'),
-  KNOWN_LOGIC_HASHES: logicHashesSchema.default([CURRENT_LOGIC_HASH]),
+  KNOWN_LOGIC_HASHES: logicHashesSchema.default(DEFAULT_KNOWN_LOGIC_HASHES),
   ADMIN_API_KEY: z.string().min(1, 'ADMIN_API_KEY is required'),
   PORT: z.coerce.number().int().min(1).max(65_535).default(8787),
   DATABASE_PATH: z.string().min(1).default('./data/sponsor.sqlite'),

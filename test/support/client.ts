@@ -19,9 +19,12 @@ import {
   initialStateUnder,
   logicHash,
   logicScript,
+  logicV2Hash,
+  logicV2Script,
   otherLogicHash,
   otherLogicScript,
   parkedLogicUtxo,
+  parkedLogicV2Utxo,
   parkedOtherLogicUtxo,
   parkedProxyUtxo,
   operateRedeemer,
@@ -185,20 +188,31 @@ export const collateralClientBuilder = (service: TestService, collateral: Collat
 /** A Plutus data value as an inline datum. */
 const inlineDatum = (data: PlutusData): { type: typeof Cometa.DatumType.InlineData; inlineDatum: PlutusData } => ({ type: Cometa.DatumType.InlineData, inlineDatum: data });
 
+/** The logic scripts the fixtures hold, by hash: the blueprint's two versions and the one standing for rules the service has not read. */
+const logicScripts: ReadonlyMap<string, PlutusScript> = new Map([
+  [logicHash, logicScript],
+  [logicV2Hash, logicV2Script],
+  [otherLogicHash, otherLogicScript],
+]);
+
+/** The UTxO each of those logics is parked at. */
+const parkedLogicUtxos: ReadonlyMap<string, UTxO> = new Map([
+  [logicHash, parkedLogicUtxo],
+  [logicV2Hash, parkedLogicV2Utxo],
+  [otherLogicHash, parkedOtherLogicUtxo],
+]);
+
 /** The logic script of a hash the fixtures hold one for. */
 const logicScriptOf = (logic: string): PlutusScript => {
-  if (logic === logicHash) {
-    return logicScript;
+  const script = logicScripts.get(logic);
+  if (script === undefined) {
+    throw new Error(`The fixtures hold no logic script hashing to ${logic}`);
   }
-  if (logic === otherLogicHash) {
-    return otherLogicScript;
-  }
-  throw new Error(`The fixtures hold no logic script hashing to ${logic}`);
+  return script;
 };
 
 /** The parked UTxO the fixtures hold for a logic, when they park one for it. */
-const parkedLogicUtxoOf = (logic: string): UTxO | undefined =>
-  logic === logicHash ? parkedLogicUtxo : logic === otherLogicHash ? parkedOtherLogicUtxo : undefined;
+const parkedLogicUtxoOf = (logic: string): UTxO | undefined => parkedLogicUtxos.get(logic);
 
 /** Attaches the account proxy to the transaction, or references the UTxO it is parked at when the options ask for that. */
 const attachProxy = (builder: TransactionBuilder, options: ClientOptions): TransactionBuilder =>
