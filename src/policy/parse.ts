@@ -100,8 +100,10 @@ export interface ResolvedInput {
 /** What parsing yields: the transaction, or the reason it is not well formed. */
 export type ParseResult = { transaction: ParsedTransaction; violation?: never } | { transaction?: never; violation: Violation };
 
-/** What resolving the inputs yields: every input paired with what it spends, or the reason the chain could not be asked. */
-export type ResolveResult = { inputs: ResolvedInput[]; violation?: never } | { inputs?: never; violation: Violation };
+/** What resolving yields: every input and every reference input paired with the output it names, or the reason the chain could not be asked. */
+export type ResolveResult =
+  | { inputs: ResolvedInput[]; referenceInputs: ResolvedInput[]; violation?: never }
+  | { inputs?: never; referenceInputs?: never; violation: Violation };
 
 /** The scalar shapes of the CIP-116 view: hex strings, 28 byte hashes and integers carried as decimal strings. */
 const hex = z.string().regex(/^[0-9a-f]*$/);
@@ -409,28 +411,30 @@ export const parseTransaction = (cbor: string): ParseResult => {
 };
 
 /**
- * Looks up the outputs the transaction spends through the provider, in
- * one call, so that every input can be classified by the address and
- * value it holds. An input the chain does not know keeps an undefined
- * output; the policy refuses such a transaction at evaluation, since no
- * node could run it. A provider that refuses the whole lookup is not
- * asked again input by input, which would let a client turn one request
- * into as many provider calls as a transaction has inputs; the
- * transaction is refused at evaluation instead.
+ * Looks up the outputs the transaction spends and the ones it references
+ * through the provider, in one call, so that every input can be
+ * classified by the address and value it holds and a referenced control
+ * UTxO can be read for the account it belongs to. An input the chain does
+ * not know keeps an undefined output; the policy refuses such a
+ * transaction at evaluation, since no node could run it. A provider that
+ * refuses the whole lookup is not asked again input by input, which would
+ * let a client turn one request into as many provider calls as a
+ * transaction has inputs; the transaction is refused at evaluation
+ * instead.
  */
-export const resolveInputs = async (provider: Provider, inputs: TxIn[]): Promise<ResolveResult> => {
+export const resolveInputs = async (provider: Provider, inputs: TxIn[], referenceInputs: TxIn[] = []): Promise<ResolveResult> => {
+  const wanted = [...inputs, ...referenceInputs];
   let resolved: UTxO[] = [];
   try {
-    resolved = inputs.length === 0 ? [] : await provider.resolveUnspentOutputs(inputs);
+    resolved = wanted.length === 0 ? [] : await provider.resolveUnspentOutputs(wanted);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'unknown error';
     return { violation: { rule: 'evaluates', detail: `The inputs could not be resolved: ${message}` } };
   }
-  return {
-    inputs: inputs.map((input) => {
-      const ref = inputRef(input);
-      const utxo = resolved.find((candidate) => inputRef(candidate.input) === ref);
-      return { input, ref, output: utxo === undefined ? undefined : toParsedOutput(utxo.output) };
-    }),
+  const resolve = (input: TxIn): ResolvedInput => {
+    const ref = inputRef(input);
+    const utxo = resolved.find((candidate) => inputRef(candidate.input) === ref);
+    return { input, ref, output: utxo === undefined ? undefined : toParsedOutput(utxo.output) };
   };
+  return { inputs: inputs.map(resolve), referenceInputs: referenceInputs.map(resolve) };
 };

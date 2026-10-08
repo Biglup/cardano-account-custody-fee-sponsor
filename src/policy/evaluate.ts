@@ -40,23 +40,28 @@ const sponsorUtxosOf = ({ mode, collateral, sponsor }: PolicyContext): UTxO[] =>
 ];
 
 /**
- * The evaluation rule: every input must be known to the chain, the
- * provider must evaluate the transaction's scripts successfully with the
- * sponsor UTxOs supplied alongside, in case the provider's own view lags
- * behind the pool, and every declared budget must cover what the
- * evaluation found. A transaction that passes can only fail later in
- * phase one, which spends no collateral, so this is what protects the
- * shared collateral UTxO.
+ * The evaluation rule: every input and every reference input must be
+ * known to the chain, the provider must evaluate the transaction's
+ * scripts successfully with the sponsor UTxOs supplied alongside, in case
+ * the provider's own view lags behind the pool, and every declared budget
+ * must cover what the evaluation found. A transaction that passes can
+ * only fail later in phase one, which spends no collateral, so this is
+ * what protects the shared collateral UTxO.
  */
 export const evaluates = async (
   transaction: ParsedTransaction,
   inputs: ResolvedInput[],
+  referenceInputs: ResolvedInput[],
   context: PolicyContext,
   provider: Provider,
 ): Promise<Violation | undefined> => {
   const unknown = inputs.find((input) => input.output === undefined);
   if (unknown !== undefined) {
     return { rule: 'evaluates', detail: `Input ${unknown.ref} is not an unspent output the chain knows` };
+  }
+  const unknownReference = referenceInputs.find((input) => input.output === undefined);
+  if (unknownReference !== undefined) {
+    return { rule: 'evaluates', detail: `Reference input ${unknownReference.ref} is not an unspent output the chain knows` };
   }
   let evaluated: Redeemer[];
   try {

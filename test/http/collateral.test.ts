@@ -6,19 +6,39 @@ import type { CollateralBody, LeaseBody } from '../../src/api.js';
 import { parseTransaction } from '../../src/policy/parse.js';
 import type { RuleName } from '../../src/policy/rules.js';
 import {
+  AGENT_KEY,
   DEVICE_KEY,
   accountAddress,
+  accountRewardAddress,
+  burnGrantsRedeemer,
   controlUtxo,
+  deviceRedeemer,
   enterpriseAddress,
   foreignScript,
   fundUtxo,
+  grantAssetId,
+  grantUtxo,
+  grantedState,
+  operateRedeemer,
+  otherStakeScriptHash,
+  reserveUtxo,
+  scriptCredential,
+  scriptUtxo,
   stakeScript,
   stakeScriptHash,
   strangerAddress,
-  scriptUtxo,
-  unitRedeemer,
+  sweepGrantRedeemer,
 } from '../support/account.js';
-import { buildAccountPaidOperation, buildOwnerOperation, collateralClientBuilder, sponsorUtxo, underDeclaringEvaluator } from '../support/client.js';
+import {
+  AGENT_SPEND_LOVELACE,
+  buildAccountPaidOperation,
+  buildAgentSpend,
+  buildOwnerOperation,
+  buildReservePaidOperation,
+  collateralClientBuilder,
+  sponsorUtxo,
+  underDeclaringEvaluator,
+} from '../support/client.js';
 import { type TestService, createTestService, txHash } from '../support/service.js';
 import { markInvalid, outputWithDatumHash, withCollateralReturn, withTotalCollateral } from '../support/transaction.js';
 
@@ -67,6 +87,21 @@ const placeAccount = (): { control: UTxO; fund: UTxO } => {
   return { control, fund };
 };
 
+/** Puts an account that issued the fixture grant on the fake chain: its control UTxO, the grant UTxO and a fund UTxO. */
+const placeGrantedAccount = (): { control: UTxO; grant: UTxO; fund: UTxO } => {
+  const control = controlUtxo(txHash(300), undefined, grantedState);
+  const grant = grantUtxo(txHash(302));
+  const fund = fundUtxo(txHash(301), 20_000_000n);
+  service.provider.addUtxo(control);
+  service.provider.addUtxo(grant);
+  service.provider.addUtxo(fund);
+  return { control, grant, fund };
+};
+
+/** The reward address of the stake script `hash`, which only that script may draw from. */
+const rewardAddressOf = (hash: string): ReturnType<typeof Cometa.RewardAddress.fromCredentials> =>
+  Cometa.RewardAddress.fromCredentials(Cometa.NetworkId.Testnet, scriptCredential(hash));
+
 /** The number of witnesses issued so far. */
 const witnessCount = (): number => (service.db.prepare('SELECT COUNT(*) AS count FROM witnesses').get() as { count: number }).count;
 
@@ -78,6 +113,14 @@ const witnessAudit = (): { outcome: string; detail: Record<string, unknown> }[] 
 
 /** The hash of the one verification key in a witness set. */
 const keyHashOf = (vkey: string): string => Cometa.uint8ArrayToHex(Cometa.Blake2b.computeHash(Cometa.hexToUint8Array(vkey), 28));
+
+/** Expects a witness set carrying exactly the sponsor payment key's signature, and the transaction to need the sponsor and `signer` alone. */
+const expectSponsorWitness = (witnessSet: string, transaction: string, resolved: UTxO[], signer: string): void => {
+  const decoded = Cometa.readVkeyWitnessSetFromWitnessSetCbor(witnessSet);
+  expect(decoded).toHaveLength(1);
+  expect(keyHashOf(decoded[0]?.vkey ?? '')).toBe(service.serviceWallet.paymentKeyHash);
+  expect(Cometa.getUniqueSigners(transaction, resolved).sort()).toEqual([signer, service.serviceWallet.paymentKeyHash].sort());
+};
 
 /** Expects a refusal naming exactly `rule`, recorded on the audit trail under the collateral mode. */
 const expectViolation = (response: request.Response, rule: RuleName, detail: RegExp): void => {
@@ -157,6 +200,65 @@ describe('POST /v1/collateral/witness', () => {
     ]);
     expect(service.db.prepare('SELECT COUNT(*) AS count FROM leases').get()).toEqual({ count: 0 });
     expect((await request(service.app).get('/health')).body.pool.collateral).toEqual({ shared: true, spare: 0, consumed: 0 });
+  });
+
+  it('witnesses an agent spend that spends the grant UTxO and a fund UTxO and references the control UTxO', async () => {
+    await fundPool();
+    const { control, grant, fund } = placeGrantedAccount();
+    const shared = await collateral();
+    const transaction = await buildAgentSpend(service, shared, { control, grant, fund });
+    const parsed = parseTransaction(transaction).transaction;
+    expect(parsed?.inputs).toEqual(expect.arrayContaining([grant.input, fund.input]));
+    expect(parsed?.inputs).toHaveLength(2);
+    expect(parsed?.referenceInputs).toEqual([control.input]);
+    expect(parsed?.outputs.find((output) => output.assets[grantAssetId] === 1n)?.address).toBe(accountAddress);
+    expect(parsed?.outputs.find((output) => output.address === strangerAddress)?.lovelace).toBe(AGENT_SPEND_LOVELACE);
+
+    const response = await witness(transaction);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ txHash: parsed?.hash, witnessSet: expect.stringMatching(/^[0-9a-f]+$/) });
+    expectSponsorWitness(response.body.witnessSet, transaction, [grant, fund, sponsorUtxo(shared)], AGENT_KEY);
+    expect(witnessAudit()).toEqual([
+      { outcome: 'issued', detail: { mode: 'collateral', txHash: parsed?.hash, kind: 'operation', sponsoredLovelace: 0, fee: parsed?.fee.toString() } },
+    ]);
+  });
+
+  it('witnesses an owner operation paid from a reserve, recreated with the fee taken out', async () => {
+    await fundPool();
+    const { control } = placeAccount();
+    const reserve = reserveUtxo(txHash(303), 20_000_000n);
+    service.provider.addUtxo(reserve);
+    const shared = await collateral();
+    const transaction = await buildReservePaidOperation(service, shared, control, reserve);
+    const parsed = parseTransaction(transaction).transaction;
+    expect(parsed?.inputs).toEqual(expect.arrayContaining([control.input, reserve.input]));
+    expect(parsed?.inputs).toHaveLength(2);
+    expect(parsed?.outputs.every((output) => output.address === accountAddress)).toBe(true);
+    const recreated = parsed?.outputs.find((output) => output.hasDatum && Object.keys(output.assets).length === 0);
+    expect(recreated?.lovelace).toBe(reserve.output.value.coins - (parsed?.fee ?? 0n));
+
+    const response = await witness(transaction);
+
+    expect(response.status).toBe(200);
+    expectSponsorWitness(response.body.witnessSet, transaction, [control, reserve, sponsorUtxo(shared)], DEVICE_KEY);
+    expect(witnessAudit().at(-1)).toMatchObject({ outcome: 'issued', detail: { kind: 'operation', sponsoredLovelace: 0 } });
+  });
+
+  it('witnesses a sweep that spends the control UTxO and a dead grant UTxO and burns the grant token', async () => {
+    await fundPool();
+    const { control, grant, fund } = placeGrantedAccount();
+    const shared = await collateral();
+    const transaction = await buildAccountPaidOperation(service, shared, control, fund, {
+      customise: (builder) => builder.addInput({ utxo: grant, redeemer: sweepGrantRedeemer }).mintToken({ assetIdHex: grantAssetId, amount: -1n, redeemer: burnGrantsRedeemer }),
+    });
+    const parsed = parseTransaction(transaction).transaction;
+    expect(parsed?.mint).toEqual({ [grantAssetId]: -1n });
+
+    const response = await witness(transaction);
+
+    expect(response.status).toBe(200);
+    expectSponsorWitness(response.body.witnessSet, transaction, [control, grant, fund, sponsorUtxo(shared)], DEVICE_KEY);
   });
 
   it('answers the same witness set again for the same transaction, counting once, and to both of two concurrent requests', async () => {
@@ -320,11 +422,47 @@ describe('collateral mode policy', () => {
     const locked = scriptUtxo(txHash(400), stakeScriptAddress, 10_000_000n);
     service.provider.addUtxo(locked);
     const builder = collateralClientBuilder(service, shared, { changeAddress: strangerAddress });
-    builder.addInput({ utxo: locked, redeemer: unitRedeemer });
+    builder.addInput({ utxo: locked, redeemer: deviceRedeemer });
     builder.sendLovelace({ address: strangerAddress, amount: 5_000_000n });
     builder.addSigner(DEVICE_KEY).addScript(stakeScript);
 
-    expectViolation(await witness(await builder.build()), 'account_transaction', /No input is an account control UTxO and nothing is minted/);
+    expectViolation(await witness(await builder.build()), 'account_transaction', /No input is an account control or grant UTxO and nothing is minted/);
+  });
+
+  it('account_transaction: refuses an agent spend whose control UTxO is neither spent nor referenced', async () => {
+    await fundPool();
+    const { grant, fund } = placeGrantedAccount();
+    const shared = await collateral();
+
+    const transaction = await buildAgentSpend(service, shared, { grant, fund });
+
+    expectViolation(
+      await witness(transaction),
+      'account_transaction',
+      new RegExp(`Input ${txHash(302)}#0 is a grant UTxO of account ${stakeScriptHash}, whose control UTxO is neither spent nor referenced`),
+    );
+    expect(witnessCount()).toBe(0);
+  });
+
+  it('no_foreign_scripts: takes the stake script of the account whose control UTxO is referenced, and no other', async () => {
+    await fundPool();
+    const { control, grant, fund } = placeGrantedAccount();
+    const shared = await collateral();
+
+    const own = await buildAgentSpend(service, shared, { control, grant, fund }, {
+      customise: (builder) => builder.withdrawRewards({ rewardAddress: accountRewardAddress, amount: 0n, redeemer: operateRedeemer }).addScript(stakeScript),
+    });
+    expect((await witness(own)).status).toBe(200);
+
+    const other = await buildAgentSpend(service, shared, { control, grant, fund }, {
+      customise: (builder) => builder.withdrawRewards({ rewardAddress: rewardAddressOf(otherStakeScriptHash), amount: 0n, redeemer: operateRedeemer }).addScript(stakeScript),
+    });
+    expectViolation(
+      await witness(other),
+      'no_foreign_scripts',
+      new RegExp(`A withdrawal draws from script ${otherStakeScriptHash}, which is neither the account script nor its stake script`),
+    );
+    expect(witnessCount()).toBe(1);
   });
 
   it('sponsor_outflow_zero: refuses an output to the sponsor, at its address or at its payment key alone', async () => {
@@ -355,7 +493,7 @@ describe('collateral mode policy', () => {
     const locked = scriptUtxo(txHash(400), Cometa.EnterpriseAddress.fromCredentials(Cometa.NetworkId.Testnet, { hash: Cometa.computeScriptHash(foreignScript), type: Cometa.CredentialType.ScriptHash }).toAddress().toString(), 10_000_000n);
     service.provider.addUtxo(locked);
     const foreign = await buildAccountPaidOperation(service, shared, control, fund, {
-      customise: (builder) => builder.addInput({ utxo: locked, redeemer: unitRedeemer }).addScript(foreignScript).sendLovelace({ address: strangerAddress, amount: 10_000_000n }),
+      customise: (builder) => builder.addInput({ utxo: locked, redeemer: deviceRedeemer }).addScript(foreignScript).sendLovelace({ address: strangerAddress, amount: 10_000_000n }),
     });
     expectViolation(await witness(foreign), 'no_foreign_scripts', new RegExp(`Input ${txHash(400)}#0 is locked by script`));
 

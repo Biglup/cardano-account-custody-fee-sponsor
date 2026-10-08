@@ -7,7 +7,7 @@ const VALID_MNEMONIC = 'alpha bravo charlie delta echo foxtrot golf hotel india 
 const validEnv = (): Record<string, string> => ({
   BLOCKFROST_PREPROD_PROJECT_ID: 'preprodTestProjectId',
   SPONSOR_MNEMONIC: VALID_MNEMONIC,
-  ACCOUNT_SCRIPT_HASH: '0524f57b785cf3a45b7ed6029b387dc39ffb2411bd1cb4300c58c2c3',
+  ACCOUNT_SCRIPT_HASH: '6f275cca0cc4433e6a798d78a2db2934df60dc4fd989274a2d9bb434',
   ADMIN_API_KEY: 'test-admin-key',
 });
 
@@ -18,7 +18,7 @@ describe('loadConfig', () => {
     expect(config.network).toBe('preprod');
     expect(config.blockfrostProjectId).toBe('preprodTestProjectId');
     expect(config.sponsorMnemonic).toEqual(VALID_MNEMONIC.split(' '));
-    expect(config.accountScriptHash).toBe('0524f57b785cf3a45b7ed6029b387dc39ffb2411bd1cb4300c58c2c3');
+    expect(config.accountScriptHash).toBe('6f275cca0cc4433e6a798d78a2db2934df60dc4fd989274a2d9bb434');
     expect(config.adminApiKey).toBe('test-admin-key');
     expect(config.port).toBe(8787);
     expect(config.databasePath).toBe('./data/sponsor.sqlite');

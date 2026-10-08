@@ -1,19 +1,31 @@
-import type { CoinSelector, TransactionBuilder, TxEvaluator, UTxO } from '@biglup/cometa';
+import type { CoinSelector, PlutusData, TransactionBuilder, TxEvaluator, UTxO } from '@biglup/cometa';
 import { Cometa } from '../../src/cometa.js';
 import type { CollateralBody, LeaseBody, SponsorUtxoBody } from '../../src/api.js';
 import {
+  AGENT_KEY,
+  CONTROL_LOVELACE,
+  DEVICE_KEY,
+  type Grant,
   accountAddress,
   accountRewardAddress,
   accountScript,
+  createAccountRedeemer,
+  deviceRedeemer,
+  encodeGrant,
+  fixtureGrant,
+  fundRedeemer,
+  grantAfterSpend,
   initialStateOf,
+  operateRedeemer,
+  reserveDatum,
+  spendWithGrantRedeemer,
   stakeScript,
   stateNftAssetId,
-  unitRedeemer,
-  DEVICE_KEY,
-  CONTROL_LOVELACE,
+  strangerAddress,
 } from './account.js';
 import { PROTOCOL_PARAMETERS, fakeExecutionUnits } from './fake.js';
 import type { TestService } from './service.js';
+import { transactionParts } from './transaction.js';
 
 /** A step a test applies to a builder before it builds, to bend an otherwise valid transaction. */
 export type Customise = (builder: TransactionBuilder) => void;
@@ -44,8 +56,36 @@ export interface CollateralOptions extends ClientOptions {
   changeAddress?: string;
 }
 
+/**
+ * How a client shapes an agent spend beyond the fixtures' defaults: the
+ * lovelace paid away and to whom, the grant the grant UTxO carries, and
+ * the key that signs as the grantee.
+ */
+export interface AgentSpendOptions extends ClientOptions {
+  lovelace?: bigint;
+  recipient?: string;
+  grant?: Grant;
+  grantee?: string;
+}
+
+/** The UTxOs an agent spend builds on: the control UTxO it references, when it references one, the grant UTxO it spends and the fund UTxO that pays. */
+export interface AgentSpendUtxos {
+  control?: UTxO;
+  grant: UTxO;
+  fund: UTxO;
+}
+
 /** How far before the end of the collateral validity window a client in collateral mode sets its validity upper bound. */
 export const COLLATERAL_BOUND_MARGIN_MS = 60_000;
+
+/** The lovelace an agent spend pays away unless a test says otherwise. */
+export const AGENT_SPEND_LOVELACE = 3_000_000n;
+
+/** The lovelace a reserve output keeps at least, above the minimum UTxO value of a datum carrying output. */
+const RESERVE_FLOOR = 2_000_000n;
+
+/** The most times a reserve paid operation is built while its fee settles. */
+const MAX_BALANCING_ROUNDS = 4;
 
 /** The UTxO a sponsor UTxO of the API response resolves to. */
 export const sponsorUtxo = (utxo: SponsorUtxoBody): UTxO => ({
@@ -114,11 +154,8 @@ export const collateralClientBuilder = (service: TestService, collateral: Collat
   return withValidity(builder, options, new Date(service.clock.now.getTime() + collateral.validitySeconds * 1000 - COLLATERAL_BOUND_MARGIN_MS));
 };
 
-/** The inline datum of a control output carrying the initial state of an account owned by `device`. */
-const stateDatum = (device: string): { type: typeof Cometa.DatumType.InlineData; inlineDatum: ReturnType<typeof initialStateOf> } => ({
-  type: Cometa.DatumType.InlineData,
-  inlineDatum: initialStateOf(device),
-});
+/** A Plutus data value as an inline datum. */
+const inlineDatum = (data: PlutusData): { type: typeof Cometa.DatumType.InlineData; inlineDatum: PlutusData } => ({ type: Cometa.DatumType.InlineData, inlineDatum: data });
 
 /**
  * Shapes a builder into an account creation, as the contract's builder
@@ -129,12 +166,12 @@ const stateDatum = (device: string): { type: typeof Cometa.DatumType.InlineData;
  */
 export const shapeCreation = (builder: TransactionBuilder, options: CreationOptions = {}): TransactionBuilder => {
   const device = options.device ?? DEVICE_KEY;
-  builder.registerStakeAddress({ rewardAddress: accountRewardAddress, redeemer: unitRedeemer });
-  builder.mintToken({ assetIdHex: stateNftAssetId, amount: 1n, redeemer: unitRedeemer });
+  builder.registerStakeAddress({ rewardAddress: accountRewardAddress, redeemer: operateRedeemer });
+  builder.mintToken({ assetIdHex: stateNftAssetId, amount: 1n, redeemer: createAccountRedeemer });
   builder.lockValue({
     scriptAddress: options.controlAddress ?? accountAddress,
     value: { coins: options.controlLovelace ?? CONTROL_LOVELACE, assets: { [stateNftAssetId]: 1n } },
-    datum: stateDatum(device),
+    datum: inlineDatum(initialStateOf(device)),
   });
   builder.addSigner(device).addScript(accountScript).addScript(stakeScript);
   options.customise?.(builder);
@@ -147,12 +184,12 @@ export const buildCreation = (service: TestService, lease: LeaseBody, options: C
 
 /**
  * Shapes a builder into an owner operation: the control UTxO is spent
- * with the device redeemer and recreated unchanged, the device signs,
- * and whatever the builder spends pays the fee.
+ * with the device redeemer and recreated with its own state, the device
+ * signs, and whatever the builder spends pays the fee.
  */
 export const shapeOwnerOperation = (builder: TransactionBuilder, control: UTxO, device: string = DEVICE_KEY): TransactionBuilder => {
-  builder.addInput({ utxo: control, redeemer: unitRedeemer });
-  builder.lockValue({ scriptAddress: accountAddress, value: control.output.value, datum: stateDatum(device) });
+  builder.addInput({ utxo: control, redeemer: deviceRedeemer });
+  builder.lockValue({ scriptAddress: accountAddress, value: control.output.value, datum: inlineDatum(control.output.datum ?? initialStateOf(device)) });
   return builder.addSigner(device).addScript(accountScript);
 };
 
@@ -181,7 +218,74 @@ export const buildAccountPaidOperation = async (
   options: CollateralOptions = {},
 ): Promise<string> => {
   const builder = shapeOwnerOperation(collateralClientBuilder(service, collateral, options), control, options.device);
-  builder.addInput({ utxo: fund, redeemer: unitRedeemer });
+  builder.addInput({ utxo: fund, redeemer: fundRedeemer });
+  options.customise?.(builder);
+  return builder.build();
+};
+
+/**
+ * Builds an owner operation paid from a reserve, as the contract's
+ * builder does without a sponsor: the reserve is spent alongside the
+ * control UTxO and recreated under its datum with exactly the fee taken
+ * out, so that no fund UTxO an agent may be spending is touched and
+ * nothing but the reserve changes. The fee is only known once the
+ * transaction is built, so the transaction is built again with the fee
+ * fixed until it settles, as the contract's builder does.
+ */
+export const buildReservePaidOperation = async (
+  service: TestService,
+  collateral: CollateralBody,
+  control: UTxO,
+  reserve: UTxO,
+  options: CollateralOptions = {},
+): Promise<string> => {
+  let reserveCoins = RESERVE_FLOOR;
+  let assumedFee: bigint | undefined;
+  for (let round = 0; round < MAX_BALANCING_ROUNDS; round += 1) {
+    const builder = shapeOwnerOperation(collateralClientBuilder(service, collateral, options), control, options.device);
+    if (assumedFee !== undefined) {
+      builder.setMinimumFee(assumedFee);
+    }
+    builder.addInput({ utxo: reserve, redeemer: fundRedeemer });
+    builder.lockValue({ scriptAddress: accountAddress, value: { coins: reserveCoins }, datum: inlineDatum(reserve.output.datum ?? reserveDatum) });
+    options.customise?.(builder);
+    const tx = await builder.build();
+    const fee = transactionParts(tx).fee;
+    if (fee === assumedFee) {
+      return tx;
+    }
+    assumedFee = fee;
+    reserveCoins = reserve.output.value.coins - fee;
+  }
+  throw new Error('The reserve paid operation did not settle on a fee');
+};
+
+/**
+ * Builds an agent spend paid from the account, as the contract's builder
+ * does with a collateral wallet: the grant UTxO is spent with the grant
+ * redeemer and recreated with the same value and the grant's remaining
+ * cap reduced by the payout and the fee bound, a fund UTxO is spent with
+ * the fund redeemer and pays the fee and the payout with the change back
+ * to the account, the control UTxO is referenced and never spent, the
+ * grantee signs, and the sponsor contributes the shared collateral only.
+ */
+export const buildAgentSpend = async (
+  service: TestService,
+  collateral: CollateralBody,
+  { control, grant, fund }: AgentSpendUtxos,
+  options: AgentSpendOptions = {},
+): Promise<string> => {
+  const lovelace = options.lovelace ?? AGENT_SPEND_LOVELACE;
+  const spent = options.grant ?? fixtureGrant;
+  const builder = collateralClientBuilder(service, collateral, options);
+  if (control !== undefined) {
+    builder.addReferenceInput(control);
+  }
+  builder.addInput({ utxo: grant, redeemer: spendWithGrantRedeemer });
+  builder.addInput({ utxo: fund, redeemer: fundRedeemer });
+  builder.lockValue({ scriptAddress: accountAddress, value: grant.output.value, datum: inlineDatum(encodeGrant(grantAfterSpend(spent, lovelace))) });
+  builder.sendLovelace({ address: options.recipient ?? strangerAddress, amount: lovelace });
+  builder.addSigner(options.grantee ?? AGENT_KEY).addScript(accountScript);
   options.customise?.(builder);
   return builder.build();
 };

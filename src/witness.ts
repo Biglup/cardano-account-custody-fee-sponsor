@@ -229,16 +229,17 @@ export const createWitnessService = ({
   };
 
   /**
-   * Resolves the inputs, applies the policy under the mode and signs,
-   * checking that the signature is the sponsor payment key's alone;
-   * answers the first violation found instead when there is one.
+   * Resolves the inputs and the reference inputs, applies the policy
+   * under the mode and signs, checking that the signature is the sponsor
+   * payment key's alone; answers the first violation found instead when
+   * there is one.
    */
   const sign = async (tx: ParsedTransaction, mode: PolicyMode, shared: PoolUtxo): Promise<Signed | Violation> => {
-    const resolved = await resolveInputs(provider, tx.inputs);
+    const resolved = await resolveInputs(provider, tx.inputs, tx.referenceInputs);
     if (resolved.violation !== undefined) {
       return resolved.violation;
     }
-    const verdict = await applyPolicy(tx, resolved.inputs, policyContext(mode, shared), provider);
+    const verdict = await applyPolicy(tx, resolved.inputs, resolved.referenceInputs, policyContext(mode, shared), provider);
     if (verdict.violation !== undefined) {
       return verdict.violation;
     }

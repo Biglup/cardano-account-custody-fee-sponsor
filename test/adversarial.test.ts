@@ -7,20 +7,41 @@ import type { RuleName } from '../src/policy/rules.js';
 import {
   CONTROL_LOVELACE,
   DEVICE_KEY,
+  GRANT_LOVELACE,
+  GRANT_SLOT,
   accountAddress,
   accountScript,
   accountScriptHash,
   controlUtxo,
+  createAccountRedeemer,
+  deviceRedeemer,
+  encodeGrant,
+  fixtureGrant,
   foreignScript,
   foreignScriptHash,
   fundUtxo,
+  grantAssetId,
+  grantTokenName,
+  grantUtxo,
+  grantedState,
   initialState,
+  operateRedeemer,
+  otherControlUtxo,
+  otherStakeScriptHash,
+  scriptCredential,
   stakeScriptHash,
   stateNftAssetId,
   strangerAddress,
-  unitRedeemer,
 } from './support/account.js';
-import { buildAccountPaidOperation, buildCreation, buildOwnerOperation, clientBuilder, sponsorUtxo, underDeclaringEvaluator } from './support/client.js';
+import {
+  buildAccountPaidOperation,
+  buildAgentSpend,
+  buildCreation,
+  buildOwnerOperation,
+  clientBuilder,
+  sponsorUtxo,
+  underDeclaringEvaluator,
+} from './support/client.js';
 import { type TestService, createTestService, txHash } from './support/service.js';
 import { withTotalCollateral, withValidityUpperBound } from './support/transaction.js';
 
@@ -111,9 +132,6 @@ const buildCreations = async (key: string, count: number): Promise<{ taken: Leas
 /** The inline datum of a control output carrying the initial state. */
 const stateDatum = { type: Cometa.DatumType.InlineData, inlineDatum: initialState } as const;
 
-/** A script credential. */
-const scriptCredential = (hash: string): { hash: string; type: typeof Cometa.CredentialType.ScriptHash } => ({ hash, type: Cometa.CredentialType.ScriptHash });
-
 /**
  * An account creation whose stake credential is the foreign script, as an
  * account the service has never seen the stake script of looks: the
@@ -126,8 +144,8 @@ const buildForeignStakeCreation = async (taken: LeaseBody, policy: string): Prom
     .toAddress()
     .toString();
   const builder = clientBuilder(service, taken);
-  builder.registerStakeAddress({ rewardAddress: Cometa.RewardAddress.fromCredentials(Cometa.NetworkId.Testnet, scriptCredential(foreignScriptHash)), redeemer: unitRedeemer });
-  builder.mintToken({ assetIdHex: assetId, amount: 1n, redeemer: unitRedeemer });
+  builder.registerStakeAddress({ rewardAddress: Cometa.RewardAddress.fromCredentials(Cometa.NetworkId.Testnet, scriptCredential(foreignScriptHash)), redeemer: operateRedeemer });
+  builder.mintToken({ assetIdHex: assetId, amount: 1n, redeemer: createAccountRedeemer });
   builder.lockValue({ scriptAddress: address, value: { coins: CONTROL_LOVELACE, assets: { [assetId]: 1n } }, datum: stateDatum });
   builder.addSigner(DEVICE_KEY).addScript(accountScript).addScript(foreignScript);
   return builder.build();
@@ -217,8 +235,8 @@ describe('a client trying to drain the sponsor', () => {
     const taken = await lease();
     const lookalike = `${foreignScriptHash}${stakeScriptHash}`;
     const builder = clientBuilder(service, taken);
-    builder.addInput({ utxo: control, redeemer: unitRedeemer });
-    builder.mintToken({ assetIdHex: lookalike, amount: 1n, redeemer: unitRedeemer });
+    builder.addInput({ utxo: control, redeemer: deviceRedeemer });
+    builder.mintToken({ assetIdHex: lookalike, amount: 1n, redeemer: createAccountRedeemer });
     builder.lockValue({ scriptAddress: accountAddress, value: { coins: CONTROL_LOVELACE, assets: { [stateNftAssetId]: 1n, [lookalike]: 1n } }, datum: stateDatum });
     builder.addSigner(DEVICE_KEY).addScript(accountScript).addScript(foreignScript);
 
@@ -241,6 +259,76 @@ describe('a client trying to drain the sponsor', () => {
     expectViolation(await witness(taken.leaseId, transaction), 'signers', /sponsor payment key is among the required signers/);
   });
 
+  it('cannot reference the control UTxO of another account in an agent spend', async () => {
+    await fundPool();
+    const control = controlUtxo(txHash(300), undefined, grantedState);
+    const grant = grantUtxo(txHash(302));
+    const fund = fundUtxo(txHash(301), 20_000_000n);
+    const other = otherControlUtxo(txHash(304));
+    for (const utxo of [control, grant, fund, other]) {
+      service.provider.addUtxo(utxo);
+    }
+    const shared = await collateral();
+
+    const transaction = await buildAgentSpend(service, shared, { control: other, grant, fund });
+
+    expectViolation(
+      await collateralWitness(transaction),
+      'account_transaction',
+      new RegExp(`Reference input ${txHash(304)}#0 is the control UTxO of account ${otherStakeScriptHash}, which no input operates`),
+    );
+    expect(witnessCount()).toBe(0);
+  });
+
+  it('cannot pass a sponsor UTxO off as a grant UTxO, in either mode', async () => {
+    await fundPool();
+    const control = controlUtxo(txHash(300), undefined, grantedState);
+    const fund = fundUtxo(txHash(301), 20_000_000n);
+    service.provider.addUtxo(control);
+    service.provider.addUtxo(fund);
+    const shared = await collateral();
+    const disguised: UTxO = {
+      input: { txId: txHash(305), index: 0 },
+      output: { address: shared.sponsorAddress, value: { coins: GRANT_LOVELACE, assets: { [grantAssetId]: 1n } }, datum: encodeGrant(fixtureGrant) },
+    };
+    service.provider.addUtxo(disguised);
+
+    const onCollateral = await buildAgentSpend(service, shared, { control, grant: disguised, fund });
+    expectViolation(await collateralWitness(onCollateral), 'no_sponsor_inputs', new RegExp(`Input ${txHash(305)}#0 belongs to the sponsor, which contributes collateral only`));
+
+    const taken = await lease();
+    const onLease = await buildOwnerOperation(service, taken, control, {
+      customise: (builder) => builder.addInput({ utxo: sponsorUtxo(taken.fee) }).addInput({ utxo: disguised }),
+    });
+    expectViolation(await witness(taken.leaseId, onLease), 'uses_leased_fee_input', new RegExp(`Input ${txHash(305)}#0 belongs to the sponsor but is not the leased fee UTxO`));
+    expect(witnessCount()).toBe(0);
+  });
+
+  it('cannot pass a UTxO holding a grant shaped token of a foreign policy off as a grant UTxO', async () => {
+    await fundPool();
+    const control = controlUtxo(txHash(300), undefined, grantedState);
+    const fund = fundUtxo(txHash(301), 20_000_000n);
+    const lookalike: UTxO = {
+      input: { txId: txHash(306), index: 0 },
+      output: { address: accountAddress, value: { coins: GRANT_LOVELACE, assets: { [`${foreignScriptHash}${grantTokenName(stakeScriptHash, GRANT_SLOT)}`]: 1n } }, datum: encodeGrant(fixtureGrant) },
+    };
+    for (const utxo of [control, fund, lookalike]) {
+      service.provider.addUtxo(utxo);
+    }
+    const shared = await collateral();
+
+    const referencing = await buildAgentSpend(service, shared, { control, grant: lookalike, fund });
+    expectViolation(
+      await collateralWitness(referencing),
+      'account_transaction',
+      new RegExp(`Reference input ${txHash(300)}#0 is the control UTxO of account ${stakeScriptHash}, which no input operates`),
+    );
+
+    const alone = await buildAgentSpend(service, shared, { grant: lookalike, fund });
+    expectViolation(await collateralWitness(alone), 'account_transaction', /No input is an account control or grant UTxO and nothing is minted under the account policy/);
+    expect(witnessCount()).toBe(0);
+  });
+
   it('is sponsored for an account whose stake script the service has never seen, when the state NFT is minted under the account policy', async () => {
     await fundPool(2, 1);
     const taken = await lease();
@@ -254,7 +342,7 @@ describe('a client trying to drain the sponsor', () => {
     expectViolation(
       await witness(other.leaseId, await buildForeignStakeCreation(other, foreignScriptHash)),
       'account_transaction',
-      /No input is an account control UTxO and nothing is minted under the account policy/,
+      /No input is an account control or grant UTxO and nothing is minted under the account policy/,
     );
   });
 });

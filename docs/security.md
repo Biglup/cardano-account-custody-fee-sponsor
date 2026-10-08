@@ -48,7 +48,15 @@ sponsor's value from going anywhere but the fee and the account:
 - `account_transaction` and `no_foreign_scripts` make sure the only
   scripts that run are the account contract and the account's own stake
   script; a lookalike policy, a foreign script input or a foreign
-  certificate is refused.
+  certificate is refused. The account a transaction operates is read
+  from the control or grant UTxOs it spends, which hold a token of the
+  account policy at the address the token is named after, and its stake
+  script from the control UTxO it spends or, as an agent spend does,
+  references. A grant UTxO spent without its account's control UTxO, a
+  referenced control UTxO of an account no input operates, a token of
+  the account policy held at the sponsor address, which the sponsor
+  input rules refuse first, and a grant shaped token under any other
+  policy are all refused.
 - `sponsor_outflow_bounded` ties what the fee UTxO is drawn down by to the
   fee, plus the registration deposit and the control output at creation,
   capped by `MAX_FEE_LOVELACE` and `MAX_SPONSORED_LOVELACE`; nothing is
@@ -67,8 +75,9 @@ sponsor's value from going anywhere but the fee and the account:
 ### Spending the collateral
 
 Collateral is taken by the ledger only when a transaction fails phase two.
-The `evaluates` rule has the provider resolve every input and evaluate
-the transaction with the sponsor UTxOs it builds on supplied, and refuses
+The `evaluates` rule has the provider resolve every input and reference
+input and evaluate the transaction with the sponsor UTxOs it builds on
+supplied, and refuses
 a redeemer that declares less budget than the evaluation found it needs,
 so a witnessed transaction can only fail in phase one, which spends no
 collateral. A transaction flagged as failing is refused outright. This is
@@ -155,8 +164,9 @@ before the body is read, so guessing keys or flooding costs the caller
 its own address first. Every client route also counts against the key's
 `KEY_RATE_LIMIT_PER_MINUTE`. Both answer 429 `rate_limited`. Request
 bodies are capped at 64 KiB and transactions at 16 KiB, the protocol's
-own limit, before anything decodes them. The inputs of a transaction are
-resolved in one provider call, never one per input.
+own limit, before anything decodes them. The inputs and the reference
+inputs of a transaction are resolved in one provider call, never one per
+input.
 
 ### Reading secrets out of the service
 

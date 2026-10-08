@@ -22,7 +22,7 @@ export const silentLogger = pino({ level: 'silent' });
 export const testEnv = (overrides: Record<string, string> = {}): Record<string, string> => ({
   BLOCKFROST_PREPROD_PROJECT_ID: 'preprodTestProjectId',
   SPONSOR_MNEMONIC: TEST_MNEMONIC,
-  ACCOUNT_SCRIPT_HASH: '0524f57b785cf3a45b7ed6029b387dc39ffb2411bd1cb4300c58c2c3',
+  ACCOUNT_SCRIPT_HASH: '6f275cca0cc4433e6a798d78a2db2934df60dc4fd989274a2d9bb434',
   ADMIN_API_KEY: TEST_ADMIN_KEY,
   DATABASE_PATH: ':memory:',
   ...overrides,

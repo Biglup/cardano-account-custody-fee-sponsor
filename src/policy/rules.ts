@@ -98,13 +98,27 @@ interface Creation {
   controlOutput: ParsedOutput;
 }
 
+/**
+ * An input or reference input that holds a token of an account: the
+ * control UTxO under the state NFT, named after the account's stake
+ * script hash, or a grant UTxO under a grant token, named after that hash
+ * and a slot. The account is the hash the token name starts with.
+ */
+interface AccountTokenInput {
+  input: ResolvedInput;
+  account: string;
+  kind: 'control' | 'grant';
+}
+
 /** The transaction classified against the sponsor and the account contract, which every rule after the first reads. */
 interface Analysis {
   transaction: ParsedTransaction;
   inputs: ResolvedInput[];
+  referenceInputs: ResolvedInput[];
   sponsorInputs: ResolvedInput[];
   otherInputs: ResolvedInput[];
-  controlInputs: ResolvedInput[];
+  accountTokenInputs: AccountTokenInput[];
+  referencedControls: AccountTokenInput[];
   sponsorOutputs: ParsedOutput[];
   accountOutputs: ParsedOutput[];
   foreignOutputs: ParsedOutput[];
@@ -121,6 +135,12 @@ type Rule = (analysis: Analysis, context: PolicyContext) => Violation | undefine
 
 /** The key lovelace takes in a balance, next to asset ids. */
 const LOVELACE = 'lovelace';
+
+/** The hex length of a state NFT name: the 28 byte stake script hash of its account. */
+const STATE_NFT_NAME_LENGTH = 56;
+
+/** The hex length of a grant token name: the stake script hash followed by the grant's slot as four bytes. */
+const GRANT_TOKEN_NAME_LENGTH = 64;
 
 /** The quantity of every asset, lovelace included, a list of outputs holds in total. */
 const balanceOf = (outputs: ParsedOutput[]): AssetAmounts => {
@@ -150,10 +170,33 @@ const isKey = (credential: Credential | undefined): credential is Credential =>
 const isAccountOutput = (output: ParsedOutput, context: PolicyContext): boolean =>
   isScript(output.paymentCredential) && output.paymentCredential.hash === context.accountScriptHash;
 
-/** Whether an output is an account's control UTxO: at an account address and holding a token of the account policy. */
-const isControlOutput = (output: ParsedOutput, context: PolicyContext): boolean =>
-  isAccountOutput(output, context) &&
-  Object.entries(output.assets).some(([assetId, quantity]) => assetId.startsWith(context.accountScriptHash) && quantity > 0n);
+/** The kind of account token a token name under the account policy denotes, by its length, or undefined for a name of neither shape. */
+const tokenKindOf = (name: string): AccountTokenInput['kind'] | undefined =>
+  name.length === STATE_NFT_NAME_LENGTH ? 'control' : name.length === GRANT_TOKEN_NAME_LENGTH ? 'grant' : undefined;
+
+/**
+ * The account token an input holds, when it is a control or a grant UTxO
+ * of an account: the output sits at an account address whose stake part
+ * is a script, and holds a token under the account policy named after
+ * that very script, alone or followed by a slot. The validator mints a
+ * token only into such an output, so an output shaped otherwise belongs
+ * to no account and is never read as one. The control token wins when an
+ * output holds both kinds.
+ */
+const accountTokenOf = (input: ResolvedInput, context: PolicyContext): AccountTokenInput | undefined => {
+  const output = input.output;
+  if (output === undefined || !isAccountOutput(output, context) || !isScript(output.stakeCredential)) {
+    return undefined;
+  }
+  const account = output.stakeCredential.hash;
+  const kinds = Object.entries(output.assets).flatMap(([assetId, quantity]) => {
+    const name = assetId.slice(context.accountScriptHash.length);
+    const kind = tokenKindOf(name);
+    return assetId.startsWith(context.accountScriptHash) && quantity > 0n && kind !== undefined && name.startsWith(account) ? [kind] : [];
+  });
+  const kind = kinds.includes('control') ? 'control' : kinds[0];
+  return kind === undefined ? undefined : { input, account, kind };
+};
 
 /** Whether a credential is the key the sponsor pays with or stakes with, whatever the view calls it. */
 const namesSponsorKey = (credential: Credential, sponsor: PolicyContext['sponsor']): boolean =>
@@ -171,37 +214,45 @@ const isSponsorInput = (input: ResolvedInput, context: PolicyContext): boolean =
 
 /**
  * The stake scripts of the accounts this transaction belongs to: those of
- * the control UTxOs it spends, or the one it registers at creation. They
- * are never read off outputs, which anyone can shape at will.
+ * the control UTxOs it spends or references, which are the names of their
+ * state NFTs, or the one it registers at creation. They are never read
+ * off outputs, which anyone can shape at will, nor off a grant UTxO
+ * alone: an agent spend references the control UTxO of its account, and
+ * that is what names the stake script.
  */
-const stakeScriptHashesOf = (controlInputs: ResolvedInput[], creation: Creation | undefined): Set<string> => {
-  const hashes = new Set<string>();
-  for (const output of outputsOf(controlInputs)) {
-    if (isScript(output.stakeCredential)) {
-      hashes.add(output.stakeCredential.hash);
-    }
-  }
+const stakeScriptHashesOf = (controls: AccountTokenInput[], creation: Creation | undefined): Set<string> => {
+  const hashes = new Set(controls.map((control) => control.account));
   if (creation !== undefined && isScript(creation.registration.credential)) {
     hashes.add(creation.registration.credential.hash);
   }
   return hashes;
 };
 
+/** What the transaction was read as: an operation, a creation with its parts, or neither, with the reason. */
+type AccountReading =
+  | { kind: 'operation'; creation?: never; reason?: never }
+  | { kind: 'creation'; creation: Creation; reason?: never }
+  | { kind: undefined; creation?: never; reason: string };
+
 /**
  * Reads an account creation out of the transaction, or the reason it is
- * not one: exactly one token minted under the account policy, exactly
- * one registration of a script stake credential with an explicit
- * deposit, the token named after that credential and sitting in exactly
- * one output at an account address staked to that same credential.
+ * not one: exactly one token minted under the account policy, named with
+ * the 28 bytes of a stake script hash, exactly one registration of a
+ * script stake credential with an explicit deposit, the token named after
+ * that credential and sitting in exactly one output at an account
+ * address staked to that same credential.
  */
 const readCreation = (transaction: ParsedTransaction, context: PolicyContext): Creation | string => {
   const minted = Object.entries(transaction.mint).filter(([assetId]) => assetId.startsWith(context.accountScriptHash));
   if (minted.length === 0) {
-    return 'No input is an account control UTxO and nothing is minted under the account policy';
+    return 'No input is an account control or grant UTxO and nothing is minted under the account policy';
   }
   const [assetId, quantity] = minted[0] as [string, bigint];
   if (minted.length !== 1 || quantity !== 1n) {
     return 'An account creation mints exactly one token under the account policy';
+  }
+  if (tokenKindOf(assetId.slice(context.accountScriptHash.length)) !== 'control') {
+    return 'An account creation mints a state NFT named with the 28 bytes of its stake script hash';
   }
   const registrations = transaction.certificates.filter(
     (certificate) => certificate.kind === 'registration' && isScript(certificate.credential) && certificate.deposit !== undefined,
@@ -224,29 +275,72 @@ const readCreation = (transaction: ParsedTransaction, context: PolicyContext): C
   return { registration, deposit: registration.deposit ?? 0n, controlOutput };
 };
 
-/** Classifies the transaction's inputs and outputs against the sponsor and the account contract. */
-const analyse = (transaction: ParsedTransaction, inputs: ResolvedInput[], context: PolicyContext): Analysis => {
+/**
+ * Reads what the transaction does to the account contract. Every control
+ * UTxO it references must belong to an account whose control or grant
+ * UTxO it spends: a referenced control UTxO of any other account serves
+ * no path of the validator and is refused outright. A transaction that
+ * spends an account token is an operation, and every account it operates
+ * must have its control UTxO spent or referenced, as the validator needs
+ * on the owner, the sweep and the agent path alike. One that spends none
+ * is a creation, or no account transaction at all.
+ */
+const readAccountTransaction = (
+  transaction: ParsedTransaction,
+  accountTokenInputs: AccountTokenInput[],
+  referencedControls: AccountTokenInput[],
+  context: PolicyContext,
+): AccountReading => {
+  const operated = new Set(accountTokenInputs.map((token) => token.account));
+  const foreignControl = referencedControls.find((control) => !operated.has(control.account));
+  if (foreignControl !== undefined) {
+    return { kind: undefined, reason: `Reference input ${foreignControl.input.ref} is the control UTxO of account ${foreignControl.account}, which no input operates` };
+  }
+  if (accountTokenInputs.length === 0) {
+    const creation = readCreation(transaction, context);
+    return typeof creation === 'string' ? { kind: undefined, reason: creation } : { kind: 'creation', creation };
+  }
+  const present = new Set([...accountTokenInputs, ...referencedControls].filter((token) => token.kind === 'control').map((token) => token.account));
+  const orphan = accountTokenInputs.find((token) => !present.has(token.account));
+  if (orphan !== undefined) {
+    return { kind: undefined, reason: `Input ${orphan.input.ref} is a grant UTxO of account ${orphan.account}, whose control UTxO is neither spent nor referenced` };
+  }
+  return { kind: 'operation' };
+};
+
+/**
+ * Classifies the transaction's inputs, reference inputs and outputs
+ * against the sponsor and the account contract. A transaction spending a
+ * control or a grant UTxO is an operation on that account, read against
+ * the control UTxOs it spends or references; one spending neither is read
+ * as a creation, or as no account transaction at all.
+ */
+const analyse = (transaction: ParsedTransaction, inputs: ResolvedInput[], referenceInputs: ResolvedInput[], context: PolicyContext): Analysis => {
   const sponsorInputs = inputs.filter((input) => isSponsorInput(input, context));
   const otherInputs = inputs.filter((input) => !isSponsorInput(input, context));
-  const controlInputs = otherInputs.filter((input) => input.output !== undefined && isControlOutput(input.output, context));
+  const accountTokenInputs = otherInputs.flatMap((input) => accountTokenOf(input, context) ?? []);
+  const referencedControls = referenceInputs.flatMap((input) => accountTokenOf(input, context) ?? []).filter((token) => token.kind === 'control');
   const sponsorOutputs = transaction.outputs.filter((output) => output.address === context.sponsor.address);
   const accountOutputs = transaction.outputs.filter((output) => output.address !== context.sponsor.address && isAccountOutput(output, context));
   const foreignOutputs = transaction.outputs.filter((output) => !sponsorOutputs.includes(output) && !accountOutputs.includes(output));
-  const creation = controlInputs.length > 0 ? undefined : readCreation(transaction, context);
+  const reading = readAccountTransaction(transaction, accountTokenInputs, referencedControls, context);
+  const controls = [...accountTokenInputs.filter((token) => token.kind === 'control'), ...referencedControls];
   const returned = balanceOf(sponsorOutputs)[LOVELACE] ?? 0n;
   return {
     transaction,
     inputs,
+    referenceInputs,
     sponsorInputs,
     otherInputs,
-    controlInputs,
+    accountTokenInputs,
+    referencedControls,
     sponsorOutputs,
     accountOutputs,
     foreignOutputs,
-    kind: controlInputs.length > 0 ? 'operation' : typeof creation === 'string' ? undefined : 'creation',
-    creation: typeof creation === 'string' ? undefined : creation,
-    notAccountTransaction: typeof creation === 'string' ? creation : undefined,
-    stakeScriptHashes: stakeScriptHashesOf(controlInputs, typeof creation === 'string' ? undefined : creation),
+    kind: reading.kind,
+    creation: reading.creation,
+    notAccountTransaction: reading.reason,
+    stakeScriptHashes: stakeScriptHashesOf(controls, reading.creation),
     sponsoredLovelace: context.mode.kind === 'fee' ? BigInt(context.mode.fee.lovelace) - returned : 0n,
   };
 };
@@ -365,7 +459,7 @@ const boundedValidity = ({ transaction }: Analysis, context: PolicyContext): big
   return bound;
 };
 
-/** The transaction operates an existing account through its control UTxO, or creates one. */
+/** The transaction operates an existing account through its control or grant UTxOs, with the control UTxO spent or referenced, or creates one. */
 const accountTransaction: Rule = ({ notAccountTransaction }) =>
   notAccountTransaction === undefined ? undefined : violation('account_transaction', notAccountTransaction);
 
@@ -453,7 +547,11 @@ const noSponsorValueElsewhere: Rule = ({ transaction, otherInputs, foreignOutput
   return undefined;
 };
 
-/** Every script the transaction runs or attaches is the account script or one of the account's stake scripts. */
+/**
+ * Every script the transaction runs or attaches is the account script or
+ * one of the account's stake scripts: those named by the control UTxOs
+ * it spends or references, or the one it registers at creation.
+ */
 const noForeignScripts: Rule = ({ transaction, inputs, stakeScriptHashes }, { accountScriptHash }) => {
   const allowed = new Set([accountScriptHash, ...stakeScriptHashes]);
   const foreign = (hash: string): string => `${hash}, which is neither the account script nor its stake script`;
@@ -547,10 +645,11 @@ const BEFORE_EVALUATION: Rule[] = [accountTransaction, sponsorOutflow, noSponsor
 export const applyPolicy = async (
   transaction: ParsedTransaction,
   inputs: ResolvedInput[],
+  referenceInputs: ResolvedInput[],
   context: PolicyContext,
   provider: Provider,
 ): Promise<PolicyVerdict> => {
-  const analysis = analyse(transaction, inputs, context);
+  const analysis = analyse(transaction, inputs, referenceInputs, context);
   const reading: Reading = { kind: analysis.kind, sponsoredLovelace: analysis.sponsoredLovelace };
   const refuse = (found: Violation): PolicyRefusal => ({ ...reading, violation: found });
   for (const rule of BEFORE_VALIDITY) {
@@ -569,7 +668,7 @@ export const applyPolicy = async (
       return refuse(found);
     }
   }
-  const evaluation = await evaluates(transaction, inputs, context, provider);
+  const evaluation = await evaluates(transaction, inputs, referenceInputs, context, provider);
   if (evaluation !== undefined) {
     return refuse(evaluation);
   }

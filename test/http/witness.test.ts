@@ -6,25 +6,32 @@ import type { LeaseBody } from '../../src/api.js';
 import { parseTransaction } from '../../src/policy/parse.js';
 import type { RuleName } from '../../src/policy/rules.js';
 import {
+  CONTROL_LOVELACE,
   DEVICE_KEY,
   STRANGER_KEY,
   accountAddress,
+  accountRewardAddress,
   accountScript,
   accountScriptHash,
   byronAddress,
   controlUtxo,
+  createAccountRedeemer,
+  deviceRedeemer,
   enterpriseAddress,
   foreignScript,
   foreignScriptAddress,
   foreignScriptHash,
   fundUtxo,
+  grantAssetId,
+  initialState,
+  operateRedeemer,
   pointerAddress,
+  reserveDatum,
   scriptUtxo,
   stakeScript,
   stakeScriptHash,
   stateNftAssetId,
   strangerAddress,
-  unitRedeemer,
 } from '../support/account.js';
 import { buildCreation, buildOwnerOperation, clientBuilder, sponsorUtxo, lenientEvaluator, underDeclaringEvaluator } from '../support/client.js';
 import { type TestService, createTestService, txHash } from '../support/service.js';
@@ -553,28 +560,40 @@ describe('transaction policy', () => {
     service.provider.addUtxo(locked);
     const taken = await lease();
     const builder = clientBuilder(service, taken);
-    builder.addInput({ utxo: locked, redeemer: unitRedeemer });
+    builder.addInput({ utxo: locked, redeemer: deviceRedeemer });
     builder.sendLovelace({ address: strangerAddress, amount: 10_000_000n });
     builder.addSigner(DEVICE_KEY).addScript(stakeScript);
     const transaction = await builder.build();
 
-    expectViolation(await witness(taken.leaseId, transaction), 'account_transaction', /No input is an account control UTxO and nothing is minted/);
+    expectViolation(await witness(taken.leaseId, transaction), 'account_transaction', /No input is an account control or grant UTxO and nothing is minted/);
   });
 
   it('account_transaction: refuses a mint under the account policy without a stake registration', async () => {
     await fundPool();
     const taken = await lease();
     const builder = clientBuilder(service, taken);
-    builder.mintToken({ assetIdHex: stateNftAssetId, amount: 1n, redeemer: unitRedeemer });
+    builder.mintToken({ assetIdHex: stateNftAssetId, amount: 1n, redeemer: createAccountRedeemer });
     builder.lockValue({
       scriptAddress: accountAddress,
       value: { coins: 2_000_000n, assets: { [stateNftAssetId]: 1n } },
-      datum: { type: Cometa.DatumType.InlineData, inlineDatum: unitRedeemer },
+      datum: { type: Cometa.DatumType.InlineData, inlineDatum: initialState },
     });
     builder.addSigner(DEVICE_KEY).addScript(accountScript);
     const transaction = await builder.build();
 
     expectViolation(await witness(taken.leaseId, transaction), 'account_transaction', /registers exactly one script stake credential/);
+  });
+
+  it('account_transaction: refuses a creation whose minted token is named like a grant token rather than a state NFT', async () => {
+    await fundPool();
+    const taken = await lease();
+    const builder = clientBuilder(service, taken);
+    builder.registerStakeAddress({ rewardAddress: accountRewardAddress, redeemer: operateRedeemer });
+    builder.mintToken({ assetIdHex: grantAssetId, amount: 1n, redeemer: createAccountRedeemer });
+    builder.lockValue({ scriptAddress: accountAddress, value: { coins: CONTROL_LOVELACE, assets: { [grantAssetId]: 1n } }, datum: { type: Cometa.DatumType.InlineData, inlineDatum: initialState } });
+    builder.addSigner(DEVICE_KEY).addScript(accountScript).addScript(stakeScript);
+
+    expectViolation(await witness(taken.leaseId, await builder.build()), 'account_transaction', /mints a state NFT named with the 28 bytes of its stake script hash/);
   });
 
   it('account_transaction: refuses a creation whose control output is staked to a credential other than the registered one', async () => {
@@ -651,7 +670,7 @@ describe('transaction policy', () => {
         builder.lockValue({
           scriptAddress: taken.sponsorAddress,
           value: { coins: 3_000_000n },
-          datum: { type: Cometa.DatumType.InlineData, inlineDatum: unitRedeemer },
+          datum: { type: Cometa.DatumType.InlineData, inlineDatum: reserveDatum },
         }),
     });
     expectViolation(await witness(taken.leaseId, withDatum), 'sponsor_outflow_bounded', /output to the sponsor carries a datum/);
@@ -685,7 +704,7 @@ describe('transaction policy', () => {
     const taken = await lease();
     const transaction = await buildOwnerOperation(service, taken, control, {
       customise: (builder) => {
-        builder.addInput({ utxo: locked, redeemer: unitRedeemer }).addScript(foreignScript);
+        builder.addInput({ utxo: locked, redeemer: deviceRedeemer }).addScript(foreignScript);
         builder.sendLovelace({ address: strangerAddress, amount: 10_000_000n });
       },
     });
@@ -701,7 +720,7 @@ describe('transaction policy', () => {
     const taken = await lease();
     const transaction = await buildOwnerOperation(service, taken, control, {
       customise: (builder) => {
-        builder.addInput({ utxo: locked, redeemer: unitRedeemer }).addScript(foreignScript);
+        builder.addInput({ utxo: locked, redeemer: deviceRedeemer }).addScript(foreignScript);
         builder.sendLovelace({ address: disguisedAccountAddress, amount: 1_500_000n });
         builder.sendLovelace({ address: strangerAddress, amount: 8_500_000n });
       },

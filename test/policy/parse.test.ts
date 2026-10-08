@@ -12,6 +12,9 @@ import {
   byronAddress,
   controlUtxo,
   enterpriseAddress,
+  grantAssetId,
+  grantUtxo,
+  grantedState,
   pointerAddress,
   stakeScriptHash,
   stateNftAssetId,
@@ -169,6 +172,29 @@ describe('resolveInputs', () => {
     expect(resolved?.[0]?.output?.assets).toEqual({ [stateNftAssetId]: 1n });
     expect(resolved?.[0]?.output?.hasDatum).toBe(true);
     expect(resolved?.[1]).toEqual({ input: unknown, ref: `${txHash(999)}#3`, output: undefined });
+  });
+
+  it('resolves the reference inputs alongside the inputs, in one lookup, and leaves unknown ones unresolved', async () => {
+    const control = controlUtxo(txHash(300), undefined, grantedState);
+    const grant = grantUtxo(txHash(302));
+    service.provider.addUtxo(control);
+    service.provider.addUtxo(grant);
+    const unknown = { txId: txHash(999), index: 3 };
+    const lookups: number[] = [];
+    const counting = service.provider.resolveUnspentOutputs.bind(service.provider);
+    service.provider.resolveUnspentOutputs = (txIns) => {
+      lookups.push(txIns.length);
+      return counting(txIns);
+    };
+
+    const resolved = await resolveInputs(service.provider, [grant.input], [control.input, unknown]);
+
+    expect(lookups).toEqual([3]);
+    expect(resolved.inputs?.map((input) => input.ref)).toEqual([`${txHash(302)}#0`]);
+    expect(resolved.inputs?.[0]?.output?.assets).toEqual({ [grantAssetId]: 1n });
+    expect(resolved.referenceInputs?.map((input) => input.ref)).toEqual([`${txHash(300)}#0`, `${txHash(999)}#3`]);
+    expect(resolved.referenceInputs?.[0]?.output?.assets).toEqual({ [stateNftAssetId]: 1n });
+    expect(resolved.referenceInputs?.[1]?.output).toBeUndefined();
   });
 
   it('refuses at evaluation when the provider rejects the lookup, without asking again input by input', async () => {

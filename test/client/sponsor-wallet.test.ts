@@ -6,7 +6,7 @@ import { SponsorError, SponsorWallet } from '../../src/client/sponsor-wallet.js'
 import { Cometa } from '../../src/cometa.js';
 import { parseTransaction } from '../../src/policy/parse.js';
 import { slotAt } from '../../src/slots.js';
-import { accountAddress, fundUtxo, initialStateOf, stateNftAssetId, strangerAddress, unitRedeemer } from '../support/account.js';
+import { accountAddress, fundRedeemer, fundUtxo, initialStateOf, stateNftAssetId, strangerAddress } from '../support/account.js';
 import { shapeCreation, shapeOwnerOperation, sponsorUtxo } from '../support/client.js';
 import { appFetch } from '../support/http.js';
 import { TEST_MNEMONIC, type TestService, createTestService, txHash } from '../support/service.js';
@@ -87,7 +87,7 @@ const placeAccountOf = (device: string): { control: UTxO; fund: UTxO } => {
 /** An owner operation the account pays for, built on the collateral mode sponsor's builder: the control and a fund UTxO in, the change back to the account. */
 const buildAccountPaid = async (sponsor: SponsorWallet, device: string, control: UTxO, fund: UTxO): Promise<string> => {
   const builder = shapeOwnerOperation((await sponsor.createTransactionBuilder()).setChangeAddress(accountAddress), control, device);
-  return builder.addInput({ utxo: fund, redeemer: unitRedeemer }).build();
+  return builder.addInput({ utxo: fund, redeemer: fundRedeemer }).build();
 };
 
 describe('SponsorWallet', () => {

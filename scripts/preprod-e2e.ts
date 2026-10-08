@@ -10,17 +10,21 @@ import {
   type AccountRecord,
   type AccountState,
   type DiscoveredAccount,
-  type Grant,
+  type GrantRequest,
+  type GrantUtxo,
   LOVELACE,
   accountByOwner,
   createAccount,
+  encodeReserveDatum,
   findAccountUtxos,
+  isGrantTokenName,
   issueGrant,
   paymentKeyHashOf,
   posixTimeToSlot,
   revokeGrant,
   spendWithDevice,
   spendWithGrant,
+  sweepGrant,
 } from 'cardano-account-custody-offchain';
 import { config as loadEnvFile } from 'dotenv';
 import { type CollateralBody, type LeaseBody, SponsorError, SponsorWallet, type SponsorWalletOptions } from '../src/index.js';
@@ -30,7 +34,7 @@ import { type Config, loadConfig } from '../src/config.js';
 import type { RecordedAuditEntry } from '../src/audit.js';
 import type { PoolCounts } from '../src/http/health.js';
 import { createLogger } from '../src/logger.js';
-import { type ParsedTransaction, parseTransaction } from '../src/policy/parse.js';
+import { type ParsedOutput, type ParsedTransaction, parseTransaction } from '../src/policy/parse.js';
 import { createService } from '../src/service.js';
 import { type SlotSettings, slotAt } from '../src/slots.js';
 
@@ -62,13 +66,26 @@ const REPLENISH_COLLATERAL_UTXOS = 2;
 /** The lovelace in one tADA. */
 const TADA = 1_000_000n;
 
-/** What the account receives and pays away in the run. */
+/**
+ * What the account receives and pays away in the run. The reserve is
+ * sized so that every owner operation draws its fee from it: the
+ * contract's builder takes the fee from a reserve only while the reserve
+ * can cover the most a transaction can cost and still be recreated above
+ * its minimum, about 4.4 tADA under preprod's parameters.
+ */
 const DEPOSIT_LOVELACE = 50n * TADA;
+const RESERVE_LOVELACE = 20n * TADA;
 const OWNER_SPEND_LOVELACE = 5n * TADA;
 const AGENT_SPEND_LOVELACE = 3n * TADA;
 const OVER_CAP_SPEND_LOVELACE = 8n * TADA;
 
-/** The grant issued to the agent: one slot, a per call cap and a total cap of the same small amount, the recipient address only. */
+/**
+ * The grant issued to the agent: the first slot of a fresh account, a per
+ * call cap and a total cap of the same small amount, the recipient
+ * address only. A grant spend reduces the caps by its outputs plus the
+ * builder's fee bound of 1.5 tADA, so the agent spend leaves 5.5 tADA of
+ * cap and the over cap spend, at 9.5 tADA with the bound, exceeds it.
+ */
 const GRANT_SLOT = 0n;
 const GRANT_CAP = 10n * TADA;
 const GRANT_LIFETIME_MS = 2n * 60n * 60n * 1000n;
@@ -296,8 +313,18 @@ const freshWallets = async (provider: Provider, config: Config, mnemonics: strin
   return wallets;
 };
 
-/** The initial state of an account owned by one key: that device alone, no grants, generation zero. */
-const initialState = (owner: string): AccountState => ({ devices: [owner], grants: [], grantGeneration: 0n });
+/** The initial state of an account owned by one key: that device alone and zero counters, as the validators demand of every new account. */
+const initialState = (owner: string): AccountState => ({ devices: [owner], grantGeneration: 0n, nextSlot: 0n, revoked: [], outstanding: 0n });
+
+/** The hex length of a policy id, which every asset id starts with. */
+const POLICY_ID_LENGTH = 56;
+
+/** Whether an output holds a token of the account policy named like a grant token. */
+const holdsGrantToken = (output: ParsedOutput, account: DiscoveredAccount): boolean =>
+  Object.keys(output.assets).some((assetId) => assetId.startsWith(account.stateNftAssetId.slice(0, POLICY_ID_LENGTH)) && isGrantTokenName(assetId.slice(POLICY_ID_LENGTH)));
+
+/** Whether an output holds the account's state NFT. */
+const holdsStateNft = (output: ParsedOutput, account: DiscoveredAccount): boolean => output.assets[account.stateNftAssetId] === 1n;
 
 /**
  * A sponsor wallet whose builders pay a third party out of the sponsor's
@@ -385,18 +412,27 @@ const creationAmounts = (tx: ParsedTransaction, lease: LeaseBody, owner: FreshWa
   return { fee: tx.fee, deposit: registration.deposit, controlLovelace: control.lovelace, change, sponsored, invalidHereafter: tx.invalidHereafter };
 };
 
+/** Which path of the validator an operation takes: the owner path spends and recreates the control UTxO, the agent path references it. */
+type OperationPath = 'owner' | 'agent';
+
 /**
  * What an operation paid from the account cost and who paid, read off
  * the transaction: the fee and the outputs away from the account come
- * out of the account's inputs, the change returns to the account, and
- * the sponsor's only part is the shared collateral, declared and
- * returned in full.
+ * out of the account's inputs, the reserve is recreated with the fee
+ * taken out when it pays, the grant UTxOs and the plain change return to
+ * the account, and the sponsor's only part is the shared collateral,
+ * declared and returned in full.
  */
 interface OperationAmounts {
   fee: bigint;
   paidAway: bigint;
   accountChange: bigint;
-  controlLovelace: bigint;
+  /** The lovelace of the recreated control UTxO, or undefined on the agent path, which only references it. */
+  controlLovelace: bigint | undefined;
+  /** The lovelace of the grant UTxOs the transaction creates or recreates. */
+  grantLovelace: bigint;
+  /** The lovelace of the reserve recreated with the fee taken out, or undefined when no reserve pays. */
+  reserveLovelace: bigint | undefined;
   collateral: CollateralBody;
   totalCollateral: bigint;
   collateralReturned: bigint;
@@ -407,13 +443,17 @@ interface OperationAmounts {
  * Reads the amounts of an operation paid from the account and checks
  * what the policy in collateral mode requires of it: every input is one
  * of the account's UTxOs, no output pays the sponsor, the collateral is
- * exactly the shared UTxO with its return to the sponsor address, and the
- * body carries the validity upper bound `expectedBound` says it should.
+ * exactly the shared UTxO with its return to the sponsor address, the
+ * body carries the validity upper bound `expectedBound` says it should,
+ * and the control UTxO is recreated on the owner path or referenced and
+ * left alone on the agent path.
  */
 const operationAmounts = (
   tx: ParsedTransaction,
   account: DiscoveredAccount,
   accountUtxos: Set<string>,
+  control: UTxO,
+  path: OperationPath,
   collateral: CollateralBody,
   expectedBound: bigint,
 ): OperationAmounts => {
@@ -433,17 +473,26 @@ const operationAmounts = (
   if (tx.invalidHereafter !== expectedBound) {
     throw new Error(`The operation stops being valid at slot ${tx.invalidHereafter} where slot ${expectedBound} was expected`);
   }
-  const control = tx.outputs.find((output) => output.address === account.address && output.assets[account.stateNftAssetId] === 1n);
-  if (control === undefined) {
-    throw new Error('The operation does not recreate the control UTxO');
+  const atAccount = tx.outputs.filter((output) => output.address === account.address);
+  const recreated = atAccount.find((output) => holdsStateNft(output, account));
+  if (path === 'owner' && (recreated === undefined || !tx.inputs.some((input) => inputRef(input) === ref(control)))) {
+    throw new Error('The owner operation does not spend and recreate the control UTxO');
   }
-  const atAccount = tx.outputs.filter((output) => output.address === account.address && output !== control);
+  if (path === 'agent' && (recreated !== undefined || !tx.referenceInputs.some((input) => inputRef(input) === ref(control)))) {
+    throw new Error('The agent spend does not reference the control UTxO, or recreates it');
+  }
+  const grants = atAccount.filter((output) => holdsGrantToken(output, account));
+  const reserves = atAccount.filter((output) => output.hasDatum && !holdsStateNft(output, account) && !holdsGrantToken(output, account));
+  const change = atAccount.filter((output) => !output.hasDatum && !holdsStateNft(output, account) && !holdsGrantToken(output, account));
   const away = tx.outputs.filter((output) => output.address !== account.address);
+  const sum = (outputs: ParsedOutput[]): bigint => outputs.reduce((total, output) => total + output.lovelace, 0n);
   return {
     fee: tx.fee,
-    paidAway: away.reduce((total, output) => total + output.lovelace, 0n),
-    accountChange: atAccount.reduce((total, output) => total + output.lovelace, 0n),
-    controlLovelace: control.lovelace,
+    paidAway: sum(away),
+    accountChange: sum(change),
+    controlLovelace: recreated?.lovelace,
+    grantLovelace: sum(grants),
+    reserveLovelace: reserves.length === 0 ? undefined : sum(reserves),
     collateral,
     totalCollateral: tx.totalCollateral,
     collateralReturned: tx.collateralReturn.lovelace,
@@ -451,11 +500,12 @@ const operationAmounts = (
   };
 };
 
-/** An operation paid from the account, confirmed on chain, with the state the account was left in. */
+/** An operation paid from the account, confirmed on chain, with the state and the grant UTxOs the account was left with. */
 interface Operation {
   txId: string;
   amounts: OperationAmounts;
   state: AccountState;
+  grants: GrantUtxo[];
 }
 
 /** Everything the evidence document reports. */
@@ -478,12 +528,13 @@ interface Evidence {
   depositTxId: string;
   depositFee: bigint;
   ownerSpend: Operation;
-  grant: Grant;
+  grant: GrantRequest;
   grantIssued: Operation;
   agentSpend: Operation;
   overCapTxHash: string;
   overCapRefusal: Refusal;
   revoked: Operation;
+  swept: Operation;
   leakingTxHash: string;
   creationRefusals: Refusal[];
   collateralAudit: RecordedAuditEntry[];
@@ -504,6 +555,7 @@ const refusalLines = (refusal: Refusal, index: number): string[] => [
 /** The lines the document gives every operation paid from the account: its link, its bound and where it came from, its amounts and the sponsor's part. */
 const operationLines = (operation: Operation, signer: string, bound: string): string[] => {
   const { amounts } = operation;
+  const payer = amounts.reserveLovelace === undefined ? 'the account, from its funds' : 'the account, from its reserve';
   return [
     `- Transaction: ${link(operation.txId)}, signed by ${signer} and the service`,
     `- Validity upper bound: slot ${amounts.invalidHereafter}, ${bound}`,
@@ -512,9 +564,13 @@ const operationLines = (operation: Operation, signer: string, bound: string): st
     '',
     '| Amount | Lovelace | Paid by |',
     '| ------ | -------- | ------- |',
-    `| Fee | ${ada(amounts.fee)} | the account |`,
+    `| Fee | ${ada(amounts.fee)} | ${payer} |`,
     `| Paid away from the account | ${ada(amounts.paidAway)} | the account |`,
-    `| Control UTxO | ${ada(amounts.controlLovelace)} | the account, including any growth |`,
+    amounts.controlLovelace === undefined
+      ? '| Control UTxO | referenced, not spent | |'
+      : `| Control UTxO | ${ada(amounts.controlLovelace)} | the account, including any growth |`,
+    `| Grant UTxOs | ${ada(amounts.grantLovelace)} | the account |`,
+    amounts.reserveLovelace === undefined ? '| Reserve | not spent | |' : `| Reserve recreated with | ${ada(amounts.reserveLovelace)} | the fee taken out of it |`,
     `| Change back to the account | ${ada(amounts.accountChange)} | |`,
     `| Sponsor lovelace spent | 0 lovelace (0.000000 tADA) | the sponsor contributed collateral only |`,
     '',
@@ -524,7 +580,8 @@ const operationLines = (operation: Operation, signer: string, bound: string): st
 /** The evidence document. */
 const evidenceDocument = (evidence: Evidence): string => {
   const { owner, agent, recipient, lease, creation, grant } = evidence;
-  const remainingCap = evidence.agentSpend.state.grants.find((candidate) => candidate.slot === GRANT_SLOT)?.scope.cap;
+  const issued = evidence.grantIssued.grants.find((candidate) => candidate.grant.slot === GRANT_SLOT);
+  const remainingCap = evidence.agentSpend.grants.find((candidate) => candidate.grant.slot === GRANT_SLOT)?.grant.scope.cap;
   const lines = [
     '# Preprod evidence',
     '',
@@ -533,8 +590,10 @@ const evidenceDocument = (evidence: Evidence): string => {
     "the admin route, and every transaction was built through the contract's own builders with the sponsor wallet adapter:",
     'in fee mode as the `sponsor` of the creation, where the service paid the fee, the registration deposit and the control',
     'UTxO for an owner wallet that holds no ADA, and in collateral mode as the `collateral` wallet of every later operation,',
-    'where the account paid its own fee and the service contributed the shared collateral and nothing else. The owner and the',
-    'agent wallets held no ADA at any point.',
+    'where the account paid its own fee, the owner operations from a reserve UTxO the owner alone can spend and the agent',
+    'spend from the plain funds, and the service contributed the shared collateral and nothing else. The grant lived in its',
+    'own grant UTxO and the agent spend referenced the control UTxO without spending it. The owner and the agent wallets held',
+    'no ADA at any point.',
     '',
     '## Setup',
     '',
@@ -581,30 +640,35 @@ const evidenceDocument = (evidence: Evidence): string => {
       ? `- The audit trail records the witness as issued: \`${JSON.stringify(evidence.creationAudit.detail)}\``
       : '- The audit trail entry for the witness was not found',
     '',
-    '## 2. Deposit',
+    '## 2. Deposit and reserve',
     '',
-    `- Transaction: ${link(evidence.depositTxId)}, a plain transfer of ${ada(DEPOSIT_LOVELACE)} to the account address`,
+    `- Transaction: ${link(evidence.depositTxId)}, a plain transfer of ${ada(DEPOSIT_LOVELACE)} to the account address and a deposit of`,
+    `  ${ada(RESERVE_LOVELACE)} under the reserve datum, which the owner alone can spend`,
     `- Paid by the funding wallet, which is the sponsor wallet spending from its reserve outside the service, with a fee of ${ada(evidence.depositFee)};`,
     '  the service was not involved and no pool UTxO was touched',
     '',
-    '## 3. Owner spend, collateral mode',
+    '## 3. Owner spend from the reserve, collateral mode',
     '',
     `${ada(OWNER_SPEND_LOVELACE)} paid from the account to the recipient address through \`spendWithDevice\`, with the adapter in collateral mode as`,
-    "the builder's `collateral` wallet.",
+    "the builder's `collateral` wallet. The fee is drawn from the reserve, which is spent and recreated with the fee taken out, so",
+    'that no fund UTxO an agent may be spending is touched.',
     '',
     ...operationLines(evidence.ownerSpend, 'the owner device', ADAPTER_BOUND),
-    '## 4. Grant issued, collateral mode',
+    '## 4. Grant issued into its own UTxO, collateral mode',
     '',
-    `A lovelace grant in slot ${grant.slot} to the agent key through \`issueGrant\`: ${ada(grant.scope.perCallCap)} per call, ${ada(grant.scope.cap)} in total,`,
-    `expiring at ${new Date(Number(grant.scope.expiresAt)).toISOString()}, the recipient address as the only recipient. The larger state raises the`,
-    "control UTxO's lovelace, which the account pays, as it pays the fee.",
+    `A lovelace grant in slot ${GRANT_SLOT} to the agent key through \`issueGrant\`: ${ada(grant.scope.perCallCap)} per call, ${ada(grant.scope.cap)} in total,`,
+    `expiring at ${new Date(Number(grant.scope.expiresAt)).toISOString()}, the recipient address as the only recipient. The grant token is minted into`,
+    `a grant UTxO at the account address, paid from the funds, under generation ${issued === undefined ? 'unknown' : issued.grant.generation}; the fee`,
+    "comes from the reserve, and the control UTxO's next slot and outstanding count move to one.",
     '',
     ...operationLines(evidence.grantIssued, 'the owner device', ADAPTER_BOUND),
     '## 5. Agent spend within the cap, collateral mode',
     '',
     `${ada(AGENT_SPEND_LOVELACE)} paid from the account to the recipient address through \`spendWithGrant\`, built from the persisted account`,
-    "record with the agent wallet signing and the adapter in collateral mode as the builder's `collateral` wallet. The fee comes",
-    'out of the account and counts against the grant alongside the payout.',
+    "record with the agent wallet signing and the adapter in collateral mode as the builder's `collateral` wallet. The grant UTxO",
+    'is spent and recreated with the same value, the control UTxO is referenced and left alone, and the fee comes out of the',
+    'plain funds and counts against the grant alongside the payout: the caps are reduced by the payout plus the fee bound of',
+    '1.5 tADA, which the validator accepts anywhere between zero and the exact reduction.',
     '',
     ...operationLines(evidence.agentSpend, 'the agent key', BUILDER_BOUND),
     `- Remaining cap after the spend: ${remainingCap === undefined ? 'unknown' : ada(remainingCap)}`,
@@ -618,10 +682,17 @@ const evidenceDocument = (evidence: Evidence): string => {
     ...refusalLines(evidence.overCapRefusal, 0),
     '## 7. Grant revoked, collateral mode',
     '',
-    `The grant in slot ${grant.slot} revoked through \`revokeGrant\`, leaving the account with ${evidence.revoked.state.grants.length} grants.`,
+    `The grant in slot ${GRANT_SLOT} revoked through \`revokeGrant\`: the slot joins the revoked list of the control UTxO, which now lists`,
+    `${evidence.revoked.state.revoked.join(', ') || 'nothing'}, and the grant UTxO is left in place, dead.`,
     '',
     ...operationLines(evidence.revoked, 'the owner device', ADAPTER_BOUND),
-    '## 8. Refused creations, fee mode',
+    '## 8. Dead grant swept, collateral mode',
+    '',
+    `The dead grant UTxO of slot ${GRANT_SLOT} swept through \`sweepGrant\`: its token is burned and its lovelace returns to the account, leaving`,
+    `${evidence.swept.state.outstanding} grants outstanding and ${evidence.swept.grants.length} grant UTxOs at the address.`,
+    '',
+    ...operationLines(evidence.swept, 'the owner device', ADAPTER_BOUND),
+    '## 9. Refused creations, fee mode',
     '',
     `A second creation, for the owner at account index ${recipient.index} (\`${recipient.address}\`), built with a sponsor wallet`,
     `that slips a ${ada(LEAK_LOVELACE)} payment to the first owner's address into every builder, so that the creation`,
@@ -635,12 +706,13 @@ const evidenceDocument = (evidence: Evidence): string => {
     '| ---- | ----------- | --- | ----------- | ---------------------- | ------------ |',
     `| 1 | ${link(evidence.creationTxId)} | ${ada(creation.fee)} | the sponsor | ${ada(creation.sponsored)} | fee, deposit, control UTxO and collateral |`,
     `| 2 | ${link(evidence.depositTxId)} | ${ada(evidence.depositFee)} | the funding wallet | none through the service | none |`,
-    `| 3 | ${link(evidence.ownerSpend.txId)} | ${ada(evidence.ownerSpend.amounts.fee)} | the account | 0 | collateral only |`,
-    `| 4 | ${link(evidence.grantIssued.txId)} | ${ada(evidence.grantIssued.amounts.fee)} | the account | 0 | collateral only |`,
-    `| 5 | ${link(evidence.agentSpend.txId)} | ${ada(evidence.agentSpend.amounts.fee)} | the account | 0 | collateral only |`,
+    `| 3 | ${link(evidence.ownerSpend.txId)} | ${ada(evidence.ownerSpend.amounts.fee)} | the account's reserve | 0 | collateral only |`,
+    `| 4 | ${link(evidence.grantIssued.txId)} | ${ada(evidence.grantIssued.amounts.fee)} | the account's reserve | 0 | collateral only |`,
+    `| 5 | ${link(evidence.agentSpend.txId)} | ${ada(evidence.agentSpend.amounts.fee)} | the account's funds | 0 | collateral only |`,
     '| 6 | none, refused | | | 0 | none |',
-    `| 7 | ${link(evidence.revoked.txId)} | ${ada(evidence.revoked.amounts.fee)} | the account | 0 | collateral only |`,
-    '| 8 | none, refused | | | 0 | none |',
+    `| 7 | ${link(evidence.revoked.txId)} | ${ada(evidence.revoked.amounts.fee)} | the account's reserve | 0 | collateral only |`,
+    `| 8 | ${link(evidence.swept.txId)} | ${ada(evidence.swept.amounts.fee)} | the account's reserve | 0 | collateral only |`,
+    '| 9 | none, refused | | | 0 | none |',
     '',
     '## Audit trail of the collateral mode witnesses',
     '',
@@ -732,11 +804,12 @@ const main = async (): Promise<void> => {
     }
     console.log(`  on chain: control UTxO ${ref(controlUtxo)}, sponsor change ${ref(changeUtxo)}, stake credential registered`);
 
-    console.log(`Step 2: deposit of ${DEPOSIT_LOVELACE} lovelace from the funding wallet's reserve`);
+    console.log(`Step 2: deposit of ${DEPOSIT_LOVELACE} lovelace and a reserve of ${RESERVE_LOVELACE} lovelace from the funding wallet's reserve`);
     const reserve = running.reserveUtxos();
     const depositTx = await (await funding.createTransactionBuilder())
       .setUtxos(reserve)
       .sendLovelace({ address: owner.account.address, amount: DEPOSIT_LOVELACE })
+      .lockValue({ scriptAddress: owner.account.address, value: { coins: RESERVE_LOVELACE }, datum: { type: Cometa.DatumType.InlineData, inlineDatum: encodeReserveDatum() } })
       .build();
     const depositParsed = parsed(depositTx);
     const outsidePool = new Set(reserve.map(ref));
@@ -752,32 +825,40 @@ const main = async (): Promise<void> => {
     const clock = { now: new Date() };
     const collateral = new SponsorWallet({ baseUrl: running.baseUrl, apiKey, provider, mode: 'collateral', now: () => clock.now });
     const presetBound = (shared: CollateralBody): bigint => slotAt(config.slots, presetCollateralBound(shared, clock.now));
-    const accountRefs = async (): Promise<Set<string>> => new Set((await provider.getUnspentOutputs(owner.account.address)).map(ref));
-    const operate = async (role: string, signer: Wallet, build: () => Promise<string>, expectedBound: (shared: CollateralBody) => bigint = presetBound): Promise<Operation> => {
-      const held = await accountRefs();
+    const operate = async (
+      role: string,
+      signer: Wallet,
+      path: OperationPath,
+      build: () => Promise<string>,
+      expectedBound: (shared: CollateralBody) => bigint = presetBound,
+    ): Promise<Operation> => {
+      const before = await findAccountUtxos(provider, { record, wallet: signer });
+      const held = new Set([before.control, ...before.grants.map((grant) => grant.utxo), ...before.reserves, ...before.funds].map(ref));
       clock.now = new Date();
       const tx = await build();
       const shared = collateral.collateral;
       if (shared === undefined) {
         throw new Error('The collateral wallet holds no shared collateral after building');
       }
-      const amounts = operationAmounts(parsed(tx), owner.account, held, shared, expectedBound(shared));
+      const amounts = operationAmounts(parsed(tx), owner.account, held, before.control, path, shared, expectedBound(shared));
       attempted.push({ hash: parsed(tx).hash, role });
       const txId = await submit(provider, [collateral, signer], tx);
       console.log(`  submitted ${txId}, fee ${amounts.fee} paid by the account, collateral ${ref(shared)}`);
       await settle(provider, txId, parsed(tx));
-      const { state } = await findAccountUtxos(provider, { record, wallet: signer });
-      return { txId, amounts, state };
+      const { state, grants } = await findAccountUtxos(provider, { record, wallet: signer });
+      return { txId, amounts, state, grants };
     };
 
-    console.log(`Step 3: owner spend of ${OWNER_SPEND_LOVELACE} lovelace to the recipient, paid from the account`);
-    const ownerSpend = await operate('owner spend paid from the account', owner.wallet, () =>
+    console.log(`Step 3: owner spend of ${OWNER_SPEND_LOVELACE} lovelace to the recipient, paid from the account's reserve`);
+    const ownerSpend = await operate('owner spend paid from the reserve', owner.wallet, 'owner', () =>
       spendWithDevice({ owner: owner.keyHash, wallet: owner.wallet, collateral, provider, outputs: [{ address: recipient.address, value: { coins: OWNER_SPEND_LOVELACE } }] }),
     );
+    if (ownerSpend.amounts.reserveLovelace === undefined) {
+      throw new Error('The owner spend did not draw its fee from the reserve');
+    }
 
-    console.log(`Step 4: grant in slot ${GRANT_SLOT} to the agent key, paid from the account`);
-    const grant: Grant = {
-      slot: GRANT_SLOT,
+    console.log(`Step 4: grant in slot ${GRANT_SLOT} to the agent key, minted into its own UTxO, paid from the account`);
+    const grant: GrantRequest = {
       grantee: agent.keyHash,
       scope: {
         asset: LOVELACE,
@@ -789,9 +870,12 @@ const main = async (): Promise<void> => {
         recipients: [recipient.address],
       },
     };
-    const grantIssued = await operate('grant issued, paid from the account', owner.wallet, () =>
-      issueGrant({ owner: owner.keyHash, wallet: owner.wallet, collateral, provider, grant }),
+    const grantIssued = await operate('grant issued, paid from the account', owner.wallet, 'owner', () =>
+      issueGrant({ owner: owner.keyHash, wallet: owner.wallet, collateral, provider, grants: [grant] }),
     );
+    if (!grantIssued.grants.some((candidate) => candidate.grant.slot === GRANT_SLOT) || grantIssued.state.outstanding !== 1n) {
+      throw new Error('The account does not hold the issued grant UTxO');
+    }
 
     let agentValidUntilSlot = 0n;
     const grantSpend = (lovelace: bigint, unchecked: boolean): Promise<string> => {
@@ -813,6 +897,7 @@ const main = async (): Promise<void> => {
     const agentSpend = await operate(
       'agent spend within the cap, paid from the account',
       agent.wallet,
+      'agent',
       () => grantSpend(AGENT_SPEND_LOVELACE, false),
       () => agentValidUntilSlot,
     );
@@ -835,14 +920,22 @@ const main = async (): Promise<void> => {
     console.log(`  refused as expected: ${overCap.status} ${overCap.code} ${overCap.rule}`);
 
     console.log(`Step 7: grant in slot ${GRANT_SLOT} revoked, paid from the account`);
-    const revoked = await operate('grant revoked, paid from the account', owner.wallet, () =>
+    const revoked = await operate('grant revoked, paid from the account', owner.wallet, 'owner', () =>
       revokeGrant({ owner: owner.keyHash, wallet: owner.wallet, collateral, provider, slot: GRANT_SLOT }),
     );
-    if (revoked.state.grants.length !== 0) {
-      throw new Error('The account still holds a grant after the revocation');
+    if (!revoked.state.revoked.includes(GRANT_SLOT)) {
+      throw new Error('The control UTxO does not list the revoked slot');
     }
 
-    console.log('Step 8: refused creations in fee mode');
+    console.log(`Step 8: dead grant in slot ${GRANT_SLOT} swept, paid from the account`);
+    const swept = await operate('dead grant swept, paid from the account', owner.wallet, 'owner', () =>
+      sweepGrant({ owner: owner.keyHash, wallet: owner.wallet, collateral, provider, slots: [GRANT_SLOT] }),
+    );
+    if (swept.grants.length !== 0 || swept.state.outstanding !== 0n) {
+      throw new Error('The account still holds a grant UTxO after the sweep');
+    }
+
+    console.log('Step 9: refused creations in fee mode');
     const leaking = new LeakingSponsorWallet({ baseUrl: running.baseUrl, apiKey, provider }, owner.address, LEAK_LOVELACE);
     const leakingTx = await createAccount({
       owner: recipient.keyHash,
@@ -904,6 +997,7 @@ const main = async (): Promise<void> => {
       overCapTxHash,
       overCapRefusal,
       revoked,
+      swept,
       leakingTxHash,
       creationRefusals,
       collateralAudit: issuedEntries.filter((entry) => entry.detail['mode'] === 'collateral'),

@@ -19,11 +19,15 @@ UTxOs to the dApp, the dApp builds the creation on it, and the service
 signs once the transaction draws nothing from the sponsor beyond the fee,
 the deposit and the control UTxO.
 
-Every later operation is paid by the account from its own fund UTxOs.
-What the owner or an agent still lacks is collateral, which only a wallet
-with ADA can declare. For those transactions the service contributes its
-shared collateral UTxO alone, signs the collateral declaration, and no
-sponsor lovelace is spent.
+Every later operation is paid by the account from its own UTxOs: an
+owner operation from a reserve, a deposit under a datum that the owner
+alone can spend, or from the plain funds, and an agent spend, which
+spends its grant UTxO and plain funds and references the control UTxO
+without spending it, from the plain funds. What the owner or an agent
+still lacks is collateral, which only a wallet with ADA can declare. For
+those transactions the service contributes its shared collateral UTxO
+alone, signs the collateral declaration, and no sponsor lovelace is
+spent.
 
 Two modes follow from this, both served by the same policy:
 
@@ -341,13 +345,20 @@ name.
    now plus `COLLATERAL_VALIDITY_SECONDS` in collateral mode; slots are
    compared as integers, with one second per slot from the network's
    Shelley start.
-5. `account_transaction`: an input is an account control UTxO, at an
-   address paying to `ACCOUNT_SCRIPT_HASH` and holding a token of that
-   policy, or the transaction creates an account: it mints exactly one
-   token under the policy, registers exactly one script stake
-   credential with an explicit deposit, names the token after that
-   credential and locks it in exactly one output at an account address
-   staked to that credential.
+5. `account_transaction`: an input is an account control UTxO or grant
+   UTxO, at an address paying to `ACCOUNT_SCRIPT_HASH` and staked to a
+   script, holding a token of that policy named after that script alone,
+   the 28 byte state NFT, or followed by a slot, the 32 byte grant token;
+   every account whose token is spent has its control UTxO among the
+   inputs or the reference inputs, as an agent spend references it, and
+   every control UTxO among the reference inputs belongs to such an
+   account. Otherwise the transaction creates an account: it mints
+   exactly one token under the policy, named with the 28 bytes of a
+   stake script hash, registers exactly one script stake credential with
+   an explicit deposit, names the token after that credential and locks
+   it in exactly one output at an account address staked to that
+   credential. A token under another policy, whatever its name, and a
+   token held at any other address count for nothing.
 6. `sponsor_outflow_bounded` in fee mode: the fee is at most
    `MAX_FEE_LOVELACE`, exactly one output pays the sponsor address, the
    change, as plain lovelace with neither a datum nor a reference
@@ -364,14 +375,16 @@ name.
 8. `no_foreign_scripts`: every script input, mint policy, script
    credential of a certificate, withdrawal or vote, and attached Plutus
    script is the account script or the account's stake script, that is,
-   the stake script of a control UTxO the transaction spends or the one
-   it registers at creation, and the transaction carries no native
-   script witness.
-9. `evaluates`: the provider resolves every input in one lookup and all
-   of them exist, the provider evaluates the transaction with the
-   sponsor UTxOs it builds on supplied, and every redeemer declares at
-   least the memory and steps the evaluation found it needs; a provider
-   that refuses the input lookup is reported here too.
+   the stake script named by a control UTxO the transaction spends or
+   references, which is the name of its state NFT, or the one it
+   registers at creation, and the transaction carries no native script
+   witness. A grant UTxO names no stake script by itself: the control
+   UTxO an agent spend references does.
+9. `evaluates`: the provider resolves every input and reference input in
+   one lookup and all of them exist, the provider evaluates the
+   transaction with the sponsor UTxOs it builds on supplied, and every
+   redeemer declares at least the memory and steps the evaluation found
+   it needs; a provider that refuses the lookup is reported here too.
 10. `signers`: neither sponsor key is a required signer, no withdrawal
     draws from the sponsor's reward account, no certificate of any kind
     names a sponsor credential, and no voter is a sponsor credential; a
@@ -503,10 +516,14 @@ Requires Node 22.
    preprod proof use it, and both need it built there with `npm run
    build` in that directory; the service, its tests, `npm run lint` and
    `npm run typecheck` do not. The `file:` dependency and the continuous
-   integration workflow are pinned to contract commit `ced2fe4`, the one
-   that adds the collateral wallet option the preprod proof builds on;
+   integration workflow are pinned to contract commit `b08a2e6`, the one
+   whose builders the preprod proof builds on;
    `package-lock.json` must be regenerated whenever the contract's
-   off-chain package changes its dependencies.
+   off-chain package changes its dependencies. The pinned commit is
+   revision 2 of the validators, with each grant in its own grant UTxO,
+   reserves, and the account validator at hash
+   `6f275cca0cc4433e6a798d78a2db2934df60dc4fd989274a2d9bb434`, which is
+   what `ACCOUNT_SCRIPT_HASH` must name.
 3. Start the service with `npm run dev`, or `npm run start` without the
    file watcher.
 
@@ -629,7 +646,7 @@ policy accepts at creation. Its owner operations with a sponsor have the
 sponsor pay the control output's growth and receive withdrawn rewards as
 change, both of which `sponsor_outflow_bounded` refuses, since an
 operation must draw exactly the fee: `withdrawRewards` with a sponsor is
-refused whenever it withdraws anything, and `addDevice`, `issueGrant`
+refused whenever it withdraws anything, and `addDevice`, `revokeGrant`
 and `rewriteState` with a sponsor are refused once the larger state
 raises the control output's minimum lovelace. Operations on an existing
 account take the adapter in collateral mode instead.
@@ -652,7 +669,11 @@ const txId = await collateral.submitTransaction(Cometa.applyVkeyWitnessSet(tx, w
   validity upper bound at now plus `validitySeconds` less a margin of
   60 seconds, or half the window when that is smaller. The change
   address is the caller's to set; the contract's builders set it to the
-  account and add the account's control and fund UTxOs as inputs.
+  account and add the account's own UTxOs as inputs: the control UTxO
+  and a reserve or funds on the owner path, the grant UTxO and funds on
+  the agent path, which references the control UTxO instead. A grant
+  spend's validity upper bound is the builder's `validUntilSlot`, which
+  must stay within the window as well.
 - `signTransaction` posts to `POST /v1/collateral/witness`; the same
   transaction signed again receives the same witness set. A refusal
   under `uses_shared_collateral` drops the collateral held so the next
@@ -680,12 +701,15 @@ does for the preprod proof.
 
 [docs/preprod-evidence.md](docs/preprod-evidence.md) records a full run
 on preprod: a sponsored creation in fee mode for an owner holding no
-ADA, a deposit, an owner spend, a grant, an agent spend and the grant's
-revocation in collateral mode with the account paying its fees, an
-agent spend over the cap refused under `evaluates`, a creation paying
-sponsor value to a third party refused under `sponsor_outflow_bounded`,
-and the reuse of a consumed lease refused as `lease_consumed`, with
-every transaction, who paid what and every refusal body.
+ADA, a deposit and a reserve deposit, then in collateral mode with the
+account paying its fees an owner spend paid from the reserve, a grant
+issued into its own grant UTxO, an agent spend that references the
+control UTxO, the grant's revocation and the sweep of the dead grant
+UTxO, an agent spend over the remaining cap refused under `evaluates`,
+a creation paying sponsor value to a third party refused under
+`sponsor_outflow_bounded`, and the reuse of a consumed lease refused as
+`lease_consumed`, with every transaction, who paid what and every
+refusal body.
 
 `npm run preprod-e2e` reruns it and rewrites the document. It spends
 test ADA from the sponsor wallet: it starts the service in this process
