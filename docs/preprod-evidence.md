@@ -1,5 +1,12 @@
 # Preprod evidence
 
+This run is superseded. It was made against the single account validator
+of the contract's earlier revision, so the account script hash and the
+state NFT policy it records are not the ones the service runs against
+today, and it exercises no proxy and no logic withdrawal. Read
+`contract/plutus.json` and the configuration table of the README for the
+hashes in force. It stands until the next preprod run replaces it.
+
 A custody account taken through its life on preprod on 2026-10-07T13:36:25.530Z with the fee sponsor service as the only source of
 sponsor funds and collateral. The service ran against preprod with its funding wallet, a client key was issued through
 the admin route, and every transaction was built through the contract's own builders with the sponsor wallet adapter:

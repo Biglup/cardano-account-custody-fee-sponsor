@@ -1044,9 +1044,11 @@ surroundings.
 - State lives in one sqlite database; the lease and quota guarantees
   rest on its transactions, so one process serves one database and
   there is no horizontal scaling without a shared database.
-- Preprod only: the network and the Blockfrost endpoint are fixed to
-  preprod, and mainnet is refused in code, since the service carries the
-  slot settings of preprod alone.
+- Preprod only: the network magic and the slot settings are fixed to
+  preprod in code, and the service carries no others. Pointing
+  `PROVIDER_BASE_URL` at another chain is not detected, and a chain whose
+  slots do not map to time as preprod's do would give a witnessed
+  transaction the wrong validity bound.
 - The service has not been audited.
 
 ## License

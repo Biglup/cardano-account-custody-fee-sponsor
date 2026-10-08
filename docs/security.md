@@ -206,6 +206,25 @@ cannot land once the chain has spent it, and the fee UTxO it
 leased returns to the pool once its bound lapses, as any unsubmitted
 witness does.
 
+### Trusting the provider
+
+The chain is read and evaluated through one Blockfrost compatible
+endpoint, which may be the hosted one or a proxy another team runs, and
+the service trusts what it answers. Three guarantees rest on it: the
+`evaluates` rule takes the endpoint's evaluation as the phase two
+verdict, the `script_data_hash` rule takes its cost models as the prices
+the chain charges, and the rules that classify inputs take its view of
+what every input holds and who it pays. An endpoint that lies or that
+serves a stale view can therefore cost the sponsor two things: the
+shared collateral UTxO, if it reports an evaluation the chain then fails,
+bounded by `COLLATERAL_UTXO_LOVELACE` and visible on the audit trail and
+in health; and the lovelace of one creation, if it fabricates a UTxO view
+the exact outflow check is then measured against. It cannot obtain a
+signature over a transaction the service did not inspect, because the
+structural rules read the transaction itself and the witness set is
+checked before it leaves. Point the service only at an endpoint trusted
+as much as the wallet it holds.
+
 ### Replaying a witness
 
 A lease issues one witness and is consumed by it. The same transaction
