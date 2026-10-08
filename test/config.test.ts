@@ -16,11 +16,22 @@ const validEnv = (): Record<string, string> => ({
 });
 
 describe('loadConfig', () => {
+  it('takes the Blockfrost compatible endpoint of the environment, such as a local devnet', () => {
+    const config = loadConfig({ ...validEnv(), PROVIDER_BASE_URL: 'http://localhost:8080/api/v1' });
+
+    expect(config.blockfrostBaseUrl).toBe('http://localhost:8080/api/v1');
+  });
+
+  it('refuses an endpoint that is not a URL', () => {
+    expect(() => loadConfig({ ...validEnv(), PROVIDER_BASE_URL: 'not a url' })).toThrow(ConfigError);
+  });
+
   it('parses a complete environment and fills in the documented defaults', () => {
     const config = loadConfig(validEnv());
 
     expect(config.network).toBe('preprod');
     expect(config.blockfrostProjectId).toBe('preprodTestProjectId');
+    expect(config.blockfrostBaseUrl).toBeUndefined();
     expect(config.sponsorMnemonic).toEqual(VALID_MNEMONIC.split(' '));
     expect(config.accountScriptHash).toBe('ed61963ac94d12c0b320be5a336c36af66bc02c380e0aa3001899253');
     expect(config.knownLogicHashes).toEqual([CURRENT_LOGIC_HASH]);

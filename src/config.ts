@@ -53,6 +53,7 @@ const DEFAULT_BLUEPRINT_PATH = fileURLToPath(new URL('../contract/plutus.json', 
 /** The environment variables the service reads, with defaults for every operational tunable. */
 const envSchema = z.object({
   BLOCKFROST_PREPROD_PROJECT_ID: z.string().min(1, 'BLOCKFROST_PREPROD_PROJECT_ID is required'),
+  PROVIDER_BASE_URL: z.string().url('PROVIDER_BASE_URL must be a URL').optional(),
   SPONSOR_MNEMONIC: mnemonicSchema,
   ACCOUNT_SCRIPT_HASH: z.string().regex(SCRIPT_HASH, 'ACCOUNT_SCRIPT_HASH must be a 56 character hex script hash'),
   KNOWN_LOGIC_HASHES: logicHashesSchema.default([CURRENT_LOGIC_HASH]),
@@ -96,6 +97,8 @@ const configSchema = envSchema.refine(sizesAreDistinct, {
 export interface Config {
   network: Network;
   blockfrostProjectId: string;
+  /** The Blockfrost compatible endpoint the service reads and submits through, or none for the hosted preprod one. */
+  blockfrostBaseUrl: string | undefined;
   sponsorMnemonic: string[];
   accountScriptHash: string;
   /** The logic script hashes the service serves accounts under; a control datum naming any other is refused. */
@@ -154,6 +157,7 @@ export const loadConfig = (env: Record<string, string | undefined> = process.env
   return {
     network,
     blockfrostProjectId: data.BLOCKFROST_PREPROD_PROJECT_ID,
+    blockfrostBaseUrl: data.PROVIDER_BASE_URL,
     sponsorMnemonic: data.SPONSOR_MNEMONIC,
     accountScriptHash: data.ACCOUNT_SCRIPT_HASH,
     knownLogicHashes: data.KNOWN_LOGIC_HASHES,

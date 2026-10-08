@@ -18,6 +18,7 @@ const main = async (): Promise<void> => {
   const provider = new Cometa.BlockfrostProvider({
     network: Cometa.NetworkMagic.Preprod,
     projectId: config.blockfrostProjectId,
+    ...(config.blockfrostBaseUrl === undefined ? {} : { baseUrl: config.blockfrostBaseUrl }),
   });
 
   const service = await createService({ config, provider, logger });

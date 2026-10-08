@@ -588,6 +588,16 @@ Optional, with defaults:
 | `IP_RATE_LIMIT_PER_MINUTE` | `120` | requests per address per minute |
 | `KEY_RATE_LIMIT_PER_MINUTE` | `60` | requests per key per minute |
 | `TRUST_PROXY_HOPS` | `0` | reverse proxies in front of the service |
+| `PROVIDER_BASE_URL` | the hosted preprod endpoint | the Blockfrost compatible endpoint the service reads and submits through |
+
+`PROVIDER_BASE_URL` points the service at a Blockfrost compatible
+endpoint other than the hosted preprod one, such as the local devnet of
+the contract repository, which serves one at `http://localhost:8080/api/v1`
+and ignores the project id, so any placeholder satisfies
+`BLOCKFROST_PREPROD_PROJECT_ID` there. Nothing else about the service
+changes with it: the slot settings and the network magic stay preprod's,
+so a devnet whose slots do not map to time as preprod's do would give a
+witnessed transaction the wrong validity bound.
 
 `FEE_UTXO_LOVELACE` and `COLLATERAL_UTXO_LOVELACE` must differ by more
 than ten percent of the larger, or a UTxO of either size could not be
