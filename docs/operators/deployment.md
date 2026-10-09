@@ -177,7 +177,11 @@ set `TRUST_PROXY_HOPS` to the number of proxies, and never more. The service
 then reads the client address from that many `X-Forwarded-For` hops. Trusting
 more hops than exist lets a caller choose the address it is limited as. With
 `TRUST_PROXY_HOPS` at 0, the service limits each request by the address of its
-connection.
+connection. If the first request after start carries an `X-Forwarded-For`
+header, the service prints one `ERR_ERL_UNEXPECTED_X_FORWARDED_FOR` message on
+stderr. The request is still served. The message points at a proxy in front of
+a service that does not trust it. The check runs on the first request only, so
+a missing message proves nothing.
 
 ### Keep the admin routes off the public network
 

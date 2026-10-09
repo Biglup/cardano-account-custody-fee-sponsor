@@ -3,8 +3,9 @@
 The service reads its configuration from the environment once, at startup.
 Before it reads, it loads a `.env` file from the working directory into the
 environment. A variable already set in the environment takes precedence over
-the same variable in the file. The container image carries no `.env` file; see
-[deployment.md](deployment.md).
+the same variable in the file. A `.env` file holds secrets, so keep it
+readable by the service user alone and out of version control. The container
+image carries no `.env` file; see [deployment.md](deployment.md).
 
 An invalid configuration stops the service before it listens. It prints
 `Fee sponsor service failed to start: Invalid configuration:` on stderr,
