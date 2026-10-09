@@ -64,7 +64,9 @@ The other free collateral UTxOs are [spare collateral](../glossary.md#spare-coll
 
 - When no collateral UTxO is designated, the pool sync designates the oldest
   free one. The designation is stored, so it survives restarts.
-- A replenish never spends the shared collateral, whatever the reserve lists.
+- A replenish never spends the shared collateral while it is designated,
+  whatever the reserve lists. A [pool size change](#changing-the-pool-sizes)
+  ends the designation.
   [POL-2](../policy.md#pol-2-sponsor-inputs) refuses it as a regular input.
 - The ledger takes collateral only when a script fails in phase two, which
   [POL-11](../policy.md#pol-11-evaluates) prevents.
@@ -128,34 +130,12 @@ curl --silent --request POST http://127.0.0.1:8787/admin/pool/replenish \
   --data '{}'
 ```
 
-The body is optional. Each field overrides one default.
+The body is optional. [api.md](../integrators/api.md#post-adminpoolreplenish)
+gives its fields, their defaults and the answers.
 
-| Field | Default |
-| ----- | ------- |
-| `feeUtxoLovelace` | `FEE_UTXO_LOVELACE` |
-| `feeUtxoCount` | what tops the free and leased fee UTxOs up to `FEE_UTXO_COUNT` |
-| `collateralLovelace` | `COLLATERAL_UTXO_LOVELACE` |
-| `collateralCount` | what tops the free collateral UTxOs up to `COLLATERAL_UTXO_COUNT` |
-
-The counts are capped by what the reserve can fund after keeping 3000000
-lovelace back for the fee and the change. Fee outputs are funded first,
-collateral outputs from what is left. An output the pool sync does not
-classify as a pool size becomes reserve.
-
-The service resyncs, builds, signs and submits the split. It waits up to 180
-seconds for confirmation, resyncs again and answers:
-
-```json
-{ "txId": "...", "feeOutputs": 5, "collateralOutputs": 1, "reserveLovelace": "312345678" }
-```
-
-| Answer | When |
-| ------ | ---- |
-| 200 with `txId` null and zero counts | the pool is already at its targets |
-| 503 `out_of_funds` | the reserve cannot fund one output |
-| 500 `internal_error` | the split is not confirmed within 180 seconds, or the provider fails. A submitted split may still land, and the next pool sync takes up its outputs. |
-
-The log line `Split submitted` carries the transaction id of a replenish.
+The log line `Split submitted` carries the transaction id of a replenish. A
+500 `internal_error` after that line does not mean the split failed. It may
+still land, and the next pool sync takes up its outputs.
 [monitoring.md](monitoring.md#the-audit-trail) says what the audit trail
 leaves out.
 
@@ -203,8 +183,11 @@ Changing `FEE_UTXO_LOVELACE` or `COLLATERAL_UTXO_LOVELACE` retires every pool
 UTxO of the old size on the next pool sync. A lease open on a retired fee
 UTxO is closed, and the client's next witness request on it is refused. A
 retired shared collateral is replaced by a collateral UTxO of the new size,
-once one exists. Each retirement is a `pool` `retired` audit entry and a
-`Pool UTxO retired` log line.
+once one exists. The former shared collateral is reserve, and a later
+replenish may spend it. A witnessed transaction that declares it and has not
+landed then fails in phase one, so the chain takes no collateral and the
+sponsor loses nothing. Each retirement is a `pool` `retired` audit entry and
+a `Pool UTxO retired` log line.
 
 A fee UTxO whose witnessed transaction has not landed is retired as well. A
 replenish may then spend it, which invalidates that transaction. To avoid
@@ -212,7 +195,9 @@ that:
 
 1. Wait until no fee mode witness is outstanding: the last `witness` `issued`
    entry with a `leaseId` is older than the hold time
-   [above](#restore-after-the-validity-lapses).
+   [above](#restore-after-the-validity-lapses). Wait as well until no
+   collateral mode witness is outstanding: the last `witness` `issued` entry
+   with `mode: collateral` is older than `COLLATERAL_VALIDITY_SECONDS`.
 2. Change the sizes and recreate the container, as
    [deployment.md](deployment.md#changing-the-configuration) describes.
 3. Replenish, so the pool holds UTxOs of the new sizes.
@@ -222,24 +207,6 @@ restore, puts UTxOs of the old size back into the pool.
 
 ## Inspecting the pool
 
-`GET /admin/pool` closes every lease past its expiry, then answers:
-
-```json
-{
-  "pool": { "fee": { "free": 5, "leased": 0 }, "collateral": { "shared": true, "spare": 1, "consumed": 0 } },
-  "reserve": { "utxos": 2, "lovelace": "812345678", "syncedAt": "2026-10-07T13:36:25.530Z" },
-  "leases": { "open": 0 },
-  "sharedCollateral": { "txHash": "1874...f2d0", "index": 1, "lovelace": 5000000, "chosenAt": "2026-10-07T12:00:00.000Z" },
-  "utxos": [
-    { "txHash": "4c08...31f2", "index": 1, "lovelace": 95485676, "kind": "fee", "status": "free", "discoveredAt": "2026-10-07T12:00:00.000Z" }
-  ]
-}
-```
-
-| Field | Meaning |
-| ----- | ------- |
-| `pool` | The counts `GET /health` reports. See [monitoring.md](monitoring.md#the-health-route). |
-| `reserve` | The reserve as of the last successful pool sync, and the time of that sync |
-| `leases.open` | The open leases |
-| `sharedCollateral` | The shared collateral and when it was designated, or null when none is designated and free |
-| `utxos` | Every free or leased pool UTxO |
+`GET /admin/pool` reports the pool, the reserve, the shared collateral and
+every free or leased pool UTxO, as
+[api.md](../integrators/api.md#get-adminpool) describes.

@@ -81,6 +81,12 @@ lease reserves one for a single client.
 A logic script hash listed in `KNOWN_LOGIC_HASHES`. The service refuses a
 transaction that names any other logic.
 
+### Lapsed witness
+
+A witness whose validity upper bound the current slot has passed by more than
+the [restore margin](#restore-margin). No block can include its transaction
+any more.
+
 ### Lease
 
 A client key's exclusive reservation of one fee UTxO for `LEASE_TTL_SECONDS`.
@@ -102,6 +108,12 @@ The ordered rules a transaction must pass before the service signs it. See
 
 The fee UTxOs and collateral UTxOs at the sponsor address that the service
 tracks. Each has a status: free, leased, consumed, gone or retired.
+
+### Pool size
+
+`FEE_UTXO_LOVELACE` or `COLLATERAL_UTXO_LOVELACE`. The pool sync classifies a
+UTxO that holds only lovelace, within a tenth of one of these sizes, as a fee
+UTxO or a collateral UTxO. Every other UTxO at the sponsor address is reserve.
 
 ### Pool sync
 
@@ -163,6 +175,16 @@ designates the oldest one when the shared collateral is consumed or retired.
 
 The base address of the sponsor wallet, with key hash payment and stake
 credentials. Fee UTxOs, collateral, change and collateral returns sit there.
+
+### Sponsor payment key
+
+The payment key of the sponsor wallet. Its hash is the payment credential of
+the sponsor address. Every witness is its signature.
+
+### Sponsor stake key
+
+The stake key of the sponsor wallet. Its hash is the stake credential of the
+sponsor address. No witness carries its signature.
 
 ### Sponsor UTxO
 

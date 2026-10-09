@@ -641,19 +641,11 @@ Response `200`:
 | `ts` | string | When the decision was made. |
 | `apiKeyId` | number | The key that asked. Absent for a decision no key asked for. |
 | `action` | string | `lease`, `witness`, `pool` or `key`. |
-| `outcome` | string | What was decided, listed below. |
+| `outcome` | string | What was decided. |
 | `detail` | object | Identifiers, amounts and reasons. Never a transaction body or a key. |
 
-| Action | Outcomes |
-| --- | --- |
-| `lease` | `created`, `released`, `expired`, `consumed`, `quota_exceeded`, `no_utxo_available`, `out_of_funds` |
-| `witness` | `issued`, `reissued`, the name of the policy rule that refused the transaction, `unknown_lease`, `lease_expired`, `lease_released`, `lease_consumed`, `quota_exceeded`, `no_utxo_available`, `out_of_funds` |
-| `pool` | `restored`, `retired`, `collateral_consumed` |
-| `key` | `disabled` |
-
-A `witness` entry names the lease, or carries `"mode": "collateral"`, and the
-transaction hash. An `issued` entry also carries `kind` (`creation` or
-`operation`), the sponsored lovelace and the fee.
+[monitoring.md](../operators/monitoring.md#the-audit-trail) lists every
+`action` with its outcomes and the fields of its `detail`.
 
 To page through the trail, pass the `ts` of the last entry received as the next
 `since`, and skip entries with an `id` already seen.
@@ -688,7 +680,7 @@ Request body, every field optional:
 | `feeUtxoLovelace` | integer, positive | The size of each fee output. Default `FEE_UTXO_LOVELACE`. |
 | `feeUtxoCount` | integer, 0 or more | Fee outputs to create. Default: enough to bring free and leased fee UTxOs up to `FEE_UTXO_COUNT`. |
 | `collateralLovelace` | integer, positive | The size of each collateral output. Default `COLLATERAL_UTXO_LOVELACE`. |
-| `collateralCount` | integer, 0 or more | Collateral outputs to create. Default: enough to bring free and leased collateral UTxOs up to `COLLATERAL_UTXO_COUNT`. |
+| `collateralCount` | integer, 0 or more | Collateral outputs to create. Default: enough to bring free collateral UTxOs up to `COLLATERAL_UTXO_COUNT`. |
 
 The reserve funds the outputs after keeping back 3 ADA for the fee and the
 change. Fee outputs come first, collateral outputs from what is left. The

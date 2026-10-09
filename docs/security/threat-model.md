@@ -232,14 +232,16 @@ shows. A witnessed fee UTxO stays out of the pool until every witness on it
 has lapsed, whether or not its transaction was rolled back. A consumed shared
 collateral is never designated again, even when a rollback brings it back. A
 replenish never spends the shared collateral, so a transaction signed against
-it stays valid for as long as its bound allows.
+it stays valid for as long as its bound allows. A pool size change is the
+exception, as [pool.md](../operators/pool.md#changing-the-pool-sizes) says.
 
 ## What the sponsor can lose
 
 - Per fee mode witness, always an account creation: at most
   `MAX_SPONSORED_LOVELACE`. At most `MAX_FEE_LOVELACE` of it is the fee. The
-  rest is the stake registration deposit and the control output's lovelace,
-  which end up with the account.
+  rest is the stake registration deposit, which the ledger holds against the
+  account's stake credential, and the control output's lovelace, which stays
+  in the account.
 - Per collateral mode witness: nothing.
 - Per client key and day: at most its `sponsoredLovelacePerDay`, however many
   requests are in flight.

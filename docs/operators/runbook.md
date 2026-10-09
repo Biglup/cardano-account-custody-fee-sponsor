@@ -25,10 +25,8 @@ curl --silent --request POST "$SPONSOR/admin/keys" \
   --data '{ "label": "my dapp", "quotas": { "witnessesPerHour": 30 } }'
 ```
 
-`label` is 1 to 100 characters. `quotas` is optional and may set any of
-`openLeases`, `witnessesPerHour` and `sponsoredLovelacePerDay` as positive
-integers. The rest take the [default quotas](../glossary.md#quota). The answer
-is 201 with `apiKey`, `id`, `label` and the effective `quotas`.
+[api.md](../integrators/api.md#post-adminkeys) gives the fields, the
+default quotas and the answer.
 
 The service shows `apiKey` once and stores only its SHA-256 hash. Hand it to
 the client over a channel fit for a secret. Size `witnessesPerHour` as
@@ -40,8 +38,8 @@ the client over a channel fit for a secret. Size `witnessesPerHour` as
 curl --silent --header "Authorization: Bearer $ADMIN_API_KEY" "$SPONSOR/admin/keys"
 ```
 
-The answer lists every key ever issued, oldest first, with `id`, `label`,
-`quotas`, `createdAt` and `disabledAt`, never the key or its hash.
+The answer lists every key ever issued, never the key or its hash.
+[api.md](../integrators/api.md#get-adminkeys) gives its fields.
 
 ### Change a key's quotas
 

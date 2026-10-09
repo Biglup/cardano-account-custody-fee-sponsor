@@ -67,8 +67,8 @@ new SponsorWallet(options: SponsorWalletOptions)
 | `fetch` | `typeof fetch` | no | The function the service is called with. Default `globalThis.fetch`. |
 | `now` | `() => Date` | no | The clock the lease expiry and the collateral validity bound are measured against. Default the system clock. |
 
-Constructing the adapter calls nothing. The first method that needs what the
-service grants takes it: a lease in fee mode, the shared collateral in
+Constructing the adapter calls nothing. The first method that needs something
+to build on fetches it: a lease in fee mode, the shared collateral in
 collateral mode.
 
 ## Properties
@@ -80,12 +80,12 @@ collateral mode.
 
 ## Wallet methods
 
-"Takes a grant" means the method takes a lease in fee mode, or reads
+"Fetches" means the method takes a lease in fee mode, or reads
 `GET /v1/collateral` in collateral mode, when the adapter holds none. Calls
-that start while a grant is being taken wait for that one. A wallet asked
+that start while a fetch is in flight wait for that one. A wallet asked
 several things at once on first use takes one lease, not one per call.
 
-| Method | Fee mode | Collateral mode | Takes a grant |
+| Method | Fee mode | Collateral mode | Fetches |
 | --- | --- | --- | --- |
 | `getAddress()` | The sponsor address | The sponsor address | Yes |
 | `getChangeAddress()` | The sponsor address | The sponsor address | Yes |
@@ -204,7 +204,7 @@ with:
   address;
 - the provider as the evaluator;
 - the validity upper bound at the time of the call plus `validitySeconds`,
-  less 60 seconds or less half of `validitySeconds`, whichever is smaller.
+  less the smaller of 60 seconds and half of `validitySeconds`.
 
 The change address is the caller's to set. Change to the sponsor is refused
 in this mode. The contract's builders set it to the account and add the
@@ -241,8 +241,8 @@ await wallet.release();
 
 Leaves the adapter holding nothing.
 
-- A grant request still in flight is awaited, and what it yields is given up
-  too.
+- A lease or collateral request still in flight is awaited, and what it
+  yields is given up too.
 - Fee mode: an open lease is released with `DELETE /v1/leases/:id`. A failed
   release throws a `SponsorError`. With no lease held, nothing is called.
 - Collateral mode: the shared collateral is forgotten. Nothing is called.

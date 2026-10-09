@@ -97,8 +97,8 @@ git -C ../cardano-account-custody-contract checkout 155b32b720ed3e34c183c323faea
 (cd ../cardano-account-custody-contract/offchain && npm ci && npm run build)
 ```
 
-When the sibling checkout is present, `test/plutus.test.ts` also checks that
-the shipped blueprint equals the sibling's.
+[docs/verification.md](docs/verification.md#the-test-suite) says what the
+tests check against the sibling checkout.
 
 ### Moving to another contract build
 

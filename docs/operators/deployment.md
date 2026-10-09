@@ -12,7 +12,7 @@ The image is `ghcr.io/biglup/cardano-account-custody-fee-sponsor`, built for
 
 | Property | Value |
 | -------- | ----- |
-| Base | Node 22 on Debian bookworm slim, pinned by digest. Dependabot proposes each bump as a pull request. |
+| Base | Node 22 on Debian bookworm slim, pinned by digest. |
 | Contents | The compiled service, its production dependencies, and the blueprint of the contract build it serves at `/app/contract/plutus.json` |
 | Process | `/usr/bin/tini -g -- node dist/main.js`, so tini is process 1 and forwards signals to node |
 | User | `nonroot`, uid and gid 60000 |

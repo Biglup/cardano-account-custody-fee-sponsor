@@ -1,7 +1,7 @@
 # Known issues
 
-Residual risks and limitations of the service as it stands. Each entry says
-what the limitation is, what it affects and how an operator lives with it.
+Residual risks and limitations of the service. Each entry says what the
+limitation is, what it affects and how an operator lives with it.
 [threat-model.md](threat-model.md) explains the defences these sit beside.
 
 The service has not had an external security audit.
@@ -19,9 +19,8 @@ every transaction of every account under that logic must draw it. The
 service then refuses all of them, creations and operations alike.
 
 The drawn lovelace enters the transaction and is not the sponsor's, so
-admitting it costs the sponsor nothing. The change is tracked as
-[issue 2](https://github.com/Biglup/cardano-account-custody-fee-sponsor/issues/2).
-Until it lands, accounts under an affected logic cannot use the service.
+admitting it costs the sponsor nothing. Accounts under an affected logic
+cannot use the service.
 
 ### A provider failure answers as a refusal
 
@@ -34,8 +33,7 @@ lists the answers.
 A refusal carries the rule name and a free text `detail`. The offending
 input, output, credential or amount is not a field of its own. The service
 also does not report its contract build, its known logic, or its caps beyond
-`maxSponsoredLovelace` in a lease answer. Both are tracked as
-[issue 3](https://github.com/Biglup/cardano-account-custody-fee-sponsor/issues/3).
+`maxSponsoredLovelace` in a lease answer.
 
 ## Trust and reach
 

@@ -57,7 +57,8 @@ operator issues the client keys.
 To run your own, the container image is
 `ghcr.io/biglup/cardano-account-custody-fee-sponsor`. Put the required
 variables of [docs/operators/configuration.md](docs/operators/configuration.md)
-in an environment file, then start the image:
+in an environment file, then start the image. For a first look, the newest
+build will do:
 
 ```sh
 docker run --detach --name sponsor \

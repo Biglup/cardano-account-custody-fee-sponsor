@@ -47,7 +47,9 @@ all: a client reads `GET /v1/collateral` and presents its transaction.
   that obtains a collateral mode witness and never submits ties up no UTxO.
 - The shared collateral must never be spent by anything else. The policy
   refuses it as a regular input ([POL-2](../policy.md#pol-2-sponsor-inputs)),
-  it is never leased, and a replenish never spends it.
+  it is never leased, and a replenish never spends it while it is designated.
+  A [pool size change](../operators/pool.md#changing-the-pool-sizes) retires
+  it, and a replenish may then spend it.
 - Should the reasoning fail, the loss is the shared collateral alone, at most
   the lovelace it holds, and it happens once. The pool sync marks it
   consumed, records it on the audit trail and designates a spare collateral

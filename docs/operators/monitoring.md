@@ -7,34 +7,13 @@ the audit trail. This document says what each carries and what to watch.
 ## The health route
 
 `GET /health` takes no key. It answers 200 with the network and the pool
-counts:
-
-```json
-{
-  "ok": true,
-  "network": "preprod",
-  "pool": {
-    "fee": { "free": 5, "leased": 0 },
-    "collateral": { "shared": true, "spare": 1, "consumed": 0 }
-  }
-}
-```
-
-| Field | Meaning |
-| ----- | ------- |
-| `pool.fee.free` | Fee UTxOs free to lease |
-| `pool.fee.leased` | Fee UTxOs held by open leases |
-| `pool.collateral.shared` | Whether a [shared collateral](../glossary.md#shared-collateral) is designated and free |
-| `pool.collateral.spare` | Free collateral UTxOs behind the shared one |
-| `pool.collateral.consumed` | Collateral UTxOs the chain took, over the life of the database |
-
-The counts come from the database, as of the last pool sync. A 200 means the
-process is up and reached the provider at startup. It does not mean the
+counts, as [api.md](../integrators/api.md#get-health) describes. A 200 means
+the process is up and reached the provider at startup. It does not mean the
 provider still answers.
 
 `GET /admin/pool` adds the reserve, the time of the last successful pool
-sync and every free or leased UTxO. [pool.md](pool.md#inspecting-the-pool)
-describes it.
+sync and every free or leased UTxO.
+[api.md](../integrators/api.md#get-adminpool) describes it.
 
 ## Logs
 
@@ -73,17 +52,9 @@ curl --silent --header "Authorization: Bearer $ADMIN_API_KEY" \
   'http://127.0.0.1:8787/admin/audit?since=2026-10-07T00:00:00Z&limit=1000'
 ```
 
-| Parameter | Meaning |
-| --------- | ------- |
-| `since` | An ISO 8601 time, with an offset or `Z`. Entries at or after it. From the start without it. |
-| `limit` | 1 to 1000 entries. 100 without it. |
-
-The answer is `{ "entries": [ ... ] }`, oldest first. Each entry carries
-`id`, `ts`, `apiKeyId` (absent when no key asked), `action`, `outcome` and
-`detail`. Any other query parameter answers 400 `invalid_request`.
-
-To page, pass the `ts` of the last entry as the next `since`, and drop the
-entries whose `id` you already hold. `since` is inclusive.
+[api.md](../integrators/api.md#get-adminaudit) gives the query parameters,
+the entry fields and how to page. Each entry's `action`, `outcome` and
+`detail` take these values:
 
 | `action` | `outcome` | `detail` |
 | -------- | --------- | -------- |
@@ -114,7 +85,7 @@ request is not either: it shows only as a 429 in the request log.
 | Shared collateral | `pool.collateral.shared` on `/health` | `true` | [Out of funds](runbook.md#out-of-funds) or [no UTxO available](runbook.md#no-utxo-available) |
 | Spare collateral | `pool.collateral.spare` on `/health` | 1 or more | Replenish, as [pool.md](pool.md#replenishing) describes |
 | Consumed collateral | `pool.collateral.consumed` on `/health`, `collateral_consumed` on the audit trail | 0, and never rising | [The shared collateral is consumed](runbook.md#the-shared-collateral-is-consumed) |
-| Reserve | `reserve.lovelace` on `/admin/pool` | Enough for the next replenish: the outputs it creates plus 3000000 lovelace | [Out of funds](runbook.md#out-of-funds) |
+| Reserve | `reserve.lovelace` on `/admin/pool` | Enough for the next replenish: the outputs it creates plus 3 ADA | [Out of funds](runbook.md#out-of-funds) |
 | Pool sync | `Pool sync failed` in the logs, `reserve.syncedAt` on `/admin/pool` | No failures, `syncedAt` under a minute old | [The provider is unreachable](runbook.md#the-provider-is-unreachable) |
 | Quota exhaustion | `quota_exceeded` on the audit trail, by `apiKeyId` and `quota` | Rare | [A client key misbehaves](runbook.md#a-client-key-misbehaves) |
 | Rate limiting | 429 answers in the request log | Rare | [A client key misbehaves](runbook.md#a-client-key-misbehaves) |
