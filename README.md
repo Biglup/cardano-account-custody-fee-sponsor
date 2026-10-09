@@ -137,7 +137,9 @@ Answers every route can give:
 - 413 `payload_too_large`: the body is over 64 KiB.
 - 429 `rate_limited`: the address or the key made its requests for the
   minute; see Quotas and rate limits.
-- 404 `not_found`: no route matches.
+- 404 `not_found`: no route matches. Under `/v1/leases`,
+  `/v1/collateral` and `/admin` the key is checked first, so an
+  unmatched path there answers 401 without a valid key.
 - 500 `internal_error`: an error the service did not anticipate. The
   body carries nothing else.
 
@@ -317,7 +319,8 @@ keeps the time it was first disabled at.
 Closes any lease past its expiry, then answers 200 with the pool counts
 as `/health` reports them, the reserve as of the last sync, the number
 of open leases, the shared collateral UTxO with the time it was chosen,
-or `null` when none is designated, and every free or leased UTxO:
+or `null` when none is designated or the designated UTxO is no longer
+free, and every free or leased UTxO:
 
 ```json
 {
@@ -667,16 +670,17 @@ Requires Node 22.
    it. The blueprint must be the build `ACCOUNT_SCRIPT_HASH` names, and
    the service refuses to start on one whose account proxy hashes to
    anything else, since the stake validator of another build would
-   admit creations the configured proxy does not govern. The `file:`
-   dependency and the continuous integration workflow are pinned to
-   contract commit `155b32b720ed3e34c183c323faea48f12ddaf510`, the one
-   whose builders the preprod proof builds on and whose blueprint
-   `contract/plutus.json` is a copy of, which the workflow compares byte
-   for byte against the pinned checkout; `package-lock.json` must be
-   regenerated whenever the contract's off-chain package changes its
-   dependencies. The pinned commit is revision 3 of the validators, and
-   its blueprint holds the three a network deploys and nothing else: a
-   permanent account proxy at hash
+   admit creations the configured proxy does not govern. The continuous
+   integration workflow pins contract commit
+   `155b32b720ed3e34c183c323faea48f12ddaf510`. The workflow checks out
+   that commit as the sibling checkout and builds its off-chain library
+   there, so continuous integration runs against the pinned builders,
+   and it compares `contract/plutus.json` with that commit's blueprint
+   byte for byte. Locally the `file:` dependency links the sibling
+   checkout as it stands. `package-lock.json` must be regenerated whenever the
+   contract's off-chain package changes its dependencies. The pinned
+   blueprint holds the three validators a network deploys and nothing
+   else: a permanent account proxy at hash
    `ed61963ac94d12c0b320be5a336c36af66bc02c380e0aa3001899253`, which is
    what `ACCOUNT_SCRIPT_HASH` must name, the account's rules in a
    replaceable logic script, which applied to that proxy hashes to
@@ -769,9 +773,9 @@ named `ghcr.io/biglup/cardano-account-custody-fee-sponsor-dev`, so it
 can never overwrite the production image name; nothing under that name
 is for deployment.
 
-The image is about 340 MB on disk and holds Node 22, the compiled
-service, its production dependencies and the blueprint of the contract
-build it serves at `/app/contract/plutus.json`, which `BLUEPRINT_PATH`
+The image holds Node 22, the compiled service, its production
+dependencies and the blueprint of the contract build it serves at
+`/app/contract/plutus.json`, which `BLUEPRINT_PATH`
 defaults to. Its base image, Node 22 on Debian bookworm slim, is pinned
 by digest and updated through dependabot, so a bump is a reviewed
 change. It runs `node dist/main.js` under `tini` as the
@@ -988,25 +992,30 @@ does for the preprod proof.
 
 ## Preprod proof
 
-[docs/preprod-evidence.md](docs/preprod-evidence.md) records a full run
-on preprod: a sponsored creation in fee mode for an owner holding no
-ADA, a deposit and a reserve deposit, then in collateral mode with the
-account paying its fees an owner spend paid from the reserve, a grant
-issued into its own grant UTxO, an agent spend that references the
-control UTxO, the grant's revocation and the sweep of the dead grant
-UTxO, an agent spend over the remaining cap refused under `evaluates`,
-a creation paying sponsor value to a third party refused under
-`sponsor_outflow_bounded`, and the reuse of a consumed lease refused as
-`lease_consumed`, with every transaction, who paid what and every
-refusal body.
+[docs/preprod-hosted-evidence.md](docs/preprod-hosted-evidence.md) is
+the current proof. It records the deployed instance at
+`https://sponsor-preprod.lw.iog.io` driven as a client would drive it,
+with a client key and no admin route. It holds a sponsored creation in
+fee mode for an owner holding no ADA, then a deposit and a reserve
+deposit. Five operations in collateral mode follow, with the account
+paying its fees: an owner spend paid from the reserve, a grant issued
+into its own grant UTxO, an agent spend that references the control
+UTxO, the grant's revocation and the sweep of the dead grant UTxO. It
+also holds three refusals: an agent spend over the remaining cap under
+`evaluates`, a creation paying sponsor value to a third party under
+`sponsor_outflow_bounded`, and a second witness on a consumed lease as
+`lease_consumed`. It lists every transaction, who paid what and every
+refusal body, with the proxy hash, the logic every transaction withdrew
+zero from and the parked reference scripts it referenced.
 
-The recorded run predates revision 3 of the contract, so the document
-describes the single account validator that revision replaced with the
-proxy and its logic; a rerun records the proxy hash, the logic every
-transaction withdrew zero from and whether the network's parked
-reference scripts were referenced.
+[docs/preprod-evidence.md](docs/preprod-evidence.md) is an earlier run
+against a previous build of the contract. That build has a single
+account validator in place of the proxy and its logic. The run has no
+reserve deposit, no owner spend from a reserve, no grant in its own UTxO
+and no sweep.
 
-`npm run preprod-e2e` reruns it and rewrites the document. It spends
+`npm run preprod-e2e` runs the proof against a service it starts
+itself and rewrites `docs/preprod-evidence.md`. It spends
 test ADA from the sponsor wallet: it starts the service in this process
 from `.env` on a free local port, issues a client key, replenishes with
 5 fee UTxOs and up to 2 collateral UTxOs when fewer than 3 fee UTxOs are
@@ -1039,7 +1048,7 @@ collateral answers rather than from its own configuration, and refuses
 one that is the funding wallet's or one of its fresh wallets. Every
 other step and check is the same: the fresh owner, agent and recipient
 wallets of `SPONSOR_MNEMONIC`, the deposit from the funding wallet,
-account 0 of that mnemonic, the six collateral mode operations, the
+account 0 of that mnemonic, the five collateral mode operations, the
 over cap spend refused under `evaluates` and the leaking creation
 refused by the hosted service's policy. The run still reads the chain
 itself and needs `SPONSOR_MNEMONIC`, `ACCOUNT_SCRIPT_HASH` and
