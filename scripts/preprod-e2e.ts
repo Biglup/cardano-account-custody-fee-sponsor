@@ -33,19 +33,26 @@ import { config as loadEnvFile } from 'dotenv';
 import { type CollateralBody, type LeaseBody, SponsorError, SponsorWallet, type SponsorWalletOptions } from '../src/index.js';
 import { presetCollateralBound } from '../src/client/sponsor-wallet.js';
 import { Cometa } from '../src/cometa.js';
-import { type Config, loadConfig } from '../src/config.js';
+import { type ClientConfig, type Config, loadProofTarget } from '../src/config.js';
 import type { RecordedAuditEntry } from '../src/audit.js';
 import type { PoolCounts } from '../src/http/health.js';
 import { createLogger } from '../src/logger.js';
+import type { PoolSizes } from '../src/pool/sizes.js';
+import { classifyUtxo } from '../src/pool/sync.js';
 import { type ParsedOutput, type ParsedTransaction, parseTransaction } from '../src/policy/parse.js';
 import { createProvider } from '../src/provider.js';
 import { createService } from '../src/service.js';
 import { type SlotSettings, slotAt } from '../src/slots.js';
 
-/** The repository root, where the environment file and the evidence document live. */
+/** The repository root, where the environment file and the evidence documents live. */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const ENV_PATH = resolve(REPO_ROOT, '.env');
-const EVIDENCE_PATH = resolve(REPO_ROOT, 'docs', 'preprod-evidence.md');
+
+/** Where each kind of run writes its evidence, so that a run against a hosted service never overwrites the record of a local one. */
+const EVIDENCE_PATHS = {
+  local: resolve(REPO_ROOT, 'docs', 'preprod-evidence.md'),
+  hosted: resolve(REPO_ROOT, 'docs', 'preprod-hosted-evidence.md'),
+};
 
 /** The Blockfrost preprod endpoint, queried directly for what the provider does not expose: reward account status. */
 const BLOCKFROST_URL = 'https://cardano-preprod.blockfrost.io/api/v0';
@@ -66,6 +73,13 @@ const FRESH_ACCOUNT_CANDIDATES = 50;
 const MINIMUM_FREE_FEE_UTXOS = 3;
 const REPLENISH_FEE_UTXOS = 5;
 const REPLENISH_COLLATERAL_UTXOS = 2;
+
+/**
+ * The fewest free fee UTxOs a hosted service must report for the run to
+ * start, since a client cannot replenish it: one for the creation and
+ * one for the refused creation.
+ */
+const HOSTED_MINIMUM_FREE_FEE_UTXOS = 2;
 
 /** The lovelace in one tADA. */
 const TADA = 1_000_000n;
@@ -150,11 +164,11 @@ const walletOf = (provider: Provider, mnemonics: string[], account: number): Pro
     credentialsConfig: { account, paymentIndex: 0, stakingIndex: 0 },
   });
 
-/** The service configuration with the project id the proof's own queries of the hosted endpoint need. */
-type ProofConfig = Config & { blockfrostProjectId: string };
+/** The client configuration with the project id the proof's own queries of the hosted endpoint need. */
+type ProofConfig = ClientConfig & { blockfrostProjectId: string };
 
 /** Whether the configuration carries a project id; the proof queries the hosted endpoint directly and cannot run without one. */
-const hasProjectId = (config: Config): config is ProofConfig => config.blockfrostProjectId !== undefined;
+const hasProjectId = (config: ClientConfig): config is ProofConfig => config.blockfrostProjectId !== undefined;
 
 /** Blockfrost's answer to a query, or undefined when the resource does not exist. */
 const blockfrost = async <T>(projectId: string, path: string): Promise<T | undefined> => {
@@ -276,6 +290,142 @@ interface ReplenishBody {
   collateralOutputs: number;
   reserveLovelace: string;
 }
+
+/** What `GET /health` answers. */
+interface HealthBody {
+  ok: boolean;
+  network: string;
+  pool: PoolCounts;
+}
+
+/** Which service a run proved, as the evidence names it: one this process started, or a running one at its base URL. */
+type ServiceTarget = { mode: 'local' } | { mode: 'hosted'; baseUrl: string };
+
+/**
+ * The service a run proves, reached at `baseUrl` with the client key
+ * `apiKey`. Everything the run does differently for a service it started
+ * and acts as the operator of, and for a running one it is only a client
+ * of, goes through here.
+ */
+interface ProvenService {
+  target: ServiceTarget;
+  baseUrl: string;
+  apiKey: string;
+  /** The pool as the run can read it: through the admin route for a service it started, through `GET /health` for a running one. */
+  pool(): Promise<PoolCounts>;
+  /** Makes sure the pool can serve the run, replenishing a service it started when it is short; the replenishment, when one was made. */
+  ready(pool: PoolCounts): Promise<ReplenishBody | undefined>;
+  /** Why the sponsor address the service reported cannot be the one the run expects, or undefined when it can. */
+  sponsorConflict(sponsorAddress: string): string | undefined;
+  /** The funding wallet UTxOs the deposit may spend without touching a pool UTxO. */
+  depositUtxos(): Promise<UTxO[]>;
+  /** The witnesses the audit trail records as issued, or undefined when the run cannot read the trail. */
+  issuedWitnesses(): Promise<RecordedAuditEntry[] | undefined>;
+  stop(): Promise<void>;
+}
+
+/**
+ * Starts the service in this process and acts as its operator: issues
+ * the run a client key, reads the pool through the admin route,
+ * replenishes it when it is short and reads the audit trail. The deposit
+ * draws on the sponsor's reserve, since the funding wallet is the
+ * sponsor wallet.
+ */
+const startLocal = async (config: Config, provider: Provider): Promise<ProvenService> => {
+  const running = await startService(config, provider);
+  console.log(`Service listening at ${running.baseUrl}, sponsor address ${running.sponsorAddress}`);
+  const admin = <T>(method: 'GET' | 'POST', path: string, body?: unknown): Promise<Answer<T>> => call<T>(running.baseUrl, config.adminApiKey, method, path, body);
+  try {
+    const issued = await admin<{ apiKey: string }>('POST', '/admin/keys', { label: 'preprod proof' });
+    if (issued.status !== 201) {
+      throw new Error(`Issuing a client key answered ${issued.status}`);
+    }
+    return {
+      target: { mode: 'local' },
+      baseUrl: running.baseUrl,
+      apiKey: issued.body.apiKey,
+      pool: async () => (await admin<PoolBody>('GET', '/admin/pool')).body.pool,
+      ready: async (pool) => {
+        if (pool.fee.free >= MINIMUM_FREE_FEE_UTXOS && pool.collateral.shared) {
+          return undefined;
+        }
+        const collateralWanted = Math.max(0, REPLENISH_COLLATERAL_UTXOS - collateralCount(pool));
+        console.log(`Replenishing the pool with ${REPLENISH_FEE_UTXOS} fee and ${collateralWanted} collateral UTxOs; this waits for confirmation`);
+        const answer = await admin<ReplenishBody>('POST', '/admin/pool/replenish', { feeUtxoCount: REPLENISH_FEE_UTXOS, collateralCount: collateralWanted });
+        if (answer.status !== 200 || answer.body.txId === null) {
+          throw new Error(`Replenishing answered ${answer.status}: ${JSON.stringify(answer.body)}`);
+        }
+        console.log(`Replenished: ${answer.body.txId}`);
+        return answer.body;
+      },
+      sponsorConflict: (sponsorAddress) =>
+        sponsorAddress === running.sponsorAddress ? undefined : `The service reported sponsor address ${sponsorAddress} where it derived ${running.sponsorAddress}`,
+      depositUtxos: () => Promise.resolve(running.reserveUtxos()),
+      issuedWitnesses: async () => {
+        const audit = await admin<{ entries: RecordedAuditEntry[] }>('GET', '/admin/audit?limit=1000');
+        return audit.body.entries.filter((entry) => entry.action === 'witness' && entry.outcome === 'issued');
+      },
+      stop: () => running.stop(),
+    };
+  } catch (err) {
+    await running.stop();
+    throw err;
+  }
+};
+
+/**
+ * Whether a UTxO lies outside the pool sizes, as the deposit's inputs
+ * must: the funding wallet is the sponsor wallet of the local
+ * configuration, whose fee and collateral UTxOs belong to that
+ * deployment's pool whether or not a service of it is running.
+ */
+const outsidePoolSizes =
+  (sizes: PoolSizes) =>
+  (utxo: UTxO): boolean =>
+    Object.keys(utxo.output.value.assets ?? {}).length > 0 || classifyUtxo(utxo.output.value.coins, sizes) === 'reserve';
+
+/**
+ * Reaches a running service as a client only: with the client key its
+ * operator issued, the pool read from `GET /health`, which answers
+ * without a key, and no admin route at all, so the pool is never
+ * replenished and the audit trail never read. The service's sponsor
+ * wallet is its own, so the sponsor address it reports must not be the
+ * funding wallet's, and the deposit draws on the funding wallet's UTxOs
+ * outside the pool sizes.
+ */
+const reachHosted = async (baseUrl: string, apiKey: string, config: ClientConfig, funding: Wallet): Promise<ProvenService> => {
+  const fundingAddress = (await funding.getChangeAddress()).toString();
+  console.log(`Service at ${baseUrl}, reached with the configured client key`);
+  return {
+    target: { mode: 'hosted', baseUrl },
+    baseUrl,
+    apiKey,
+    pool: async () => {
+      const response = await fetch(`${baseUrl}/health`);
+      if (!response.ok) {
+        throw new Error(`GET /health answered ${response.status}`);
+      }
+      const health = (await response.json()) as HealthBody;
+      if (health.network !== config.network) {
+        throw new Error(`The service serves ${health.network}, not ${config.network}`);
+      }
+      return health.pool;
+    },
+    ready: (pool) => {
+      if (pool.fee.free < HOSTED_MINIMUM_FREE_FEE_UTXOS || !pool.collateral.shared) {
+        throw new Error(
+          `The service reports ${pool.fee.free} free fee UTxOs and ${collateralSummary(pool)}; the run needs ${HOSTED_MINIMUM_FREE_FEE_UTXOS} and a shared collateral, which only its operator can replenish`,
+        );
+      }
+      return Promise.resolve(undefined);
+    },
+    sponsorConflict: (sponsorAddress) =>
+      sponsorAddress === fundingAddress ? `The service reported the funding wallet's address ${sponsorAddress} as its sponsor address; a hosted service must hold a wallet of its own` : undefined,
+    depositUtxos: async () => (await funding.getUnspentOutputs()).filter(outsidePoolSizes(config)),
+    issuedWitnesses: () => Promise.resolve(undefined),
+    stop: () => Promise.resolve(),
+  };
+};
 
 /** A wallet of the run at an account index of the sponsor mnemonic, holding nothing, with the account its key would own. */
 interface FreshWallet {
@@ -522,9 +672,17 @@ interface Operation {
   grants: GrantUtxo[];
 }
 
+/** What the audit trail records of the run's witnesses, for a service the run can read the trail of. */
+interface AuditEvidence {
+  creation: RecordedAuditEntry | undefined;
+  collateral: RecordedAuditEntry[];
+}
+
 /** Everything the evidence document reports. */
 interface Evidence {
   ranAt: string;
+  target: ServiceTarget;
+  /** The sponsor address the service reported in its lease and collateral answers. */
   sponsorAddress: string;
   accountScriptHash: string;
   logicHash: string;
@@ -540,7 +698,8 @@ interface Evidence {
   creation: CreationAmounts;
   controlUtxo: UTxO;
   changeUtxo: UTxO;
-  creationAudit: RecordedAuditEntry | undefined;
+  /** What the audit trail records, or undefined for a hosted service, whose trail only its operator reads. */
+  audit: AuditEvidence | undefined;
   depositTxId: string;
   depositFee: bigint;
   ownerSpend: Operation;
@@ -553,7 +712,6 @@ interface Evidence {
   swept: Operation;
   leakingTxHash: string;
   creationRefusals: Refusal[];
-  collateralAudit: RecordedAuditEntry[];
 }
 
 /** The lines of a refusal as the document quotes it: its description, the status and the body as JSON. */
@@ -593,17 +751,33 @@ const operationLines = (operation: Operation, signer: string, bound: string): st
   ];
 };
 
+/** The lines that say which service a run proved and how the run reached it, for the setup of the document. */
+const serviceLines = (target: ServiceTarget): string[] =>
+  target.mode === 'local'
+    ? ["- Service: started in the proof's own process against preprod from the local configuration, with a client key issued through the admin route"]
+    : [
+        `- Service: the hosted instance at ${target.baseUrl}, reached with a client key its operator issued; no admin route was called`,
+        "- Pool readings: `GET /health`, which answers without a key; the pool is the operator's to replenish and the audit trail the operator's to read",
+      ];
+
 /** The evidence document. */
 const evidenceDocument = (evidence: Evidence): string => {
-  const { owner, agent, recipient, lease, creation, grant } = evidence;
+  const { owner, agent, recipient, lease, creation, grant, target } = evidence;
   const issued = evidence.grantIssued.grants.find((candidate) => candidate.prefix.slot === GRANT_SLOT);
   const remainingCap = evidence.agentSpend.grants.find((candidate) => candidate.prefix.slot === GRANT_SLOT)?.grant?.scope.cap;
+  const local = target.mode === 'local';
+  const mnemonic = local ? 'the sponsor mnemonic' : 'the funding mnemonic';
+  const poolSource = local ? 'as the admin route reported it' : 'as `GET /health` reported it';
   const lines = [
-    '# Preprod evidence',
+    local ? '# Preprod evidence' : '# Preprod evidence, hosted service',
     '',
-    `A custody account taken through its life on preprod on ${evidence.ranAt} with the fee sponsor service as the only source of`,
-    'sponsor funds and collateral. The service ran against preprod with its funding wallet, a client key was issued through',
-    "the admin route, and every transaction was built through the contract's own builders with the sponsor wallet adapter:",
+    local
+      ? `A custody account taken through its life on preprod on ${evidence.ranAt} with the fee sponsor service as the only source of`
+      : `A custody account taken through its life on preprod on ${evidence.ranAt} with the hosted fee sponsor service at ${target.baseUrl} as the only source of`,
+    ...(local
+      ? ['sponsor funds and collateral. The service ran against preprod with its funding wallet, a client key was issued through', 'the admin route,']
+      : ['sponsor funds and collateral. The service ran elsewhere with a sponsor wallet of its own, the run reached it with a client', 'key its operator issued and called no admin route,']),
+    "and every transaction was built through the contract's own builders with the sponsor wallet adapter:",
     'in fee mode as the `sponsor` of the creation, where the service paid the fee, the registration deposit and the control',
     'UTxO for an owner wallet that holds no ADA, and in collateral mode as the `collateral` wallet of every later operation,',
     'where the account paid its own fee, the owner operations from a reserve UTxO the owner alone can spend and the agent',
@@ -613,22 +787,25 @@ const evidenceDocument = (evidence: Evidence): string => {
     '',
     '## Setup',
     '',
-    `- Sponsor address: \`${evidence.sponsorAddress}\``,
+    ...serviceLines(target),
+    `- Sponsor address, as the service reported it in its lease and collateral answers: \`${evidence.sponsorAddress}\``,
     `- Account proxy hash: \`${evidence.accountScriptHash}\``,
     `- Logic script hash: \`${evidence.logicHash}\`, which every transaction but a plain deposit ran through a withdrawal of zero`,
     evidence.network.references.length === 0
       ? '- Reference scripts: none recorded for the network, so every transaction carried the scripts it ran'
       : `- Reference scripts: ${evidence.network.references.length} parked on the network and referenced rather than carried`,
-    `- Pool before the run: ${evidence.poolBefore.fee.free} free fee UTxOs, ${collateralSummary(evidence.poolBefore)}`,
+    `- Pool before the run, ${poolSource}: ${evidence.poolBefore.fee.free} free fee UTxOs, ${evidence.poolBefore.fee.leased} leased, ${collateralSummary(evidence.poolBefore)}`,
     evidence.replenish?.txId
       ? `- Replenished with ${evidence.replenish.feeOutputs} fee and ${evidence.replenish.collateralOutputs} collateral UTxOs: ${link(evidence.replenish.txId)}`
-      : '- No replenishment was needed',
-    `- Pool after the run: ${evidence.poolAfter.fee.free} free fee UTxOs, ${collateralSummary(evidence.poolAfter)}`,
-    `- Owner wallet: account index ${owner.index} of the sponsor mnemonic, address \`${owner.address}\`, holding no ADA`,
+      : local
+        ? '- No replenishment was needed'
+        : '- No replenishment: a client of the service cannot replenish it',
+    `- Pool after the run, ${poolSource}: ${evidence.poolAfter.fee.free} free fee UTxOs, ${evidence.poolAfter.fee.leased} leased, ${collateralSummary(evidence.poolAfter)}`,
+    `- Owner wallet: account index ${owner.index} of ${mnemonic}, address \`${owner.address}\`, holding no ADA`,
     `- Owner key hash: \`${owner.keyHash}\``,
-    `- Agent wallet: account index ${agent.index} of the sponsor mnemonic, address \`${agent.address}\`, holding no ADA`,
+    `- Agent wallet: account index ${agent.index} of ${mnemonic}, address \`${agent.address}\`, holding no ADA`,
     `- Agent key hash: \`${agent.keyHash}\``,
-    `- Recipient address: account index ${recipient.index} of the sponsor mnemonic, \`${recipient.address}\`, the third party the account pays`,
+    `- Recipient address: account index ${recipient.index} of ${mnemonic}, \`${recipient.address}\`, the third party the account pays`,
     `- Account address: \`${owner.account.address}\``,
     `- Stake credential: \`${owner.account.stakeScriptHash}\`, reward address \`${owner.account.rewardAddress}\``,
     `- State NFT: \`${owner.account.stateNftAssetId}\``,
@@ -656,15 +833,19 @@ const evidenceDocument = (evidence: Evidence): string => {
     `- The control UTxO \`${ref(evidence.controlUtxo)}\` sits at the account address holding ${ada(evidence.controlUtxo.output.value.coins)} and the state NFT`,
     '- The stake credential is registered: Blockfrost lists the reward address as registered, active from the next epoch',
     `- The sponsor change UTxO \`${ref(evidence.changeUtxo)}\` holds ${ada(evidence.changeUtxo.output.value.coins)}`,
-    evidence.creationAudit
-      ? `- The audit trail records the witness as issued: \`${JSON.stringify(evidence.creationAudit.detail)}\``
-      : '- The audit trail entry for the witness was not found',
+    evidence.audit === undefined
+      ? "- The audit trail is the operator's to read and was not read"
+      : evidence.audit.creation
+        ? `- The audit trail records the witness as issued: \`${JSON.stringify(evidence.audit.creation.detail)}\``
+        : '- The audit trail entry for the witness was not found',
     '',
     '## 2. Deposit and reserve',
     '',
     `- Transaction: ${link(evidence.depositTxId)}, a plain transfer of ${ada(DEPOSIT_LOVELACE)} to the account address and a deposit of`,
     `  ${ada(RESERVE_LOVELACE)} under the reserve datum, which the owner alone can spend`,
-    `- Paid by the funding wallet, which is the sponsor wallet spending from its reserve outside the service, with a fee of ${ada(evidence.depositFee)};`,
+    local
+      ? `- Paid by the funding wallet, which is the sponsor wallet spending from its reserve outside the service, with a fee of ${ada(evidence.depositFee)};`
+      : `- Paid by the funding wallet, account 0 of ${mnemonic}, from its UTxOs outside the pool sizes, with a fee of ${ada(evidence.depositFee)};`,
     '  the service was not involved and no pool UTxO was touched',
     '',
     '## 3. Owner spend from the reserve, collateral mode',
@@ -736,21 +917,29 @@ const evidenceDocument = (evidence: Evidence): string => {
     '',
     '## Audit trail of the collateral mode witnesses',
     '',
-    ...(evidence.collateralAudit.length === 0
-      ? ['No collateral mode witness entry was found.']
-      : evidence.collateralAudit.map((entry) => `- \`${JSON.stringify(entry.detail)}\``)),
+    ...(evidence.audit === undefined
+      ? ["The audit trail of a hosted service is read through the admin route, which is its operator's; this run did not read it."]
+      : evidence.audit.collateral.length === 0
+        ? ['No collateral mode witness entry was found.']
+        : evidence.audit.collateral.map((entry) => `- \`${JSON.stringify(entry.detail)}\``)),
     '',
   ];
   return `${lines.join('\n')}\n`;
 };
 
-/** Runs the proof against preprod and writes the evidence document. */
+/**
+ * Runs the proof against preprod, against a service of its own or a
+ * hosted one as the configuration says, and writes the evidence document
+ * of that kind of run.
+ */
 const main = async (): Promise<void> => {
   loadEnvFile({ path: ENV_PATH, quiet: true });
-  const config = loadConfig();
+  const target = loadProofTarget();
+  const config: ClientConfig = target.config;
   delete process.env.SPONSOR_MNEMONIC;
   delete process.env.BLOCKFROST_PREPROD_PROJECT_ID;
   delete process.env.ADMIN_API_KEY;
+  delete process.env.SPONSOR_SERVICE_API_KEY;
   if (!hasProjectId(config)) {
     throw new Error('The proof queries the hosted endpoint directly and needs BLOCKFROST_PREPROD_PROJECT_ID');
   }
@@ -779,42 +968,33 @@ const main = async (): Promise<void> => {
   console.log(`Recipient: account index ${recipient.index} of the mnemonic, ${recipient.address}`);
   console.log(`Account address: ${owner.account.address}`);
 
-  const running = await startService(config, provider);
-  console.log(`Service listening at ${running.baseUrl}, sponsor address ${running.sponsorAddress}`);
+  const service = target.mode === 'local' ? await startLocal(target.config, provider) : await reachHosted(target.baseUrl, target.apiKey, config, funding);
+  const { baseUrl, apiKey } = service;
   const attempted: { hash: string; role: string }[] = [];
   try {
-    const issued = await call<{ apiKey: string }>(running.baseUrl, config.adminApiKey, 'POST', '/admin/keys', { label: 'preprod proof' });
-    if (issued.status !== 201) {
-      throw new Error(`Issuing a client key answered ${issued.status}`);
-    }
-    const apiKey = issued.body.apiKey;
-
-    const before = await call<PoolBody>(running.baseUrl, config.adminApiKey, 'GET', '/admin/pool');
-    console.log(`Pool: ${before.body.pool.fee.free} free fee UTxOs, ${collateralSummary(before.body.pool)}, reserve ${before.body.reserve.lovelace} lovelace`);
-    let replenish: ReplenishBody | undefined;
-    if (before.body.pool.fee.free < MINIMUM_FREE_FEE_UTXOS || !before.body.pool.collateral.shared) {
-      const collateralWanted = Math.max(0, REPLENISH_COLLATERAL_UTXOS - collateralCount(before.body.pool));
-      console.log(`Replenishing the pool with ${REPLENISH_FEE_UTXOS} fee and ${collateralWanted} collateral UTxOs; this waits for confirmation`);
-      const answer = await call<ReplenishBody>(running.baseUrl, config.adminApiKey, 'POST', '/admin/pool/replenish', {
-        feeUtxoCount: REPLENISH_FEE_UTXOS,
-        collateralCount: collateralWanted,
-      });
-      if (answer.status !== 200 || answer.body.txId === null) {
-        throw new Error(`Replenishing answered ${answer.status}: ${JSON.stringify(answer.body)}`);
-      }
-      replenish = answer.body;
-      attempted.push({ hash: answer.body.txId, role: 'pool replenishment' });
-      console.log(`Replenished: ${answer.body.txId}`);
+    const poolBefore = await service.pool();
+    console.log(`Pool: ${poolBefore.fee.free} free fee UTxOs, ${poolBefore.fee.leased} leased, ${collateralSummary(poolBefore)}`);
+    const replenish = await service.ready(poolBefore);
+    if (replenish?.txId) {
+      attempted.push({ hash: replenish.txId, role: 'pool replenishment' });
     }
 
     console.log('Step 1: sponsored account creation in fee mode');
-    const sponsor = new SponsorWallet({ baseUrl: running.baseUrl, apiKey, provider });
+    const sponsor = new SponsorWallet({ baseUrl, apiKey, provider });
     const creationTx = await createAccount({ owner: owner.keyHash, wallet: owner.wallet, sponsor, provider, network, state: initialState(owner.keyHash, logic) });
     const lease = sponsor.lease;
     if (lease === undefined) {
       throw new Error('The sponsor wallet holds no lease after building');
     }
-    console.log(`  built on lease ${lease.leaseId}, fee UTxO ${lease.fee.txHash}#${lease.fee.index}`);
+    const { sponsorAddress } = lease;
+    const ownWallet = [owner, agent, recipient].find((wallet) => wallet.address === sponsorAddress);
+    const conflict =
+      ownWallet === undefined ? service.sponsorConflict(sponsorAddress) : `The service reported sponsor address ${sponsorAddress}, which is the run's own wallet at account index ${ownWallet.index}`;
+    if (conflict !== undefined) {
+      await sponsor.release();
+      throw new Error(conflict);
+    }
+    console.log(`  built on lease ${lease.leaseId}, fee UTxO ${lease.fee.txHash}#${lease.fee.index}, sponsor address ${sponsorAddress}`);
     const creation = creationAmounts(parsed(creationTx), lease, owner, config.slots);
     attempted.push({ hash: parsed(creationTx).hash, role: 'sponsored account creation' });
     const creationTxId = await submit(provider, [sponsor, owner.wallet], creationTx);
@@ -828,7 +1008,7 @@ const main = async (): Promise<void> => {
     });
     let changeUtxo: UTxO | undefined;
     await waitUntil('the sponsor change UTxO', async () => {
-      const utxos = await provider.getUnspentOutputs(running.sponsorAddress);
+      const utxos = await provider.getUnspentOutputs(sponsorAddress);
       changeUtxo = utxos.find((utxo) => utxo.input.txId === creationTxId && utxo.output.value.coins === creation.change);
       return changeUtxo !== undefined;
     });
@@ -838,8 +1018,8 @@ const main = async (): Promise<void> => {
     }
     console.log(`  on chain: control UTxO ${ref(controlUtxo)}, sponsor change ${ref(changeUtxo)}, stake credential registered`);
 
-    console.log(`Step 2: deposit of ${DEPOSIT_LOVELACE} lovelace and a reserve of ${RESERVE_LOVELACE} lovelace from the funding wallet's reserve`);
-    const reserve = running.reserveUtxos();
+    console.log(`Step 2: deposit of ${DEPOSIT_LOVELACE} lovelace and a reserve of ${RESERVE_LOVELACE} lovelace from the funding wallet outside the pool`);
+    const reserve = await service.depositUtxos();
     const depositTx = await (await funding.createTransactionBuilder())
       .setUtxos(reserve)
       .sendLovelace({ address: owner.account.address, amount: DEPOSIT_LOVELACE })
@@ -857,7 +1037,7 @@ const main = async (): Promise<void> => {
     await settle(provider, depositTxId, depositParsed);
 
     const clock = { now: new Date() };
-    const collateral = new SponsorWallet({ baseUrl: running.baseUrl, apiKey, provider, mode: 'collateral', now: () => clock.now });
+    const collateral = new SponsorWallet({ baseUrl, apiKey, provider, mode: 'collateral', now: () => clock.now });
     const presetBound = (shared: CollateralBody): bigint => slotAt(config.slots, presetCollateralBound(shared, clock.now));
     const operate = async (
       role: string,
@@ -873,6 +1053,9 @@ const main = async (): Promise<void> => {
       const shared = collateral.collateral;
       if (shared === undefined) {
         throw new Error('The collateral wallet holds no shared collateral after building');
+      }
+      if (shared.sponsorAddress !== sponsorAddress) {
+        throw new Error(`The collateral answer names sponsor address ${shared.sponsorAddress} where the lease named ${sponsorAddress}`);
       }
       const amounts = operationAmounts(parsed(tx), owner.account, held, before.control, path, shared, expectedBound(shared));
       attempted.push({ hash: parsed(tx).hash, role });
@@ -978,7 +1161,7 @@ const main = async (): Promise<void> => {
     }
 
     console.log('Step 9: refused creations in fee mode');
-    const leaking = new LeakingSponsorWallet({ baseUrl: running.baseUrl, apiKey, provider }, owner.address, LEAK_LOVELACE);
+    const leaking = new LeakingSponsorWallet({ baseUrl, apiKey, provider }, owner.address, LEAK_LOVELACE);
     const leakingTx = await createAccount({
       owner: recipient.keyHash,
       wallet: recipient.wallet,
@@ -1005,25 +1188,25 @@ const main = async (): Promise<void> => {
     console.log(`  refused as expected: ${outcome.status} ${outcome.code} ${outcome.rule ?? ''}`);
     await leaking.release();
 
-    const reuse = await call<Record<string, unknown>>(running.baseUrl, apiKey, 'POST', `/v1/leases/${lease.leaseId}/witness`, { transaction: leakingTx });
+    const reuse = await call<Record<string, unknown>>(baseUrl, apiKey, 'POST', `/v1/leases/${lease.leaseId}/witness`, { transaction: leakingTx });
     creationRefusals.push({ description: 'The same transaction presented on the lease the creation consumed', status: reuse.status, body: reuse.body });
     console.log(`  refused as expected: ${reuse.status} ${String(reuse.body.error)}`);
     if (outcome.status !== 422 || outcome.rule !== 'sponsor_outflow_bounded' || reuse.status !== 409 || reuse.body.error !== 'lease_consumed') {
       throw new Error('A refused case did not answer as documented');
     }
 
-    const after = await call<PoolBody>(running.baseUrl, config.adminApiKey, 'GET', '/admin/pool');
-    const audit = await call<{ entries: RecordedAuditEntry[] }>(running.baseUrl, config.adminApiKey, 'GET', '/admin/audit?limit=1000');
-    const issuedEntries = audit.body.entries.filter((entry) => entry.action === 'witness' && entry.outcome === 'issued');
+    const poolAfter = await service.pool();
+    const issuedEntries = await service.issuedWitnesses();
     const evidence: Evidence = {
       ranAt: new Date().toISOString(),
-      sponsorAddress: running.sponsorAddress,
+      target: service.target,
+      sponsorAddress,
       accountScriptHash: config.accountScriptHash,
       logicHash: logic,
       network,
-      poolBefore: before.body.pool,
+      poolBefore,
       replenish,
-      poolAfter: after.body.pool,
+      poolAfter,
       owner,
       agent,
       recipient,
@@ -1032,7 +1215,13 @@ const main = async (): Promise<void> => {
       creation,
       controlUtxo,
       changeUtxo,
-      creationAudit: issuedEntries.find((entry) => entry.detail['txHash'] === creationTxId),
+      audit:
+        issuedEntries === undefined
+          ? undefined
+          : {
+              creation: issuedEntries.find((entry) => entry.detail['txHash'] === creationTxId),
+              collateral: issuedEntries.filter((entry) => entry.detail['mode'] === 'collateral'),
+            },
       depositTxId,
       depositFee: depositParsed.fee,
       ownerSpend,
@@ -1045,16 +1234,16 @@ const main = async (): Promise<void> => {
       swept,
       leakingTxHash,
       creationRefusals,
-      collateralAudit: issuedEntries.filter((entry) => entry.detail['mode'] === 'collateral'),
     };
-    mkdirSync(dirname(EVIDENCE_PATH), { recursive: true });
-    writeFileSync(EVIDENCE_PATH, evidenceDocument(evidence));
-    console.log(`Evidence written to ${EVIDENCE_PATH}`);
+    const evidencePath = EVIDENCE_PATHS[service.target.mode];
+    mkdirSync(dirname(evidencePath), { recursive: true });
+    writeFileSync(evidencePath, evidenceDocument(evidence));
+    console.log(`Evidence written to ${evidencePath}`);
   } finally {
     for (const { hash, role } of attempted) {
       console.log(`Transaction ${hash}: ${role}`);
     }
-    await running.stop();
+    await service.stop();
   }
 };
 

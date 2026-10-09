@@ -1016,6 +1016,49 @@ which hold nothing as the owner, the agent and the recipient. It needs
 the sibling contract checkout built and loads `scripts/shared-cometa.ts`
 first.
 
+### Against a hosted service
+
+The same proof runs against a service already running elsewhere, with
+a sponsor wallet and a database of its own, when two more variables are
+set:
+
+| Variable | Shape |
+| -------- | ----- |
+| `SPONSOR_SERVICE_URL` | the base URL of the running service, such as `https://sponsor.example`; the API paths are appended to it |
+| `SPONSOR_SERVICE_API_KEY` | a client key the service's operator issued |
+
+Both or neither must be set; either one alone is refused, naming the
+one missing. With both set the run needs no `ADMIN_API_KEY` and calls
+no admin route, since the admin routes of a running service are its
+operator's: it starts no service, issues no key and never replenishes.
+It reads the pool from `GET /health`, which answers without a key, before
+and after the run, and refuses to start when the service reports fewer
+than 2 free fee UTxOs or no shared collateral, which only the operator
+can remedy. It takes the sponsor address from the service's lease and
+collateral answers rather than from its own configuration, and refuses
+one that is the funding wallet's or one of its fresh wallets. Every
+other step and check is the same: the fresh owner, agent and recipient
+wallets of `SPONSOR_MNEMONIC`, the deposit from the funding wallet,
+account 0 of that mnemonic, the six collateral mode operations, the
+over cap spend refused under `evaluates` and the leaking creation
+refused by the hosted service's policy. The run still reads the chain
+itself and needs `SPONSOR_MNEMONIC`, `ACCOUNT_SCRIPT_HASH` and
+`BLOCKFROST_PREPROD_PROJECT_ID`:
+
+```
+SPONSOR_SERVICE_URL=https://sponsor.example SPONSOR_SERVICE_API_KEY=<client key> npm run preprod-e2e
+```
+
+The hosted service pays the creation from its own pool, so the funding
+wallet spends the deposit of 70 tADA, 50 to the account and 20 into its
+reserve, and that deposit's fee; the deposit draws only on UTxOs outside
+the pool sizes, so the pool of a local deployment on the same mnemonic
+is never touched. The run writes `docs/preprod-hosted-evidence.md`,
+which names the service's base URL, the sponsor address it reported and
+the pool as `GET /health` reported it, and leaves the local run's
+`docs/preprod-evidence.md` as it is. The audit trail of a hosted
+service is its operator's to read, so that document records none.
+
 ## Security
 
 [docs/security.md](docs/security.md) covers who can call what, what an
@@ -1032,7 +1075,7 @@ surroundings.
 - `npm run build` compiles the package to `dist`, which is what another project imports the client adapter from.
 - `npm run dev` runs the service with a file watcher; `npm run start` without.
 - `npm run replenish` splits the sponsor wallet into pool UTxOs up to the configured targets.
-- `npm run preprod-e2e` runs the preprod proof.
+- `npm run preprod-e2e` runs the preprod proof, against a service it starts itself or, with `SPONSOR_SERVICE_URL` and `SPONSOR_SERVICE_API_KEY` set, against a hosted one.
 - `docker build -t <image> .` builds the container image, and `scripts/smoke-image.sh <image>` proves it runs.
 
 ## Limitations

@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CURRENT_LOGIC_HASH, ConfigError, loadConfig } from '../src/config.js';
+import { CURRENT_LOGIC_HASH, ConfigError, loadConfig, loadProofTarget } from '../src/config.js';
 import { SLOT_SETTINGS_BY_NETWORK } from '../src/slots.js';
 
 const VALID_MNEMONIC = 'alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima';
@@ -193,5 +193,85 @@ describe('loadConfig', () => {
 
     expect(example).toBe(CURRENT_LOGIC_HASH);
     expect(loadConfig({ ...validEnv(), KNOWN_LOGIC_HASHES: example }).knownLogicHashes).toEqual([CURRENT_LOGIC_HASH]);
+  });
+});
+
+/** A running service the proof is pointed at, and the client key it issued. */
+const SERVICE_URL = 'https://sponsor.example';
+const SERVICE_API_KEY = 'test-client-key';
+
+/** The environment of a run against a running service: the service's address and key, and no admin key. */
+const hostedEnv = (): Record<string, string> => {
+  const env: Record<string, string> = { ...validEnv(), SPONSOR_SERVICE_URL: SERVICE_URL, SPONSOR_SERVICE_API_KEY: SERVICE_API_KEY };
+  delete env.ADMIN_API_KEY;
+  return env;
+};
+
+describe('loadProofTarget', () => {
+  it('runs against a service of its own by default, with the full service configuration', () => {
+    const target = loadProofTarget(validEnv());
+
+    expect(target.mode).toBe('local');
+    expect(target.config).toEqual(loadConfig(validEnv()));
+  });
+
+  it('reads blank service variables as unset, as an environment file with empty lines for them gives', () => {
+    expect(loadProofTarget({ ...validEnv(), SPONSOR_SERVICE_URL: '', SPONSOR_SERVICE_API_KEY: '' }).mode).toBe('local');
+  });
+
+  it('still requires the admin key when it runs against a service of its own', () => {
+    const env: Record<string, string> = validEnv();
+    delete env.ADMIN_API_KEY;
+
+    expect(() => loadProofTarget(env)).toThrow(/ADMIN_API_KEY/);
+  });
+
+  it('runs against a running service given its URL and a client key, needing no admin key', () => {
+    const target = loadProofTarget(hostedEnv());
+
+    expect(target).toMatchObject({ mode: 'hosted', baseUrl: SERVICE_URL, apiKey: SERVICE_API_KEY });
+    expect(target.config).not.toHaveProperty('adminApiKey');
+    expect(target.config.sponsorMnemonic).toEqual(VALID_MNEMONIC.split(' '));
+    expect(target.config.blockfrostProjectId).toBe('preprodTestProjectId');
+  });
+
+  it('drops trailing slashes from the service URL, since the API paths are appended after it', () => {
+    const target = loadProofTarget({ ...hostedEnv(), SPONSOR_SERVICE_URL: `${SERVICE_URL}//` });
+
+    expect(target.mode === 'hosted' && target.baseUrl).toBe(SERVICE_URL);
+  });
+
+  it('refuses a service URL without a client key, naming the missing variable', () => {
+    const env: Record<string, string> = hostedEnv();
+    delete env.SPONSOR_SERVICE_API_KEY;
+
+    expect(() => loadProofTarget(env)).toThrow(/SPONSOR_SERVICE_API_KEY: SPONSOR_SERVICE_API_KEY is required when SPONSOR_SERVICE_URL names a running service/);
+  });
+
+  it('refuses a client key without a service URL, naming the missing variable and never echoing the key', () => {
+    const env: Record<string, string> = hostedEnv();
+    delete env.SPONSOR_SERVICE_URL;
+
+    try {
+      loadProofTarget(env);
+      expect.unreachable('loadProofTarget should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigError);
+      const message = (err as ConfigError).message;
+      expect(message).toContain('SPONSOR_SERVICE_URL: SPONSOR_SERVICE_URL is required when SPONSOR_SERVICE_API_KEY is set');
+      expect(message).not.toContain(SERVICE_API_KEY);
+    }
+  });
+
+  it('refuses a service URL that is not a URL', () => {
+    expect(() => loadProofTarget({ ...hostedEnv(), SPONSOR_SERVICE_URL: 'not a url' })).toThrow(/SPONSOR_SERVICE_URL must be a URL/);
+  });
+
+  it('checks the rest of the configuration against a running service as it does for one of its own', () => {
+    const env: Record<string, string> = hostedEnv();
+    delete env.SPONSOR_MNEMONIC;
+
+    expect(() => loadProofTarget(env)).toThrow(/SPONSOR_MNEMONIC/);
+    expect(() => loadProofTarget({ ...hostedEnv(), FEE_UTXO_LOVELACE: '5000000', COLLATERAL_UTXO_LOVELACE: '5000000' })).toThrow(/differ by more than 10 percent/);
   });
 });
