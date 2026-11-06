@@ -17,6 +17,15 @@ const PLUTUS_V3_COSTS = [
   85848, 0, 1,
 ];
 
+/**
+ * The lengths of the Plutus V1 and V2 cost models. The chain prices both
+ * as preprod does, so that a client can build a call to an older
+ * contract, which the sponsor refuses by its language rather than for a
+ * missing cost model.
+ */
+const PLUTUS_V1_COST_MODEL_LENGTH = 166;
+const PLUTUS_V2_COST_MODEL_LENGTH = 175;
+
 /** Protocol parameters close to preprod's, enough for fee and script data hash computation. */
 export const PROTOCOL_PARAMETERS: ProtocolParameters = {
   minFeeA: 44,
@@ -36,7 +45,11 @@ export const PROTOCOL_PARAMETERS: ProtocolParameters = {
   protocolVersion: { major: 10, minor: 0 },
   minPoolCost: 170_000_000,
   adaPerUtxoByte: 4310,
-  costModels: [{ language: 'PlutusV3', costs: PLUTUS_V3_COSTS }],
+  costModels: [
+    { language: 'PlutusV1', costs: new Array<number>(PLUTUS_V1_COST_MODEL_LENGTH).fill(0) },
+    { language: 'PlutusV2', costs: new Array<number>(PLUTUS_V2_COST_MODEL_LENGTH).fill(0) },
+    { language: 'PlutusV3', costs: PLUTUS_V3_COSTS },
+  ],
   executionCosts: {
     memory: { numerator: 577, denominator: 10_000 },
     steps: { numerator: 721, denominator: 10_000_000 },

@@ -222,26 +222,37 @@ and [account script address](glossary.md#account-script-address).
   - The supply is the value of every input that is not a sponsor UTxO, plus
     the lovelace of every withdrawal not drawn from the sponsor's reward
     account.
+  - In collateral mode, what the transaction mints adds to the supply, and
+    what it burns adds to what the outputs to third parties must be covered
+    for.
   - For each asset, the outputs to third parties hold no more than that
     supply.
 - Why: sponsor value can then reach only the fee, the deposit, the account and
-  the sponsor's own change, never a third party.
-- Mode: both.
+  the sponsor's own change, never a third party. A
+  [contract call](glossary.md#contract-call) may mint tokens and pay them out,
+  and those tokens were never the sponsor's. A burn consumes tokens the inputs
+  must bring.
+- Mode: both. Minting and burning count in collateral mode only.
 - Refusal: 422, rule `no_sponsor_value_elsewhere`.
 
 ## POL-9 No foreign scripts
 
 - Rule: `no_foreign_scripts`
 - Enforces: every script the transaction runs or attaches belongs to the
-  account.
+  account, or in collateral mode to a contract the transaction calls.
 - The account's scripts are the account proxy (`ACCOUNT_SCRIPT_HASH`) and the
   account's stake scripts. A stake script belongs to the account when a
   control UTxO the transaction spends or references is named after it, or
   when a creation registers it. The logics named under POL-6 are admitted
   where the checks say.
-- Checks:
+- Checks in fee mode:
   - Every input locked by a script is locked by the account proxy.
   - Every minting policy is the account proxy.
+  - Every attached Plutus script is the proxy, an account stake script or a
+    named logic.
+- Checks in collateral mode:
+  - No input and no reference input carries a native reference script.
+- Checks in both modes:
   - Every script credential a certificate names is the proxy or an account
     stake script.
   - No reward account is withdrawn from twice.
@@ -250,12 +261,18 @@ and [account script address](glossary.md#account-script-address).
   - A withdrawal that runs a named logic draws zero lovelace.
   - Every script voter is the proxy or an account stake script.
   - The transaction carries no native script witness.
-  - Every attached Plutus script is the proxy, an account stake script or a
-    named logic.
 - Why: a script outside the account could authorize actions or move value
   the policy does not model. Referencing a UTxO where a logic is parked does
-  not admit that logic; only a control datum does.
-- Mode: both.
+  not admit that logic; only a control datum does. In collateral mode an
+  operation may call another contract: spend its UTxOs, mint under its policy,
+  and attach or reference its script. There is no switch for it. POL-10 keeps
+  every script the transaction runs to Plutus V3, and POL-11 evaluates every
+  script before the collateral is lent, so a call that fails never gets it.
+  Certificates, withdrawals and votes stay with the account's own scripts,
+  since a called contract has no reason to register, draw or vote, and a
+  native script runs outside evaluation, so none is admitted in any form.
+- Mode: both, with inputs, mints and attached scripts open to contract calls
+  in collateral mode only.
 - Refusal: 422, rule `no_foreign_scripts`.
 
 ## POL-10 Script data hash
@@ -269,8 +286,9 @@ and [account script address](glossary.md#account-script-address).
   - With either, the body carries one.
   - When the witness set carries redeemers or datums, every Plutus script is
     Plutus V3. This covers every attached Plutus script and every Plutus
-    reference script on an input or a reference input. A native reference
-    script names no Plutus language and is not refused here.
+    reference script on an input or a reference input, a called contract's
+    included. A native reference script names no Plutus language and is not
+    refused here; POL-9 refuses it in collateral mode.
   - The hash recomputed from the witness set, with the cost models the
     provider reports, equals the hash in the body.
 - Why: the sponsor's signature covers the body but not the witness set. The

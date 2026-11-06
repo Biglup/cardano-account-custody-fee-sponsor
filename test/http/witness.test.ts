@@ -864,6 +864,40 @@ describe('transaction policy', () => {
     expectViolation(await witness(taken.leaseId, transaction), 'no_foreign_scripts', new RegExp(`Input ${txHash(400)}#0 is locked by script`));
   });
 
+  it('no_foreign_scripts: refuses a mint under the account stake script and an input locked by it, since the proxy alone pays for and mints account tokens', async () => {
+    await fundPool(2, 1);
+    const minting = await lease();
+    const minted = await buildCreation(service, minting, {
+      customise: (builder) => builder.mintToken({ assetIdHex: `${stakeScriptHash}00`, amount: 1n, redeemer: operateRedeemer }),
+    });
+    expectViolation(await witness(minting.leaseId, minted), 'no_foreign_scripts', new RegExp(`The transaction mints under policy ${stakeScriptHash}, which is not the account script`));
+
+    const stakeScriptAddress = Cometa.EnterpriseAddress.fromCredentials(Cometa.NetworkId.Testnet, scriptCredential(stakeScriptHash)).toAddress().toString();
+    const locked = scriptUtxo(txHash(400), stakeScriptAddress, 10_000_000n);
+    service.provider.addUtxo(locked);
+    const spending = await lease();
+    const spent = await buildCreation(service, spending, {
+      customise: (builder) => builder.addInput({ utxo: locked, redeemer: operateRedeemer }).sendLovelace({ address: strangerAddress, amount: 10_000_000n }),
+    });
+    expectViolation(
+      await witness(spending.leaseId, spent),
+      'no_foreign_scripts',
+      new RegExp(`Input ${txHash(400)}#0 is locked by script ${stakeScriptHash}, which is not the account script`),
+    );
+  });
+
+  it('no_foreign_scripts: refuses an attached Plutus V3 script no account names, since a creation calls no contract', async () => {
+    await fundPool();
+    const taken = await lease();
+    const transaction = await buildCreation(service, taken, { customise: (builder) => builder.addScript(foreignScript) });
+
+    expectViolation(
+      await witness(taken.leaseId, transaction),
+      'no_foreign_scripts',
+      new RegExp(`The transaction attaches script ${foreignScriptHash}, which is neither the account script, its stake script nor a logic its control UTxOs name`),
+    );
+  });
+
   it('no_foreign_scripts: never takes the stake part of an account output for an account stake script', async () => {
     await fundPool();
     const locked = scriptUtxo(txHash(400), foreignScriptAddress, 10_000_000n);

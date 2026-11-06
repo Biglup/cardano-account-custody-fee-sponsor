@@ -84,6 +84,12 @@ declared budgets, which keeps a witnessed transaction from failing in that
 phase. This is why one collateral UTxO can back every transaction at once,
 without a lease.
 
+The same holds for a [contract call](glossary.md#contract-call). An operation
+in collateral mode may spend another contract's UTxOs, mint under its policy
+and attach or reference its script, as long as every script is Plutus V3. The
+policy evaluates the called contract with the account's own scripts, so a call
+that would fail is refused before the collateral is lent.
+
 ## What the service signs
 
 - An account creation of the custody contract, in fee mode, that spends the
@@ -104,7 +110,10 @@ within the mode's window.
 - A transaction whose collateral is anything but the shared collateral
   returned to the sponsor, or that declares itself failing in phase two.
 - A transaction that is not a creation or an operation of the custody
-  contract, or that runs a script outside the account.
+  contract, or that runs a script outside the account, other than a Plutus
+  V3 contract a collateral mode transaction calls.
+- A transaction carrying a native script, attached, or in collateral mode as
+  the reference script of an input or a reference input.
 - A transaction naming a logic script the operator has not listed.
 - A transaction that sends sponsor value anywhere but the fee, the deposit,
   the account and the sponsor's own change.

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
-import type { UTxO } from '@biglup/cometa';
+import type { AssetAmounts, NativeScript, PlutusData, PlutusScript, Script, UTxO } from '@biglup/cometa';
 import { Cometa } from '../../src/cometa.js';
 import type { CollateralBody, LeaseBody } from '../../src/api.js';
 import { parseTransaction } from '../../src/policy/parse.js';
@@ -15,6 +15,7 @@ import {
   deviceRedeemer,
   enterpriseAddress,
   foreignScript,
+  foreignScriptHash,
   fundUtxo,
   grantAssetId,
   grantUtxo,
@@ -45,13 +46,22 @@ import {
   buildAgentSpend,
   buildCreation,
   buildReservePaidOperation,
+  type Customise,
   buildUpgrade,
   collateralClientBuilder,
   sponsorUtxo,
   underDeclaringEvaluator,
 } from '../support/client.js';
 import { type TestService, createTestService, txHash } from '../support/service.js';
-import { markInvalid, outputWithDatumHash, withCollateralReturn, withScriptDataHash, withTotalCollateral } from '../support/transaction.js';
+import {
+  markInvalid,
+  outputWithAsset,
+  outputWithDatumHash,
+  withCollateralReturn,
+  withExtraOutput,
+  withScriptDataHash,
+  withTotalCollateral,
+} from '../support/transaction.js';
 
 let service: TestService;
 let apiKey: string;
@@ -508,26 +518,6 @@ describe('collateral mode policy', () => {
     expect(witnessCount()).toBe(1);
   });
 
-  it('no_foreign_scripts: refuses a mint under the account stake script and an input locked by it, since the proxy alone pays for and mints account tokens', async () => {
-    await fundPool();
-    const { control, fund } = placeAccount();
-    const shared = await collateral();
-
-    const minting = await buildAccountPaidOperation(service, shared, control, fund, {
-      customise: (builder) => builder.mintToken({ assetIdHex: `${stakeScriptHash}00`, amount: 1n, redeemer: operateRedeemer }).addScript(stakeScript),
-    });
-    expectViolation(await witness(minting), 'no_foreign_scripts', new RegExp(`The transaction mints under policy ${stakeScriptHash}, which is not the account script`));
-
-    const stakeScriptAddress = Cometa.EnterpriseAddress.fromCredentials(Cometa.NetworkId.Testnet, scriptCredential(stakeScriptHash)).toAddress().toString();
-    const locked = scriptUtxo(txHash(400), stakeScriptAddress, 10_000_000n);
-    service.provider.addUtxo(locked);
-    const spending = await buildAccountPaidOperation(service, shared, control, fund, {
-      customise: (builder) => builder.addInput({ utxo: locked, redeemer: operateRedeemer }).addScript(stakeScript).sendLovelace({ address: strangerAddress, amount: 10_000_000n }),
-    });
-    expectViolation(await witness(spending), 'no_foreign_scripts', new RegExp(`Input ${txHash(400)}#0 is locked by script ${stakeScriptHash}, which is not the account script`));
-    expect(witnessCount()).toBe(0);
-  });
-
   it('no_foreign_scripts: refuses a withdrawal that runs the logic but draws lovelace, since a logic runs on zero', async () => {
     await fundPool();
     const { control, grant, fund } = placeGrantedAccount();
@@ -668,17 +658,10 @@ describe('collateral mode policy', () => {
     expect(witnessCount()).toBe(0);
   });
 
-  it('no_foreign_scripts and evaluates: refuses a foreign script input and a budget declared below what evaluation finds', async () => {
+  it('evaluates: refuses a budget declared below what evaluation finds', async () => {
     await fundPool();
     const { control, fund } = placeAccount();
     const shared = await collateral();
-
-    const locked = scriptUtxo(txHash(400), Cometa.EnterpriseAddress.fromCredentials(Cometa.NetworkId.Testnet, { hash: Cometa.computeScriptHash(foreignScript), type: Cometa.CredentialType.ScriptHash }).toAddress().toString(), 10_000_000n);
-    service.provider.addUtxo(locked);
-    const foreign = await buildAccountPaidOperation(service, shared, control, fund, {
-      customise: (builder) => builder.addInput({ utxo: locked, redeemer: deviceRedeemer }).addScript(foreignScript).sendLovelace({ address: strangerAddress, amount: 10_000_000n }),
-    });
-    expectViolation(await witness(foreign), 'no_foreign_scripts', new RegExp(`Input ${txHash(400)}#0 is locked by script`));
 
     const underDeclared = await buildAccountPaidOperation(service, shared, control, fund, { evaluator: underDeclaringEvaluator });
     expectViolation(await witness(underDeclared), 'evaluates', /The spend redeemer at index \d+ declares 1 memory and 1 steps but needs 1500000 and 700000000/);
@@ -693,6 +676,236 @@ describe('collateral mode policy', () => {
 
     expectViolation(await witness(transaction), 'no_sponsor_inputs', new RegExp(`Input ${txHash(100)}#0 belongs to the sponsor`));
     expect(witnessCount()).toBe(1);
+  });
+});
+
+describe('a contract call in collateral mode', () => {
+  /** The token `contract` mints under its own policy. */
+  const calledTokenOf = (contract: PlutusScript): string => `${Cometa.computeScriptHash(contract)}746f6b656e`;
+
+  /** The token the called contract mints under its own policy. */
+  const calledToken = calledTokenOf(foreignScript);
+
+  /** The redeemer a call hands the called contract, which the always succeeding script never reads: constructor zero with no fields. */
+  const callRedeemer: PlutusData = { constructor: 0n, fields: { items: [] } };
+
+  /** A native script, which no account transaction carries in any form. */
+  const nativeScript: NativeScript = { type: Cometa.ScriptType.Native, kind: Cometa.NativeScriptKind.RequireAllOf, scripts: [] };
+
+  /**
+   * Puts a UTxO of `contract` on the fake chain, holding `assets` beside
+   * its lovelace and carrying `scriptReference` when given.
+   */
+  const placeCalledUtxo = (assets: AssetAmounts = {}, scriptReference?: Script, contract: PlutusScript = foreignScript): UTxO => {
+    const address = Cometa.EnterpriseAddress.fromCredentials(Cometa.NetworkId.Testnet, scriptCredential(Cometa.computeScriptHash(contract))).toAddress().toString();
+    const output: UTxO['output'] = { address, value: Object.keys(assets).length === 0 ? { coins: 10_000_000n } : { coins: 10_000_000n, assets } };
+    const called: UTxO = { input: { txId: txHash(400), index: 0 }, output: scriptReference === undefined ? output : { ...output, scriptReference } };
+    service.provider.addUtxo(called);
+    return called;
+  };
+
+  /** Puts a UTxO away from the account and the sponsor on the fake chain, carrying `script` for reference. */
+  const placeScriptCarrier = (script: Script): UTxO => {
+    const carrier: UTxO = { input: { txId: txHash(401), index: 0 }, output: { address: strangerAddress, value: { coins: 10_000_000n }, scriptReference: script } };
+    service.provider.addUtxo(carrier);
+    return carrier;
+  };
+
+  /**
+   * Calls `contract` from an agent spend: spends its UTxO and mints five
+   * of its tokens paid to the stranger, with its script attached, or
+   * referenced from `reference` when given.
+   */
+  const callContract =
+    (called: UTxO, reference?: UTxO, contract: PlutusScript = foreignScript): Customise =>
+    (builder) => {
+      const token = calledTokenOf(contract);
+      builder.addInput({ utxo: called, redeemer: callRedeemer });
+      builder.mintToken({ assetIdHex: token, amount: 5n, redeemer: callRedeemer });
+      builder.sendValue({ address: strangerAddress, value: { coins: 2_000_000n, assets: { [token]: 5n } } });
+      if (reference === undefined) {
+        builder.addScript(contract);
+      } else {
+        builder.addReferenceInput(reference);
+      }
+    };
+
+  it('witnesses an agent spend that spends a Plutus V3 contract UTxO, mints under its policy and attaches its script', async () => {
+    await fundPool();
+    const { control, grant, fund } = placeGrantedAccount();
+    const called = placeCalledUtxo();
+    const shared = await collateral();
+    const transaction = await buildAgentSpend(service, shared, { control, grant, fund }, { customise: callContract(called) });
+    const parsed = parseTransaction(transaction).transaction;
+    expect(parsed?.inputs).toEqual(expect.arrayContaining([called.input]));
+    expect(parsed?.mint).toEqual({ [calledToken]: 5n });
+    expect(parsed?.scripts.map((script) => script.hash)).toContain(foreignScriptHash);
+
+    const response = await witness(transaction);
+
+    expect(response.status).toBe(200);
+    expectSponsorWitness(response.body.witnessSet, transaction, [grant, fund, called, sponsorUtxo(shared)], AGENT_KEY);
+  });
+
+  it('witnesses the same call when it references the contract script rather than attaching it', async () => {
+    await fundPool();
+    const { control, grant, fund } = placeGrantedAccount();
+    const called = placeCalledUtxo();
+    const carrier = placeScriptCarrier(foreignScript);
+    const shared = await collateral();
+    const transaction = await buildAgentSpend(service, shared, { control, grant, fund }, { customise: callContract(called, carrier) });
+    const parsed = parseTransaction(transaction).transaction;
+    expect(parsed?.referenceInputs).toEqual(expect.arrayContaining([carrier.input]));
+    expect(parsed?.scripts.map((script) => script.hash)).not.toContain(foreignScriptHash);
+
+    const response = await witness(transaction);
+
+    expect(response.status).toBe(200);
+  });
+
+  it('evaluates: refuses a call the contract fails, so a failing call never gets the collateral', async () => {
+    await fundPool();
+    const { control, grant, fund } = placeGrantedAccount();
+    const called = placeCalledUtxo();
+    const shared = await collateral();
+    const transaction = await buildAgentSpend(service, shared, { control, grant, fund }, { customise: callContract(called) });
+    service.provider.setEvaluationFailure('The called contract refused the redeemer');
+
+    expectViolation(await witness(transaction), 'evaluates', /The transaction does not evaluate: The called contract refused the redeemer/);
+    expect(witnessCount()).toBe(0);
+  });
+
+  it.each([
+    ['Plutus V1', Cometa.PlutusLanguageVersion.V1],
+    ['Plutus V2', Cometa.PlutusLanguageVersion.V2],
+  ])('script_data_hash: refuses a call to a contract of %s', async (name, version) => {
+    await fundPool();
+    const { control, grant, fund } = placeGrantedAccount();
+    const contract: PlutusScript = { ...foreignScript, version };
+    const called = placeCalledUtxo({}, undefined, contract);
+    const shared = await collateral();
+    const transaction = await buildAgentSpend(service, shared, { control, grant, fund }, { customise: callContract(called, undefined, contract) });
+    expect(parseTransaction(transaction).transaction?.mint).toEqual({ [calledTokenOf(contract)]: 5n });
+
+    expectViolation(
+      await witness(transaction),
+      'script_data_hash',
+      new RegExp(`The transaction carries a script of ${name}, and every script an account runs is Plutus V3`),
+    );
+    expect(witnessCount()).toBe(0);
+  });
+
+  it('no_foreign_scripts: refuses a native script, attached, referenced or carried by a spent input', async () => {
+    await fundPool();
+    const { control, grant, fund } = placeGrantedAccount();
+    const shared = await collateral();
+
+    const plain = placeCalledUtxo();
+    const attached = await buildAgentSpend(service, shared, { control, grant, fund }, {
+      customise: (builder) => {
+        callContract(plain)(builder);
+        builder.addScript(nativeScript);
+      },
+    });
+    expectViolation(await witness(attached), 'no_foreign_scripts', /The transaction carries native script witnesses, which no account transaction needs/);
+
+    const carrier = placeScriptCarrier(nativeScript);
+    const referenced = await buildAgentSpend(service, shared, { control, grant, fund }, {
+      customise: (builder) => {
+        callContract(plain)(builder);
+        builder.addReferenceInput(carrier);
+      },
+    });
+    expectViolation(
+      await witness(referenced),
+      'no_foreign_scripts',
+      new RegExp(`Reference input ${txHash(401)}#0 carries a native reference script, which no account transaction needs`),
+    );
+
+    service.provider.removeUtxo(plain.input);
+    const carrying = placeCalledUtxo({}, nativeScript);
+    const spent = await buildAgentSpend(service, shared, { control, grant, fund }, { customise: callContract(carrying) });
+    expectViolation(await witness(spent), 'no_foreign_scripts', new RegExp(`Input ${txHash(400)}#0 carries a native reference script, which no account transaction needs`));
+    expect(witnessCount()).toBe(0);
+  });
+
+  it('no_foreign_scripts: still refuses the called contract on a withdrawal or a certificate', async () => {
+    await fundPool();
+    const { control, grant, fund } = placeGrantedAccount();
+    const called = placeCalledUtxo();
+    const shared = await collateral();
+
+    const withdrawing = await buildAgentSpend(service, shared, { control, grant, fund }, {
+      customise: (builder) => {
+        callContract(called)(builder);
+        builder.withdrawRewards({ rewardAddress: rewardAddressOf(foreignScriptHash), amount: 0n, redeemer: callRedeemer });
+      },
+    });
+    expectViolation(
+      await witness(withdrawing),
+      'no_foreign_scripts',
+      new RegExp(`A withdrawal draws from script ${foreignScriptHash}, which is neither the account script, its stake script nor a logic its control UTxOs name`),
+    );
+
+    const registering = await buildAgentSpend(service, shared, { control, grant, fund }, {
+      customise: (builder) => {
+        callContract(called)(builder);
+        builder.registerStakeAddress({ rewardAddress: rewardAddressOf(foreignScriptHash), redeemer: callRedeemer });
+      },
+    });
+    expectViolation(
+      await witness(registering),
+      'no_foreign_scripts',
+      new RegExp(`certificate names script ${foreignScriptHash}, which is neither the account script nor its stake script`),
+    );
+    expect(witnessCount()).toBe(0);
+  });
+
+  it('no_sponsor_value_elsewhere: counts burned tokens as demand, which only what the inputs bring covers', async () => {
+    await fundPool();
+    const { control, grant, fund } = placeGrantedAccount();
+    const holding = placeCalledUtxo({ [calledToken]: 5n });
+    const shared = await collateral();
+    const burning = await buildAgentSpend(service, shared, { control, grant, fund }, {
+      customise: (builder) => {
+        builder.addInput({ utxo: holding, redeemer: callRedeemer });
+        builder.mintToken({ assetIdHex: calledToken, amount: -5n, redeemer: callRedeemer });
+        builder.addScript(foreignScript);
+      },
+    });
+    expect(parseTransaction(burning).transaction?.mint).toEqual({ [calledToken]: -5n });
+
+    expectViolation(
+      await witness(withExtraOutput(burning, outputWithAsset(strangerAddress, 2_000_000n, calledToken, 5n))),
+      'no_sponsor_value_elsewhere',
+      new RegExp(`with what the transaction burns, need 10 of ${calledToken} but the non sponsor inputs, withdrawals and mint supply 5`),
+    );
+    expect((await witness(burning)).status).toBe(200);
+  });
+
+  it('never lets a call spend a sponsor input or pay the sponsor', async () => {
+    await fundPool(0, 2);
+    const { control, grant, fund } = placeGrantedAccount();
+    const called = placeCalledUtxo();
+    const shared = await collateral();
+    const other: UTxO = { input: { txId: txHash(201), index: 0 }, output: { address: shared.sponsorAddress, value: { coins: 5_000_000n } } };
+
+    const spending = await buildAgentSpend(service, shared, { control, grant, fund }, {
+      customise: (builder) => {
+        callContract(called)(builder);
+        builder.addInput({ utxo: other });
+      },
+    });
+    expectViolation(await witness(spending), 'no_sponsor_inputs', new RegExp(`Input ${txHash(201)}#0 belongs to the sponsor, which contributes collateral only`));
+
+    const paying = await buildAgentSpend(service, shared, { control, grant, fund }, {
+      customise: (builder) => {
+        callContract(called)(builder);
+        builder.sendLovelace({ address: shared.sponsorAddress, amount: 1_000_000n });
+      },
+    });
+    expectViolation(await witness(paying), 'sponsor_outflow_zero', /An output pays 1000000 lovelace to the sponsor, which contributes collateral only/);
+    expect(witnessCount()).toBe(0);
   });
 });
 

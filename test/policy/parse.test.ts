@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
-import type { Credential } from '@biglup/cometa';
+import type { Credential, Script, UTxO } from '@biglup/cometa';
 import { Cometa } from '../../src/cometa.js';
 import type { LeaseBody } from '../../src/api.js';
 import { MAX_TRANSACTION_BYTES, parseTransaction, paymentCredentialOf, plutusLanguageOf, resolveInputs } from '../../src/policy/parse.js';
@@ -12,6 +12,7 @@ import {
   byronAddress,
   controlUtxo,
   enterpriseAddress,
+  foreignScript,
   grantAssetId,
   grantUtxo,
   grantedState,
@@ -20,10 +21,19 @@ import {
   pointerAddress,
   stakeScriptHash,
   stateNftAssetId,
+  strangerAddress,
 } from '../support/account.js';
 import { buildCreation, buildOwnerOperation } from '../support/client.js';
 import { type TestService, createTestService, txHash } from '../support/service.js';
-import { poolRegistrationCertificate, transactionParts, withCertificates, withInfoProposal } from '../support/transaction.js';
+import {
+  outputWithNativeReferenceScript,
+  outputWithReferenceScript,
+  poolRegistrationCertificate,
+  transactionParts,
+  withCertificates,
+  withExtraOutput,
+  withInfoProposal,
+} from '../support/transaction.js';
 
 let service: TestService;
 let lease: LeaseBody;
@@ -123,6 +133,21 @@ describe('parseTransaction', () => {
     expect(parseTransaction(other).transaction?.hash).not.toBe(parseTransaction(cbor).transaction?.hash);
   });
 
+  it('reads whether an output carries a reference script, of which Plutus language, or a native one', async () => {
+    const cbor = withExtraOutput(
+      withExtraOutput(await buildCreation(service, lease), outputWithReferenceScript(strangerAddress, 10_000_000n, foreignScript)),
+      outputWithNativeReferenceScript(strangerAddress, 10_000_000n),
+    );
+
+    const outputs = parseTransaction(cbor).transaction?.outputs.slice(-3);
+
+    expect(outputs?.map((output) => [output.hasReferenceScript, output.referenceScriptLanguage, output.hasNativeReferenceScript])).toEqual([
+      [false, undefined, false],
+      [true, Cometa.PlutusLanguageVersion.V3, false],
+      [true, undefined, true],
+    ]);
+  });
+
   it('refuses what is not hex, what does not decode and what is too large as not well formed', () => {
     expect(parseTransaction('xyz').violation).toEqual({ rule: 'well_formed', detail: expect.stringMatching(/not a hex encoded/) });
     expect(parseTransaction('a0').violation).toEqual({ rule: 'well_formed', detail: expect.stringMatching(/does not decode/) });
@@ -205,6 +230,26 @@ describe('resolveInputs', () => {
     expect(resolved.referenceInputs?.map((input) => input.ref)).toEqual([`${txHash(300)}#0`, `${txHash(999)}#3`]);
     expect(resolved.referenceInputs?.[0]?.output?.assets).toEqual({ [stateNftAssetId]: 1n });
     expect(resolved.referenceInputs?.[1]?.output).toBeUndefined();
+  });
+
+  it('reads whether a resolved output carries a reference script, of which Plutus language, or a native one', async () => {
+    const carrying = (n: number, scriptReference?: Script): UTxO => ({
+      input: { txId: txHash(n), index: 0 },
+      output: scriptReference === undefined ? { address: strangerAddress, value: { coins: 10_000_000n } } : { address: strangerAddress, value: { coins: 10_000_000n }, scriptReference },
+    });
+    const native: Script = { type: Cometa.ScriptType.Native, kind: Cometa.NativeScriptKind.RequireAllOf, scripts: [] };
+    const utxos = [carrying(400), carrying(401, foreignScript), carrying(402, native)];
+    for (const utxo of utxos) {
+      service.provider.addUtxo(utxo);
+    }
+
+    const resolved = (await resolveInputs(service.provider, [], utxos.map((utxo) => utxo.input))).referenceInputs;
+
+    expect(resolved?.map(({ output }) => [output?.hasReferenceScript, output?.referenceScriptLanguage, output?.hasNativeReferenceScript])).toEqual([
+      [false, undefined, false],
+      [true, Cometa.PlutusLanguageVersion.V3, false],
+      [true, undefined, true],
+    ]);
   });
 
   it('refuses at evaluation when the provider rejects the lookup, without asking again input by input', async () => {

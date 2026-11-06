@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
-import type { UTxO } from '@biglup/cometa';
+import type { TransactionBuilder, UTxO } from '@biglup/cometa';
 import { Cometa } from '../src/cometa.js';
 import type { CollateralBody, LeaseBody } from '../src/api.js';
 import type { RuleName } from '../src/policy/rules.js';
@@ -16,9 +16,11 @@ import {
   accountScriptHash,
   controlUtxo,
   createAccountRedeemer,
+  deviceRedeemer,
   encodeGrant,
   fixtureGrant,
   foreignScript,
+  foreignScriptAddress,
   foreignScriptHash,
   fundUtxo,
   grantAssetId,
@@ -32,6 +34,7 @@ import {
   otherStakeScriptHash,
   parkingAddress,
   scriptCredential,
+  scriptUtxo,
   stakeScript,
   stakeScriptHash,
   stateNftAssetId,
@@ -253,6 +256,27 @@ describe('a client trying to drain the sponsor', () => {
 
     const failing = withTotalCollateral(await buildAccountPaidOperation(service, shared, control, fund), 5_000_001n);
     expectViolation(await collateralWitness(failing), 'uses_shared_collateral', /Total collateral 5000001 exceeds the 5000000 lovelace/);
+    expect(witnessCount()).toBe(0);
+  });
+
+  it('cannot put the shared collateral at risk through a contract call, whose scripts are evaluated and whose budgets are checked like the account scripts', async () => {
+    await fundPool();
+    const control = controlUtxo(txHash(300), undefined, grantedState);
+    const grant = grantUtxo(txHash(302));
+    const fund = fundUtxo(txHash(301), 20_000_000n);
+    const called = scriptUtxo(txHash(400), foreignScriptAddress, 10_000_000n);
+    for (const utxo of [control, grant, fund, called]) {
+      service.provider.addUtxo(utxo);
+    }
+    const shared = await collateral();
+    const call = { customise: (builder: TransactionBuilder) => builder.addInput({ utxo: called, redeemer: deviceRedeemer }).addScript(foreignScript) };
+
+    const underDeclared = await buildAgentSpend(service, shared, { control, grant, fund }, { ...call, evaluator: underDeclaringEvaluator });
+    expectViolation(await collateralWitness(underDeclared), 'evaluates', /declares 1 memory and 1 steps but needs/);
+
+    const failing = await buildAgentSpend(service, shared, { control, grant, fund }, call);
+    service.provider.setEvaluationFailure('The called contract refused the redeemer');
+    expectViolation(await collateralWitness(failing), 'evaluates', /The transaction does not evaluate: The called contract refused the redeemer/);
     expect(witnessCount()).toBe(0);
   });
 

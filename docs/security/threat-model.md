@@ -62,6 +62,8 @@ targets what the sponsor's signature would authorize.
 | Draw more from the fee UTxO than a creation costs, pay for an operation on the fee route, or scatter the change into the reserve | [POL-7](../policy.md#pol-7-sponsor-outflow) |
 | Pay sponsor value to a third party | [POL-8](../policy.md#pol-8-no-sponsor-value-elsewhere) |
 | Run a script outside the account, or admit a logic anywhere but where the account runs it | [POL-9](../policy.md#pol-9-no-foreign-scripts) |
+| Have the collateral lent to a contract call that fails, that runs a script of another language, or that names the called contract on a certificate, a withdrawal or a vote | [POL-9](../policy.md#pol-9-no-foreign-scripts), [POL-10](../policy.md#pol-10-script-data-hash) and [POL-11](../policy.md#pol-11-evaluates) |
+| Pay out what a contract call mints as if it were covered by the sponsor | [POL-8](../policy.md#pol-8-no-sponsor-value-elsewhere): minted tokens count as supply only in collateral mode, where the sponsor contributes no value |
 | Make the sponsor signature authorize a required signer, a withdrawal, a certificate or a vote | [POL-12](../policy.md#pol-12-signers) |
 | Smuggle a sponsor UTxO, a control UTxO or a logic in through a reference input | [POL-5](../policy.md#pol-5-account-transaction) and [POL-9](../policy.md#pol-9-no-foreign-scripts): a reference input is never read as an input |
 

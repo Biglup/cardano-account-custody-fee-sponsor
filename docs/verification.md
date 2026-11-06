@@ -22,7 +22,7 @@ from the sibling checkout, over the blueprint the service ships.
 | Suite | Verifies |
 | ----- | -------- |
 | `test/http/witness.test.ts` | The fee mode witness route and every policy rule in fee mode |
-| `test/http/collateral.test.ts` | The collateral routes, every policy rule in collateral mode, and an upgrade with both logic versions known |
+| `test/http/collateral.test.ts` | The collateral routes, every policy rule in collateral mode, contract calls, and an upgrade with both logic versions known |
 | `test/adversarial.test.ts` | Attacks from a client's side: draining the sponsor, replaying or reusing a lease, griefing the pool, and requests without a key or with a broken body |
 | `test/witness.test.ts` | The witness service: the device bound, both quotas under concurrency, the check on the witness set, and lease races |
 | `test/policy/parse.test.ts` | Transaction decoding and credential reading |
