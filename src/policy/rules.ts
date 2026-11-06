@@ -643,20 +643,37 @@ const sponsorOutflowZero: Rule = ({ transaction }, { sponsor }) => {
 const sponsorOutflow: Rule = (analysis, context) =>
   context.mode.kind === 'fee' ? sponsorOutflowBounded(analysis, context) : sponsorOutflowZero(analysis, context);
 
-/** Every output away from the sponsor and the account is covered by what the non sponsor inputs and withdrawals bring in. */
-const noSponsorValueElsewhere: Rule = ({ transaction, otherInputs, foreignOutputs }, { sponsor }) => {
+/**
+ * Every output away from the sponsor and the account is covered by what
+ * the non sponsor inputs and withdrawals bring in. In collateral mode an
+ * operation may call another contract, which may mint and burn, so what
+ * the transaction mints counts as supply and what it burns as demand:
+ * minted tokens paid out are covered, and burned tokens must come from
+ * the inputs too.
+ */
+const noSponsorValueElsewhere: Rule = ({ transaction, otherInputs, foreignOutputs }, { sponsor, mode }) => {
   const supply = balanceOf(outputsOf(otherInputs));
   for (const withdrawal of transaction.withdrawals) {
     if (!(isKey(withdrawal.credential) && withdrawal.credential.hash === sponsor.stakeKeyHash)) {
       supply[LOVELACE] = (supply[LOVELACE] ?? 0n) + withdrawal.lovelace;
     }
   }
-  for (const [assetId, demanded] of Object.entries(balanceOf(foreignOutputs))) {
+  const demand = balanceOf(foreignOutputs);
+  if (mode.kind === 'collateral') {
+    for (const [assetId, quantity] of Object.entries(transaction.mint)) {
+      const [balance, moved] = quantity > 0n ? [supply, quantity] : [demand, -quantity];
+      balance[assetId] = (balance[assetId] ?? 0n) + moved;
+    }
+  }
+  for (const [assetId, demanded] of Object.entries(demand)) {
     const supplied = supply[assetId] ?? 0n;
     if (demanded > supplied) {
+      const asset = assetId === LOVELACE ? 'lovelace' : `of ${assetId}`;
       return violation(
         'no_sponsor_value_elsewhere',
-        `Outputs away from the sponsor and the account need ${demanded} ${assetId === LOVELACE ? 'lovelace' : `of ${assetId}`} but the non sponsor inputs supply ${supplied}`,
+        mode.kind === 'collateral'
+          ? `Outputs away from the sponsor and the account, with what the transaction burns, need ${demanded} ${asset} but the non sponsor inputs, withdrawals and mint supply ${supplied}`
+          : `Outputs away from the sponsor and the account need ${demanded} ${asset} but the non sponsor inputs supply ${supplied}`,
       );
     }
   }
@@ -664,24 +681,34 @@ const noSponsorValueElsewhere: Rule = ({ transaction, otherInputs, foreignOutput
 };
 
 /**
- * Every script the transaction runs or attaches belongs to the account.
- * The account proxy alone pays for every account UTxO and mints every
- * account token: the stake validator has only withdraw and publish
- * handlers, so no account transaction locks an input with a stake
- * script or mints under one, and an input or a mint under any script
- * but the proxy is foreign. A certificate or a vote may name the proxy
- * or one of the account's stake scripts, named by the control UTxOs the
- * transaction spends or references or registered at creation. A logic
- * those control UTxOs and the control outputs name is admitted in two
- * places and nowhere else: as the credential of a withdrawal, whose
- * zero draw is how the proxy runs the account's rules, and as an
- * attached script for a transaction that embeds it rather than
- * referencing a parked one. A logic runs on a withdrawal of zero, so
- * one that draws lovelace is refused, and a second withdrawal from a
- * reward account already drawn from is refused too, since the ledger
- * cannot decode such a withdrawal map.
+ * Every script the transaction runs or attaches belongs to the account,
+ * or in collateral mode to a contract the transaction calls. The account
+ * proxy alone pays for every account UTxO and mints every account token:
+ * the stake validator has only withdraw and publish handlers, so no
+ * account transaction locks an input with a stake script or mints under
+ * one, and in fee mode an input or a mint under any script but the proxy
+ * is foreign. In collateral mode an operation may call another contract:
+ * spend its UTxOs, mint under its policy and attach its script. There is
+ * no switch for it, since every script is evaluated before collateral is
+ * lent, so a failing call never gets it, and the script data hash rule
+ * keeps every script the transaction runs to Plutus V3. A certificate, a
+ * withdrawal and a vote never name a called contract, in either mode. A
+ * certificate or a vote may name the proxy or one of the account's stake
+ * scripts, named by the control UTxOs the transaction spends or
+ * references or registered at creation. A logic those control UTxOs and
+ * the control outputs name is admitted in two places and nowhere else:
+ * as the credential of a withdrawal, whose zero draw is how the proxy
+ * runs the account's rules, and as an attached script for a transaction
+ * that embeds it rather than referencing a parked one. A logic runs on a
+ * withdrawal of zero, so one that draws lovelace is refused, and a
+ * second withdrawal from a reward account already drawn from is refused
+ * too, since the ledger cannot decode such a withdrawal map. Native
+ * scripts are refused attached in either mode, and in collateral mode
+ * also as the reference script of an input or a reference input, where a
+ * called contract could take one from.
  */
-const noForeignScripts: Rule = ({ transaction, inputs, stakeScriptHashes, logicHashes }, { accountScriptHash }) => {
+const noForeignScripts: Rule = ({ transaction, inputs, referenceInputs, stakeScriptHashes, logicHashes }, { accountScriptHash, mode }) => {
+  const canCallContracts = mode.kind === 'collateral';
   const accountScripts = new Set([accountScriptHash, ...stakeScriptHashes]);
   const runnable = new Set([...accountScripts, ...logicHashes]);
   const notProxy = (hash: string): string => `${hash}, which is not the account script`;
@@ -689,13 +716,13 @@ const noForeignScripts: Rule = ({ transaction, inputs, stakeScriptHashes, logicH
   const unrunnable = (hash: string): string => `${hash}, which is neither the account script, its stake script nor a logic its control UTxOs name`;
   for (const input of inputs) {
     const credential = input.output?.paymentCredential;
-    if (isScript(credential) && credential.hash !== accountScriptHash) {
+    if (isScript(credential) && credential.hash !== accountScriptHash && !canCallContracts) {
       return violation('no_foreign_scripts', `Input ${input.ref} is locked by script ${notProxy(credential.hash)}`);
     }
   }
   for (const assetId of Object.keys(transaction.mint)) {
     const policyId = assetId.slice(0, accountScriptHash.length);
-    if (policyId !== accountScriptHash) {
+    if (policyId !== accountScriptHash && !canCallContracts) {
       return violation('no_foreign_scripts', `The transaction mints under policy ${notProxy(policyId)}`);
     }
   }
@@ -729,8 +756,15 @@ const noForeignScripts: Rule = ({ transaction, inputs, stakeScriptHashes, logicH
   if (transaction.nativeScriptCount > 0) {
     return violation('no_foreign_scripts', 'The transaction carries native script witnesses, which no account transaction needs');
   }
+  if (canCallContracts) {
+    const carrier = [...inputs, ...referenceInputs].find((input) => input.output?.hasNativeReferenceScript === true);
+    if (carrier !== undefined) {
+      const where = inputs.includes(carrier) ? 'Input' : 'Reference input';
+      return violation('no_foreign_scripts', `${where} ${carrier.ref} carries a native reference script, which no account transaction needs`);
+    }
+  }
   for (const script of transaction.scripts) {
-    if (!runnable.has(script.hash)) {
+    if (!runnable.has(script.hash) && !canCallContracts) {
       return violation('no_foreign_scripts', `The transaction attaches script ${unrunnable(script.hash)}`);
     }
   }
@@ -763,9 +797,10 @@ const languagesOf = ({ transaction, inputs, referenceInputs }: Analysis): Plutus
  * refused: a body committing to other script data than it carries, a
  * body committing to none while the witness set carries redeemers or
  * datums, and a body committing to one while it carries neither. Every
- * script an account transaction runs is Plutus V3, so a transaction
- * whose scripts are not all written in it is refused rather than hashed
- * under a language view that would be a guess.
+ * script an account transaction runs is Plutus V3, and so must be every
+ * contract an operation calls in collateral mode, so a transaction whose
+ * scripts are not all written in it is refused rather than hashed under
+ * a language view that would be a guess.
  */
 const scriptDataHash = async (analysis: Analysis, provider: Provider): Promise<Violation | undefined> => {
   const { transaction } = analysis;

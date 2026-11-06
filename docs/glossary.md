@@ -65,6 +65,13 @@ The contract's
 [creation](https://github.com/Biglup/cardano-account-custody-contract/blob/main/docs/glossary.md#creation).
 Fee mode pays for creations only.
 
+### Contract call
+
+An operation that runs a Plutus V3 script of another contract: it spends that
+contract's UTxOs, mints under its policy, or attaches or references its
+script. Collateral mode admits contract calls, and fee mode refuses them.
+[POL-9](policy.md#pol-9-no-foreign-scripts) states what a call may run.
+
 ### Fee mode
 
 The mode of `POST /v1/leases/:id/witness`. The leased fee UTxO pays for an

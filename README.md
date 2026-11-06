@@ -46,7 +46,9 @@ flowchart LR
 
 In fee mode, a client leases one of the sponsor's fee UTxOs, and the sponsor
 pays for an account creation. In collateral mode, the account pays its own
-way, and the sponsor lends its shared collateral with no lease.
+way, and the sponsor lends its shared collateral with no lease. A transaction
+in collateral mode may also call other Plutus V3 contracts, which the policy
+evaluates before it lends the collateral.
 [The two modes](docs/overview.md#the-two-modes) compares them.
 
 ## Quick start

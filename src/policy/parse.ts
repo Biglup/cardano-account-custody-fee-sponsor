@@ -19,6 +19,8 @@ export interface ParsedOutput {
   hasReferenceScript: boolean;
   /** The Plutus language of the reference script the output carries, or undefined when it carries none or a native one. */
   referenceScriptLanguage: PlutusLanguageVersion | undefined;
+  /** Whether the reference script the output carries is a native script. */
+  hasNativeReferenceScript: boolean;
   /**
    * The 28 byte script hash the first field of the output's inline datum
    * names, when it carries one shaped that way. An account's control
@@ -133,7 +135,7 @@ const integer = z.string().regex(/^-?[0-9]+$/);
 /** The parts of the view the policy reads, each left loose so a field it does not read never fails the parse. */
 const inputSchema = z.object({ transaction_id: hex.length(64), index: z.coerce.number().int().min(0) });
 const amountSchema = z.object({ coin: integer, assets: z.record(hash28, z.record(hex, integer)).optional() });
-const scriptRefSchema = z.object({ value: z.object({ language: z.string() }).loose().optional() }).loose();
+const scriptRefSchema = z.object({ tag: z.string().optional(), value: z.object({ language: z.string().optional() }).loose().optional() }).loose();
 const outputSchema = z
   .object({ address: z.string(), amount: amountSchema, plutus_data: z.unknown().optional(), script_ref: z.unknown().optional() })
   .loose();
@@ -222,6 +224,12 @@ const inspectedScriptLanguage = (scriptRef: unknown): PlutusLanguageVersion | un
   const parsed = scriptRefSchema.safeParse(scriptRef);
   const language = parsed.success ? parsed.data.value?.language : undefined;
   return language === undefined ? undefined : PLUTUS_LANGUAGES[language];
+};
+
+/** Whether the reference script an output carries is a native script, as the CIP-116 view tags it. */
+const isInspectedNativeScript = (scriptRef: unknown): boolean => {
+  const parsed = scriptRefSchema.safeParse(scriptRef);
+  return parsed.success && parsed.data.tag === 'native_script';
 };
 
 /** The purpose a redeemer serves, by the name the CIP-116 view gives it; a provider names the same purposes as cometa does. */
@@ -367,6 +375,7 @@ const toOutput = (output: InspectedOutput): ParsedOutput => ({
   hasDatum: output.plutus_data !== undefined,
   hasReferenceScript: output.script_ref !== undefined,
   referenceScriptLanguage: inspectedScriptLanguage(output.script_ref),
+  hasNativeReferenceScript: isInspectedNativeScript(output.script_ref),
   logicHash: inlineLogicHash(output.plutus_data),
   devices: inlineDevices(output.plutus_data),
 });
@@ -425,6 +434,7 @@ const toParsedOutput = (output: TxOut): ParsedOutput => ({
   hasReferenceScript: output.scriptReference !== undefined,
   referenceScriptLanguage:
     output.scriptReference !== undefined && Cometa.isPlutusScript(output.scriptReference) ? output.scriptReference.version : undefined,
+  hasNativeReferenceScript: output.scriptReference !== undefined && Cometa.isNativeScript(output.scriptReference),
   logicHash: datumLogicHash(output.datum),
   devices: undefined,
 });

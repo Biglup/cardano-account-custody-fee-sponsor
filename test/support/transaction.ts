@@ -33,12 +33,19 @@ const OUTPUT_DATUM = 2;
 const OUTPUT_SCRIPT_REF = 3;
 const ENCODED_CBOR_TAG = 24;
 
+/** The hex length of a policy id, which an asset id starts with. */
+const POLICY_ID_LENGTH = 56;
+
 /** The kinds of the certificates the tests craft and the Plutus language of a reference script, as the ledger numbers them. */
 const POOL_REGISTRATION = 3;
 const AUTH_COMMITTEE_HOT = 14;
 const UPDATE_DREP = 18;
 const PLUTUS_V3 = 3;
 const UNIT_INTERVAL_TAG = 30;
+
+/** The tag of a native script among the script kinds, and of a native script requiring all of its sub-scripts. */
+const NATIVE_SCRIPT = 0;
+const NATIVE_ALL_OF = 1;
 
 /** The kind of the governance action that carries nothing but an anchor. */
 const INFO_ACTION = 6;
@@ -321,6 +328,15 @@ const outputMap = (address: string, lovelace: bigint, extra: (writer: InstanceTy
   return writer.encodeHex();
 };
 
+/** An output paying `lovelace` and `quantity` of one asset to `address`, as a post Alonzo map. */
+export const outputWithAsset = (address: string, lovelace: bigint, assetId: string, quantity: bigint): string => {
+  const writer = new Cometa.CborWriter().startMap(2);
+  writer.writeUnsignedInt(OUTPUT_ADDRESS).writeByteString(Cometa.Address.fromString(address).toBytes());
+  writer.writeUnsignedInt(OUTPUT_VALUE).startArray(2).writeUnsignedInt(lovelace).startMap(1).writeByteString(bytes(assetId.slice(0, POLICY_ID_LENGTH)));
+  writer.startMap(1).writeByteString(bytes(assetId.slice(POLICY_ID_LENGTH))).writeUnsignedInt(quantity);
+  return writer.encodeHex();
+};
+
 /** An output paying `lovelace` to `address` with a datum hash attached. */
 export const outputWithDatumHash = (address: string, lovelace: bigint, datumHash: string): string =>
   outputMap(address, lovelace, (writer) => writer.writeUnsignedInt(OUTPUT_DATUM).startArray(2).writeUnsignedInt(0).writeByteString(bytes(datumHash)), 1);
@@ -328,6 +344,12 @@ export const outputWithDatumHash = (address: string, lovelace: bigint, datumHash
 /** An output paying `lovelace` to `address` with a Plutus V3 script attached as a reference script. */
 export const outputWithReferenceScript = (address: string, lovelace: bigint, script: PlutusScript): string => {
   const encoded = new Cometa.CborWriter().startArray(2).writeUnsignedInt(PLUTUS_V3).writeByteString(bytes(script.bytes)).encodeHex();
+  return outputMap(address, lovelace, (writer) => writer.writeUnsignedInt(OUTPUT_SCRIPT_REF).writeTag(ENCODED_CBOR_TAG).writeByteString(bytes(encoded)), 1);
+};
+
+/** An output paying `lovelace` to `address` with a native script requiring all of no sub-scripts attached as a reference script. */
+export const outputWithNativeReferenceScript = (address: string, lovelace: bigint): string => {
+  const encoded = new Cometa.CborWriter().startArray(2).writeUnsignedInt(NATIVE_SCRIPT).startArray(2).writeUnsignedInt(NATIVE_ALL_OF).startArray(0).encodeHex();
   return outputMap(address, lovelace, (writer) => writer.writeUnsignedInt(OUTPUT_SCRIPT_REF).writeTag(ENCODED_CBOR_TAG).writeByteString(bytes(encoded)), 1);
 };
 
